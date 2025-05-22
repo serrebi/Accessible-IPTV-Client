@@ -7,16 +7,13 @@ import wx
 
 CONFIG_FILE = "iptvclient.conf"
 
-
 def get_base_path():
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
-
 def get_config_path():
     return os.path.join(get_base_path(), CONFIG_FILE)
-
 
 def load_playlist_sources() -> List[str]:
     path = get_config_path()
@@ -30,7 +27,6 @@ def load_playlist_sources() -> List[str]:
             wx.LogError(f"Failed to load playlist config: {e}")
     return []
 
-
 def save_playlist_sources(sources: List[str]):
     try:
         path = get_config_path()
@@ -38,7 +34,6 @@ def save_playlist_sources(sources: List[str]):
             json.dump(sources, f, indent=2)
     except Exception as e:
         wx.LogError(f"Failed to save playlist config: {e}")
-
 
 class PlaylistManagerDialog(wx.Dialog):
     def __init__(self, parent, playlist_sources):
@@ -150,7 +145,6 @@ class PlaylistManagerDialog(wx.Dialog):
     def GetResult(self):
         return self.playlist_sources
 
-
 class IPTVClient(wx.Frame):
     def __init__(self):
         super().__init__(None, title="Accessible IPTV Client", size=(800, 600))
@@ -178,6 +172,7 @@ class IPTVClient(wx.Frame):
         # Right: filter, channels, URL
         self.filter_box = wx.TextCtrl(p, style=wx.TE_PROCESS_ENTER)
         self.channel_list = wx.ListBox(p, style=wx.LB_SINGLE)
+        self.channel_list.Bind(wx.EVT_CHAR_HOOK, self.on_channel_key)  # << FIX HERE
         self.url_display = wx.TextCtrl(p, style=wx.TE_READONLY | wx.TE_MULTILINE)
         vs_r.Add(self.filter_box, 0, wx.EXPAND | wx.ALL, 5)
         vs_r.Add(self.channel_list, 1, wx.EXPAND | wx.ALL, 5)
@@ -217,6 +212,13 @@ class IPTVClient(wx.Frame):
         for item in (self.player_VLC, self.player_MPC, self.player_Kodi,
                      self.player_Winamp, self.player_Foobar2000):
             self.Bind(wx.EVT_MENU, lambda _: self._select_player(), item)
+
+    def on_channel_key(self, event):
+        key = event.GetKeyCode()
+        if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            self.play_selected()
+        else:
+            event.Skip()
 
     def _select_player(self):
         for attr in ("VLC", "MPC", "Kodi", "Winamp", "Foobar2000"):
@@ -324,7 +326,6 @@ class IPTVClient(wx.Frame):
                 if name and url:
                     out.append({"name": name.strip(), "url": url.strip(), "group": group})
         return out
-
 
 if __name__ == '__main__':
     app = wx.App(False)
