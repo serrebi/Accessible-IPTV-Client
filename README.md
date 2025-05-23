@@ -58,9 +58,9 @@ Your `.exe` will be in the `dist` folder.
 
 ## Known Limitations
 
-- No EPG/TV Guide yet.
-- No recording or catchup support yet.
-- App opens streams in external player windows.
+- No EPG/TV Guide.
+- No recording or catchup support.
+- App opens streams in external player windows, because that's all I need it to do.
 
 ## Tips
 
