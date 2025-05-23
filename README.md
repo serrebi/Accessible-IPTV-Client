@@ -1,6 +1,6 @@
 # Accessible IPTV Client
 
-An accessible IPTV client VibeCoded using wxPython.
+An accessible IPTV client VibeCoded using wxPython. Just made this for my own use.
 
 ## Features
 
@@ -55,15 +55,14 @@ Your `.exe` will be in the `dist` folder.
 
 ## Known Limitations
 
-- No internal or built-in player.
-- No EPG/TV Guide.
-- No recording or catchup support.
+- No EPG/TV Guide yet.
+- No recording or catchup support yet.
 - App opens streams in external player windows.
 
 ## Tips
 
 - Player paths are auto-detected from default install locations.
-- For advanced config, edit `iptvclient.conf` manually.
+-  manually.
 
 ## Support
 
