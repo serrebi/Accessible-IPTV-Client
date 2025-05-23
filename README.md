@@ -69,4 +69,4 @@ Your `.exe` will be in the `dist` folder.
 
 ## Support
 
-Blind or visually impaired users: If you hit a problem, open an issue or contact directly. Feedback is welcome.
+I wrote this for myself so there isn't really support. Sorry!
