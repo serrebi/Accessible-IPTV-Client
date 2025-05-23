@@ -64,8 +64,8 @@ Your `.exe` will be in the `dist` folder.
 
 ## Tips
 
-- Player paths are auto-detected from default install locations.
--  manually.
+- Player paths are auto-detected from default install locations, so make sure they are installed first.
+-  You are restricted by what the player you choose supports. VLC and Media player classic support a wide variety of formats.
 
 ## Support
 
