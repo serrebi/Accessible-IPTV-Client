@@ -62,7 +62,7 @@ Your `.exe` will be in the `dist` folder.
 
 ## Tips
 
-- Player paths are auto-detected from default install locations. If not found, you’ll be prompted for the path.
+- Player paths are auto-detected from default install locations.
 - For advanced config, edit `iptvclient.conf` manually.
 
 ## Support
