@@ -167,12 +167,13 @@ class IPTVClient(wx.Frame):
 
         # Left: groups
         self.group_list = wx.ListBox(p, style=wx.LB_SINGLE)
+        self.group_list.Bind(wx.EVT_CHAR_HOOK, self.on_group_key)
         vs_l.Add(self.group_list, 1, wx.EXPAND | wx.ALL, 5)
 
         # Right: filter, channels, URL
         self.filter_box = wx.TextCtrl(p, style=wx.TE_PROCESS_ENTER)
         self.channel_list = wx.ListBox(p, style=wx.LB_SINGLE)
-        self.channel_list.Bind(wx.EVT_CHAR_HOOK, self.on_channel_key)  # << FIX HERE
+        self.channel_list.Bind(wx.EVT_CHAR_HOOK, self.on_channel_key)
         self.url_display = wx.TextCtrl(p, style=wx.TE_READONLY | wx.TE_MULTILINE)
         vs_r.Add(self.filter_box, 0, wx.EXPAND | wx.ALL, 5)
         vs_r.Add(self.channel_list, 1, wx.EXPAND | wx.ALL, 5)
@@ -213,9 +214,40 @@ class IPTVClient(wx.Frame):
                      self.player_Winamp, self.player_Foobar2000):
             self.Bind(wx.EVT_MENU, lambda _: self._select_player(), item)
 
+    def on_group_key(self, event):
+        key = event.GetKeyCode()
+        sel = self.group_list.GetSelection()
+        count = self.group_list.GetCount()
+        # Block left/right arrows completely
+        if key in (wx.WXK_LEFT, wx.WXK_RIGHT):
+            return
+        if key == wx.WXK_UP:
+            if sel > 0:
+                self.group_list.SetSelection(sel - 1)
+                self.on_group_select()
+        elif key == wx.WXK_DOWN:
+            if sel < count - 1:
+                self.group_list.SetSelection(sel + 1)
+                self.on_group_select()
+        else:
+            event.Skip()
+
     def on_channel_key(self, event):
         key = event.GetKeyCode()
-        if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+        sel = self.channel_list.GetSelection()
+        count = self.channel_list.GetCount()
+        # Block left/right arrows completely
+        if key in (wx.WXK_LEFT, wx.WXK_RIGHT):
+            return
+        if key == wx.WXK_UP:
+            if sel > 0:
+                self.channel_list.SetSelection(sel - 1)
+                self.on_highlight()
+        elif key == wx.WXK_DOWN:
+            if sel < count - 1:
+                self.channel_list.SetSelection(sel + 1)
+                self.on_highlight()
+        elif key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             self.play_selected()
         else:
             event.Skip()
