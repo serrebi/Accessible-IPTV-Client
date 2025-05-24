@@ -1,6 +1,6 @@
 # Accessible IPTV Client
 
-An accessible IPTV client VibeCoded using wxPython.
+An accessible IPTV client VibeCoded using wxPython. Just made this for my own use.
 
 ## Features
 
@@ -33,10 +33,13 @@ An accessible IPTV client VibeCoded using wxPython.
 ```sh
 pip install wxpython
 ```
-
+download the .py or clone. CD,  and run
+```sh
+python3 ./iptvclient.py
 Download and install VLC or other players if needed.
 
 ## Building the Executable
+Clone this repo, or download the zip. Then
 
 ```sh
 pip install pyinstaller
@@ -55,16 +58,15 @@ Your `.exe` will be in the `dist` folder.
 
 ## Known Limitations
 
-- No internal or built-in player.
 - No EPG/TV Guide.
 - No recording or catchup support.
-- App opens streams in external player windows.
+- App opens streams in external player windows, because that's all I need it to do.
 
 ## Tips
 
-- Player paths are auto-detected from default install locations. If not found, you’ll be prompted for the path.
-- For advanced config, edit `iptvclient.conf` manually.
+- Player paths are auto-detected from default install locations, so make sure they are installed first.
+-  You are restricted by what the player you choose supports. VLC and Media player classic support a wide variety of formats.
 
 ## Support
 
-Blind or visually impaired users: If you hit a problem, open an issue or contact directly. Feedback is welcome.
+I wrote this for myself so there isn't really support. Sorry!
