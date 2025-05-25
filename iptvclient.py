@@ -100,12 +100,6 @@ class EPGDatabase:
         c.execute("CREATE INDEX IF NOT EXISTS idx_programmes_title ON programmes (title)")
         self.conn.commit()
 
-    def clear_epg(self):
-        c = self.conn.cursor()
-        c.execute("DELETE FROM programmes")
-        c.execute("DELETE FROM channels")
-        self.conn.commit()
-
     def insert_channel(self, channel_id: str, display_name: str):
         norm = canonicalize_name(display_name)
         c = self.conn.cursor()
@@ -125,18 +119,22 @@ class EPGDatabase:
         self.conn.commit()
 
     def get_matching_channel_id(self, channel: Dict[str, str]) -> Optional[str]:
-        tvg_id = channel.get("tvg-id", "").strip().lower()
-        name = channel.get("name", "")
-        norm = canonicalize_name(name)
-        relaxed = relaxed_name(name)
-        c = self.conn.cursor()
+        # 1. Primary: tvg-id from the channel dict
+        tvg_id = channel.get("tvg-id", "").strip()
         if tvg_id:
-            row = c.execute("SELECT id FROM channels WHERE LOWER(id) = ?", (tvg_id,)).fetchone()
+            c = self.conn.cursor()
+            row = c.execute("SELECT id FROM channels WHERE id = ?", (tvg_id,)).fetchone()
             if row:
                 return row[0]
+        # 2. If not found, canonicalized channel name
+        name = channel.get("name", "")
+        norm = canonicalize_name(name)
+        c = self.conn.cursor()
         row = c.execute("SELECT id FROM channels WHERE norm_name = ?", (norm,)).fetchone()
         if row:
             return row[0]
+        # 3. Relaxed name (fallback)
+        relaxed = relaxed_name(name)
         rows = c.execute("SELECT id, display_name FROM channels").fetchall()
         for ch_id, display_name in rows:
             if relaxed_name(display_name) == relaxed:
@@ -179,7 +177,6 @@ class EPGDatabase:
 
     def import_epg_xml(self, xml_sources: List[str], progress_callback=None):
         thread_db = EPGDatabase(self.db_path, for_threading=True)
-        # Do NOT clear EPG data here! Only prune old data after import.
         total = len(xml_sources)
         for idx, src in enumerate(xml_sources):
             try:
