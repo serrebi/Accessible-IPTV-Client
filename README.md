@@ -58,7 +58,7 @@ Your `.exe` will be in the `dist` folder.
 
 ## Known Limitations
 
-- No EPG/TV Guide.
+- Tentative  EPG/TV Guide. It is what it is for now. If you want to help or fork, feel free. EPG is loaded on startup and then it is checked in the background and kept in a sqLite database in the directory where the script, or executable is. Supports XMLTV, and EPG GZ
 - No recording or catchup support.
 - App opens streams in external player windows, because that's all I need it to do.
 
