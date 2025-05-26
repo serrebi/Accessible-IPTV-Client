@@ -6,6 +6,7 @@ import gzip
 import io
 import sqlite3
 import threading
+import hashlib
 from typing import Dict, List, Optional
 import wx
 import xml.etree.ElementTree as ET
@@ -25,6 +26,15 @@ def get_config_path():
 
 def get_db_path():
     return os.path.join(get_base_path(), DB_FILE)
+
+def get_cache_dir():
+    cache_dir = os.path.join(get_base_path(), "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+def get_cache_path_for_url(url):
+    h = hashlib.sha1(url.encode("utf-8")).hexdigest()
+    return os.path.join(get_cache_dir(), f"{h}.m3u")
 
 def load_config() -> Dict:
     path = get_config_path()
@@ -119,21 +129,18 @@ class EPGDatabase:
         self.conn.commit()
 
     def get_matching_channel_id(self, channel: Dict[str, str]) -> Optional[str]:
-        # 1. Primary: tvg-id from the channel dict
         tvg_id = channel.get("tvg-id", "").strip()
         if tvg_id:
             c = self.conn.cursor()
             row = c.execute("SELECT id FROM channels WHERE id = ?", (tvg_id,)).fetchone()
             if row:
                 return row[0]
-        # 2. If not found, canonicalized channel name
         name = channel.get("name", "")
         norm = canonicalize_name(name)
         c = self.conn.cursor()
         row = c.execute("SELECT id FROM channels WHERE norm_name = ?", (norm,)).fetchone()
         if row:
             return row[0]
-        # 3. Relaxed name (fallback)
         relaxed = relaxed_name(name)
         rows = c.execute("SELECT id, display_name FROM channels").fetchall()
         for ch_id, display_name in rows:
@@ -439,29 +446,133 @@ class IPTVClient(wx.Frame):
         self.epg_importing = False
         self._build_ui()
         self.Centre()
-        self.reload_all_sources()
+        self.reload_all_sources_initial()
         self.reload_epg_sources()
         self.Show()
         self.start_epg_import_background()
 
-    def start_epg_import_background(self):
-        sources = list(self.epg_sources)
-        if not sources:
-            return
-        self.epg_importing = True
-
-        def do_import():
+    def reload_all_sources_initial(self):
+        self.playlist_sources = self.config.get("playlists", [])
+        self.channels_by_group.clear()
+        self.all_channels.clear()
+        valid_caches = set()
+        seen_channel_keys = set()
+        for src in self.playlist_sources:
             try:
-                db = EPGDatabase(get_db_path(), for_threading=True)
-                db.import_epg_xml(sources)
-                wx.CallAfter(self.finish_import_background)
+                if src.startswith(("http://", "https://")):
+                    cache_path = get_cache_path_for_url(src)
+                    valid_caches.add(cache_path)
+                    if os.path.exists(cache_path):
+                        with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
+                            text = f.read()
+                    else:
+                        continue
+                else:
+                    if os.path.exists(src):
+                        with open(src, "r", encoding="utf-8", errors="ignore") as f:
+                            text = f.read()
+                    else:
+                        continue
+                channels = self._parse_m3u_return(text)
+                for ch in channels:
+                    key = (ch.get("name", ""), ch.get("url", ""))
+                    if key in seen_channel_keys:
+                        continue
+                    seen_channel_keys.add(key)
+                    grp = ch.get("group", "Uncategorized")
+                    self.channels_by_group.setdefault(grp, []).append(ch)
+                    self.all_channels.append(ch)
             except Exception:
-                wx.CallAfter(self.finish_import_background)
-        threading.Thread(target=do_import, daemon=True).start()
+                continue
+        self._refresh_group_ui()
+        self._cleanup_cache_and_channels(valid_caches)
+        self._reload_all_sources_background()
 
-    def finish_import_background(self):
-        self.epg_importing = False
-        self.on_highlight()
+    def _reload_all_sources_background(self):
+        def load():
+            playlist_sources = self.config.get("playlists", [])
+            channels_by_group: Dict[str, List[Dict[str, str]]] = {}
+            all_channels: List[Dict[str, str]] = []
+            valid_caches = set()
+            seen_channel_keys = set()
+
+            results = [None] * len(playlist_sources)
+
+            def fetch_playlist(idx, src):
+                try:
+                    if src.startswith(("http://", "https://")):
+                        cache_path = get_cache_path_for_url(src)
+                        valid_caches.add(cache_path)
+                        download = True
+                        if os.path.exists(cache_path):
+                            age = (datetime.datetime.now() - datetime.datetime.fromtimestamp(os.path.getmtime(cache_path))).total_seconds()
+                            if age < 15 * 60:
+                                download = False
+                        if download:
+                            text = urllib.request.urlopen(
+                                urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
+                            ).read().decode("utf-8", "ignore")
+                            with open(cache_path, "w", encoding="utf-8") as f:
+                                f.write(text)
+                        else:
+                            with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
+                                text = f.read()
+                    else:
+                        if os.path.exists(src):
+                            with open(src, "r", encoding="utf-8", errors="ignore") as f:
+                                text = f.read()
+                        else:
+                            return
+                    results[idx] = text
+                except Exception:
+                    results[idx] = None
+
+            threads = []
+            for idx, src in enumerate(playlist_sources):
+                if src.startswith(("http://", "https://")):
+                    t = threading.Thread(target=fetch_playlist, args=(idx, src))
+                    t.start()
+                    threads.append(t)
+                else:
+                    fetch_playlist(idx, src)
+
+            for t in threads:
+                t.join()
+
+            for idx, src in enumerate(playlist_sources):
+                text = results[idx]
+                if not text:
+                    continue
+                try:
+                    channels = self._parse_m3u_return(text)
+                    for ch in channels:
+                        key = (ch.get("name", ""), ch.get("url", ""))
+                        if key in seen_channel_keys:
+                            continue
+                        seen_channel_keys.add(key)
+                        grp = ch.get("group", "Uncategorized")
+                        channels_by_group.setdefault(grp, []).append(ch)
+                        all_channels.append(ch)
+                except Exception:
+                    continue
+
+            def finish():
+                self.channels_by_group = channels_by_group
+                self.all_channels = all_channels
+                self._refresh_group_ui()
+                self._cleanup_cache_and_channels(valid_caches)
+            wx.CallAfter(finish)
+        threading.Thread(target=load, daemon=True).start()
+
+    def _cleanup_cache_and_channels(self, valid_caches):
+        cache_dir = get_cache_dir()
+        files = [os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if f.endswith(".m3u")]
+        for f in files:
+            if f not in valid_caches:
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
 
     def _build_ui(self):
         p = wx.Panel(self)
@@ -513,6 +624,37 @@ class IPTVClient(wx.Frame):
                      self.player_Winamp, self.player_Foobar2000):
             self.Bind(wx.EVT_MENU, lambda _: self._select_player(), item)
 
+    def _refresh_group_ui(self):
+        self.group_list.Clear()
+        self.channel_list.Clear()
+        self.group_list.Append(f"All Channels ({len(self.all_channels)})")
+        for grp in sorted(self.channels_by_group):
+            self.group_list.Append(f"{grp} ({len(self.channels_by_group[grp])})")
+        self.group_list.SetSelection(0)
+        self.on_group_select()
+
+    def reload_epg_sources(self):
+        self.epg_sources = self.config.get("epgs", [])
+
+    def start_epg_import_background(self):
+        sources = list(self.epg_sources)
+        if not sources:
+            return
+        self.epg_importing = True
+
+        def do_import():
+            try:
+                db = EPGDatabase(get_db_path(), for_threading=True)
+                db.import_epg_xml(sources)
+                wx.CallAfter(self.finish_import_background)
+            except Exception:
+                wx.CallAfter(self.finish_import_background)
+        threading.Thread(target=do_import, daemon=True).start()
+
+    def finish_import_background(self):
+        self.epg_importing = False
+        self.on_highlight()
+
     def on_group_key(self, event):
         key = event.GetKeyCode()
         sel = self.group_list.GetSelection()
@@ -555,68 +697,6 @@ class IPTVClient(wx.Frame):
             if item.IsChecked():
                 self.default_player = attr
                 break
-
-    def reload_all_sources(self):
-        self.playlist_sources = self.config.get("playlists", [])
-        self.channels_by_group.clear()
-        self.all_channels.clear()
-        for src in self.playlist_sources:
-            try:
-                if src.startswith(("http://", "https://")):
-                    text = urllib.request.urlopen(
-                        urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
-                    ).read().decode("utf-8", "ignore")
-                else:
-                    with open(src, "r", encoding="utf-8", errors="ignore") as f:
-                        text = f.read()
-                for ch in self._parse_m3u_return(text):
-                    grp = ch.get("group", "Uncategorized")
-                    self.channels_by_group.setdefault(grp, []).append(ch)
-                    self.all_channels.append(ch)
-            except Exception:
-                continue
-        self.group_list.Clear()
-        self.group_list.Append(f"All Channels ({len(self.all_channels)})")
-        for grp in sorted(self.channels_by_group):
-            self.group_list.Append(f"{grp} ({len(self.channels_by_group[grp])})")
-        self.group_list.SetSelection(0)
-        self.on_group_select()
-
-    def reload_epg_sources(self):
-        self.epg_sources = self.config.get("epgs", [])
-
-    def import_epg(self, _):
-        if self.epg_importing:
-            wx.MessageBox("EPG import is already in progress.", "Wait", wx.OK | wx.ICON_INFORMATION)
-            return
-        sources = list(self.epg_sources)
-        if not sources:
-            wx.MessageBox("No EPG sources to import.", "Error", wx.OK | wx.ICON_ERROR)
-            return
-        self.epg_importing = True
-        dlg = EPGImportDialog(self, len(sources))
-        self.import_dialog = dlg
-
-        def do_import():
-            try:
-                def progress_callback(value, total):
-                    wx.CallAfter(dlg.set_progress, value, total)
-                db = EPGDatabase(get_db_path(), for_threading=True)
-                db.import_epg_xml(sources, progress_callback)
-                wx.CallAfter(dlg.Destroy)
-                wx.CallAfter(self.finish_import)
-            except Exception as e:
-                wx.CallAfter(dlg.Destroy)
-                wx.CallAfter(wx.MessageBox, f"EPG import failed: {e}", "Error", wx.OK | wx.ICON_ERROR)
-                wx.CallAfter(self.finish_import)
-        thread = threading.Thread(target=do_import, daemon=True)
-        thread.start()
-        dlg.ShowModal()
-
-    def finish_import(self):
-        self.epg_importing = False
-        wx.MessageBox("EPG import completed.", "Done", wx.OK | wx.ICON_INFORMATION)
-        self.on_highlight()
 
     def on_group_select(self):
         sel = self.group_list.GetStringSelection().split(" (", 1)[0]
@@ -691,7 +771,7 @@ class IPTVClient(wx.Frame):
             self.playlist_sources = dlg.GetResult()
             self.config["playlists"] = self.playlist_sources
             save_config(self.config)
-            self.reload_all_sources()
+            self.reload_all_sources_initial()
         dlg.Destroy()
 
     def show_epg_manager(self, _):
@@ -702,6 +782,39 @@ class IPTVClient(wx.Frame):
             save_config(self.config)
             self.reload_epg_sources()
         dlg.Destroy()
+
+    def import_epg(self, _):
+        if self.epg_importing:
+            wx.MessageBox("EPG import is already in progress.", "Wait", wx.OK | wx.ICON_INFORMATION)
+            return
+        sources = list(self.epg_sources)
+        if not sources:
+            wx.MessageBox("No EPG sources to import.", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        self.epg_importing = True
+        dlg = EPGImportDialog(self, len(sources))
+        self.import_dialog = dlg
+
+        def do_import():
+            try:
+                def progress_callback(value, total):
+                    wx.CallAfter(dlg.set_progress, value, total)
+                db = EPGDatabase(get_db_path(), for_threading=True)
+                db.import_epg_xml(sources, progress_callback)
+                wx.CallAfter(dlg.Destroy)
+                wx.CallAfter(self.finish_import)
+            except Exception as e:
+                wx.CallAfter(dlg.Destroy)
+                wx.CallAfter(wx.MessageBox, f"EPG import failed: {e}", "Error", wx.OK | wx.ICON_ERROR)
+                wx.CallAfter(self.finish_import)
+        thread = threading.Thread(target=do_import, daemon=True)
+        thread.start()
+        dlg.ShowModal()
+
+    def finish_import(self):
+        self.epg_importing = False
+        wx.MessageBox("EPG import completed.", "Done", wx.OK | wx.ICON_INFORMATION)
+        self.on_highlight()
 
     def _parse_m3u_return(self, content: str) -> List[Dict[str, str]]:
         lines = content.splitlines()
