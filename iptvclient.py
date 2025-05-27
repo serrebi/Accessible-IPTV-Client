@@ -79,6 +79,12 @@ def relaxed_name(name: str) -> str:
     n = re.sub(r'\s+', ' ', n)
     return n.strip()
 
+def utc_to_local(dt):
+    # Convert UTC datetime to local time zone
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone()
+
 class EPGDatabase:
     def __init__(self, db_path: str, for_threading=False):
         self.db_path = db_path
@@ -169,7 +175,7 @@ class EPGDatabase:
             }
             row2 = c.execute(
                 "SELECT title, start, end FROM programmes WHERE channel_id = ? AND start > ? ORDER BY start ASC LIMIT 1",
-                (ch_id, end)).fetchone()
+                (ch_id, now_str)).fetchone()
             if row2:
                 title2, start2, end2 = row2
                 nxt = {
@@ -736,12 +742,16 @@ class IPTVClient(wx.Frame):
             return "No EPG data available."
         now, nxt = now_next
         msg = ""
+        def localfmt(dt):
+            # Converts UTC to local time and returns H:MM
+            local = utc_to_local(dt)
+            return local.strftime('%H:%M')
         if now:
-            msg += f"Now: {now['title']} ({now['start'].strftime('%H:%M')} – {now['end'].strftime('%H:%M')})"
+            msg += f"Now: {now['title']} ({localfmt(now['start'])} – {localfmt(now['end'])})"
         else:
             msg += "No program currently airing."
         if nxt:
-            msg += f"\nNext: {nxt['title']} ({nxt['start'].strftime('%H:%M')} – {nxt['end'].strftime('%H:%M')})"
+            msg += f"\nNext: {nxt['title']} ({localfmt(nxt['start'])} – {localfmt(nxt['end'])})"
         return msg
 
     def play_selected(self):
@@ -817,25 +827,28 @@ class IPTVClient(wx.Frame):
         self.on_highlight()
 
     def _parse_m3u_return(self, content: str) -> List[Dict[str, str]]:
+        # Robust parser: always takes name after the last comma,
+        # strips out junk, handles missing/extra quotes.
         lines = content.splitlines()
         current_group = "Uncategorized"
         out = []
         for i, line in enumerate(lines):
             if line.startswith("#EXTINF"):
-                name = line.split(',', 1)[1] if ',' in line else ''
                 group = current_group
                 tvg_id = ""
-                if 'group-title="' in line:
-                    try:
-                        group = line.split('group-title="', 1)[1].split('"', 1)[0]
-                        current_group = group
-                    except Exception:
-                        group = current_group
-                if 'tvg-id="' in line:
-                    try:
-                        tvg_id = line.split('tvg-id="', 1)[1].split('"', 1)[0]
-                    except Exception:
-                        tvg_id = ""
+                group_match = re.search(r'group-title="([^"]*)"', line)
+                if group_match:
+                    group = group_match.group(1)
+                    current_group = group
+                tvg_id_match = re.search(r'tvg-id="([^"]*)"', line)
+                if tvg_id_match:
+                    tvg_id = tvg_id_match.group(1)
+                # Always take everything after the last comma as name
+                if ',' in line:
+                    name = line.rsplit(',', 1)[-1]
+                else:
+                    name = ''
+                name = name.strip(' "\'')
                 url = ''
                 for j in range(i+1, min(i+4, len(lines))):
                     if lines[j].startswith(('http://', 'https://')):
