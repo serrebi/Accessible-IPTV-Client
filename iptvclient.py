@@ -59,25 +59,70 @@ def save_config(cfg: Dict):
     except Exception as e:
         wx.LogError(f"Failed to save config: {e}")
 
+# Flexible list of tags to strip from names
+STRIP_TAGS = [
+    'hd', 'sd', 'hevc', 'fhd', 'uhd', '4k', '8k', 'hdr', 'dash', 'hq', 'st',
+    'us', 'usa', 'ca', 'canada', 'car', 'uk', 'u.k.', 'u.k', 'uk.', 'u.s.', 'u.s', 'us.', 'au', 'aus', 'nz'
+]
 def canonicalize_name(name: str) -> str:
     name = name.strip().lower()
-    tags = ['hd', 'sd', 'hevc', 'fhd', 'uhd', '4k', '8k', 'hdr', 'dash', 'hq']
+    tags = STRIP_TAGS
     pattern = r'^(?:' + '|'.join(tags) + r')\b[\s\-:]*|[\s\-:]*\b(?:' + '|'.join(tags) + r')$'
     while True:
         newname = re.sub(pattern, '', name, flags=re.I).strip()
         if newname == name:
             break
         name = newname
-    return name
+    # Remove left-over country/group tags in middle
+    name = re.sub(r'\b(?:' + '|'.join(tags) + r')\b', '', name, flags=re.I)
+    name = re.sub(r'\s+', ' ', name)
+    return name.strip()
 
 def relaxed_name(name: str) -> str:
     n = name.strip().lower()
     n = re.sub(r'[\(\[].*?[\)\]]', '', n)
-    tags = r'\b(?:hd|sd|hevc|fhd|uhd|4k|8k|hdr|dash|hq)\b'
+    tags = r'\b(?:' + '|'.join(STRIP_TAGS) + r')\b'
     n = re.sub(tags, '', n, flags=re.I)
     n = re.sub(r'[^\w\s]', '', n)
     n = re.sub(r'\s+', ' ', n)
     return n.strip()
+
+def extract_group(title: str) -> str:
+    if not title:
+        return ''
+    title = title.lower()
+    # Accepts "us", "usa", "united states", "ca", "canada", etc.
+    country_map = {
+        'us': 'us',
+        'usa': 'us',
+        'united states': 'us',
+        'u.s.': 'us',
+        'u.s': 'us',
+        'ca': 'ca',
+        'canada': 'ca',
+        'car': 'ca',
+        'uk': 'uk',
+        'u.k.': 'uk',
+        'u.k': 'uk',
+        'uk.': 'uk',
+        'gb': 'uk',
+        'great britain': 'uk',
+        'au': 'au',
+        'aus': 'au',
+        'australia': 'au',
+        'nz': 'nz',
+        'new zealand': 'nz'
+    }
+    # Find group/country in string
+    for key, val in country_map.items():
+        if re.search(r'\b' + re.escape(key) + r'\b', title):
+            return val
+    # If nothing, just use the first word if it looks like a country code
+    m = re.match(r'([a-z]{2,3})', title)
+    if m:
+        code = m.group(1)
+        return country_map.get(code, code)
+    return ''
 
 def utc_to_local(dt):
     # Convert UTC datetime to local time zone
@@ -98,7 +143,8 @@ class EPGDatabase:
             CREATE TABLE IF NOT EXISTS channels (
                 id TEXT PRIMARY KEY,
                 display_name TEXT,
-                norm_name TEXT
+                norm_name TEXT,
+                group_tag TEXT
             )
         """)
         c.execute("""
@@ -118,15 +164,19 @@ class EPGDatabase:
 
     def insert_channel(self, channel_id: str, display_name: str):
         norm = canonicalize_name(display_name)
+        group_tag = extract_group(display_name)
         c = self.conn.cursor()
-        c.execute("INSERT OR REPLACE INTO channels (id, display_name, norm_name) VALUES (?, ?, ?)", (channel_id, display_name, norm))
+        c.execute(
+            "INSERT OR REPLACE INTO channels (id, display_name, norm_name, group_tag) VALUES (?, ?, ?, ?)",
+            (channel_id, display_name, norm, group_tag)
+        )
 
     def insert_programme(self, channel_id: str, title: str, start: str, end: str):
         c = self.conn.cursor()
         c.execute("INSERT OR IGNORE INTO programmes (channel_id, title, start, end) VALUES (?, ?, ?, ?)", (channel_id, title, start, end))
 
     def prune_old_programmes(self, days: int = 4):
-        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).strftime("%Y%m%d%H%M%S")
+        cutoff = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=days)).strftime("%Y%m%d%H%M%S")
         c = self.conn.cursor()
         c.execute("DELETE FROM programmes WHERE end < ?", (cutoff,))
         self.conn.commit()
@@ -136,29 +186,45 @@ class EPGDatabase:
 
     def get_matching_channel_id(self, channel: Dict[str, str]) -> Optional[str]:
         tvg_id = channel.get("tvg-id", "").strip()
+        group_tag = extract_group(channel.get("group", ""))
+        name = channel.get("name", "")
+
+        c = self.conn.cursor()
+        # Try exact id
         if tvg_id:
-            c = self.conn.cursor()
             row = c.execute("SELECT id FROM channels WHERE id = ?", (tvg_id,)).fetchone()
             if row:
                 return row[0]
-        name = channel.get("name", "")
+
+        # Try exact normalized name within group
         norm = canonicalize_name(name)
-        c = self.conn.cursor()
-        row = c.execute("SELECT id FROM channels WHERE norm_name = ?", (norm,)).fetchone()
+        row = c.execute("SELECT id FROM channels WHERE norm_name = ? AND group_tag = ?", (norm, group_tag)).fetchone()
         if row:
             return row[0]
+
+        # Try relaxed name within group
         relaxed = relaxed_name(name)
-        rows = c.execute("SELECT id, display_name FROM channels").fetchall()
+        rows = c.execute("SELECT id, display_name FROM channels WHERE group_tag = ?", (group_tag,)).fetchall()
         for ch_id, display_name in rows:
             if relaxed_name(display_name) == relaxed:
                 return ch_id
+
+        # If all else fails, try global match (but prefer within country)
+        row = c.execute("SELECT id FROM channels WHERE norm_name = ?", (norm,)).fetchone()
+        if row:
+            return row[0]
+        all_rows = c.execute("SELECT id, display_name FROM channels").fetchall()
+        for ch_id, display_name in all_rows:
+            if relaxed_name(display_name) == relaxed:
+                return ch_id
+
         return None
 
     def get_now_next(self, channel: Dict[str, str]) -> Optional[tuple]:
         ch_id = self.get_matching_channel_id(channel)
         if not ch_id:
             return None
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.UTC)
         now_str = now.strftime("%Y%m%d%H%M%S")
         c = self.conn.cursor()
         row = c.execute(
@@ -743,7 +809,6 @@ class IPTVClient(wx.Frame):
         now, nxt = now_next
         msg = ""
         def localfmt(dt):
-            # Converts UTC to local time and returns H:MM
             local = utc_to_local(dt)
             return local.strftime('%H:%M')
         if now:
