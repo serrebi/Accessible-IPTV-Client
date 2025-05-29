@@ -91,33 +91,15 @@ def extract_group(title: str) -> str:
     if not title:
         return ''
     title = title.lower()
-    # Accepts "us", "usa", "united states", "ca", "canada", etc.
     country_map = {
-        'us': 'us',
-        'usa': 'us',
-        'united states': 'us',
-        'u.s.': 'us',
-        'u.s': 'us',
-        'ca': 'ca',
-        'canada': 'ca',
-        'car': 'ca',
-        'uk': 'uk',
-        'u.k.': 'uk',
-        'u.k': 'uk',
-        'uk.': 'uk',
-        'gb': 'uk',
-        'great britain': 'uk',
-        'au': 'au',
-        'aus': 'au',
-        'australia': 'au',
-        'nz': 'nz',
-        'new zealand': 'nz'
+        'us': 'us', 'usa': 'us', 'united states': 'us', 'u.s.': 'us', 'u.s': 'us',
+        'ca': 'ca', 'canada': 'ca', 'car': 'ca',
+        'uk': 'uk', 'u.k.': 'uk', 'u.k': 'uk', 'uk.': 'uk', 'gb': 'uk', 'great britain': 'uk',
+        'au': 'au', 'aus': 'au', 'australia': 'au', 'nz': 'nz', 'new zealand': 'nz'
     }
-    # Find group/country in string
     for key, val in country_map.items():
         if re.search(r'\b' + re.escape(key) + r'\b', title):
             return val
-    # If nothing, just use the first word if it looks like a country code
     m = re.match(r'([a-z]{2,3})', title)
     if m:
         code = m.group(1)
@@ -190,26 +172,19 @@ class EPGDatabase:
         name = channel.get("name", "")
 
         c = self.conn.cursor()
-        # Try exact id
         if tvg_id:
             row = c.execute("SELECT id FROM channels WHERE id = ?", (tvg_id,)).fetchone()
             if row:
                 return row[0]
-
-        # Try exact normalized name within group
         norm = canonicalize_name(name)
         row = c.execute("SELECT id FROM channels WHERE norm_name = ? AND group_tag = ?", (norm, group_tag)).fetchone()
         if row:
             return row[0]
-
-        # Try relaxed name within group
         relaxed = relaxed_name(name)
         rows = c.execute("SELECT id, display_name FROM channels WHERE group_tag = ?", (group_tag,)).fetchall()
         for ch_id, display_name in rows:
             if relaxed_name(display_name) == relaxed:
                 return ch_id
-
-        # If all else fails, try global match (but prefer within country)
         row = c.execute("SELECT id FROM channels WHERE norm_name = ?", (norm,)).fetchone()
         if row:
             return row[0]
@@ -217,7 +192,6 @@ class EPGDatabase:
         for ch_id, display_name in all_rows:
             if relaxed_name(display_name) == relaxed:
                 return ch_id
-
         return None
 
     def get_now_next(self, channel: Dict[str, str]) -> Optional[tuple]:
@@ -250,6 +224,19 @@ class EPGDatabase:
                     "end": datetime.datetime.strptime(end2, "%Y%m%d%H%M%S")
                 }
         return (current, nxt)
+
+    def get_channels_with_show(self, query: str):
+        # Returns [{name, show_title, start_time, url, group, tvg-id}]
+        c = self.conn.cursor()
+        q = f"%{query.lower()}%"
+        rows = c.execute(
+            "SELECT p.channel_id, p.title, p.start, ch.display_name FROM programmes p "
+            "JOIN channels ch ON p.channel_id = ch.id WHERE LOWER(p.title) LIKE ? ORDER BY p.start ASC", (q,)
+        ).fetchall()
+        result = []
+        for ch_id, show_title, start, display_name in rows:
+            result.append({"channel_id": ch_id, "show_title": show_title, "start": start, "name": display_name})
+        return result
 
     def close(self):
         self.conn.close()
@@ -513,6 +500,7 @@ class IPTVClient(wx.Frame):
         self.channels_by_group: Dict[str, List[Dict[str, str]]] = {}
         self.all_channels: List[Dict[str, str]] = []
         self.filtered: List[Dict[str, str]] = []
+        self.epg_filtered: List[Dict[str, str]] = []
         self.current_group = "All Channels"
         self.default_player = "VLC"
         self.epg_importing = False
@@ -567,7 +555,6 @@ class IPTVClient(wx.Frame):
             all_channels: List[Dict[str, str]] = []
             valid_caches = set()
             seen_channel_keys = set()
-
             results = [None] * len(playlist_sources)
 
             def fetch_playlist(idx, src):
@@ -778,6 +765,7 @@ class IPTVClient(wx.Frame):
     def apply_filter(self):
         txt = self.filter_box.GetValue().lower()
         self.filtered = []
+        self.epg_filtered = []
         self.channel_list.Clear()
         source = (self.all_channels if self.current_group == "All Channels"
                   else self.channels_by_group.get(self.current_group, []))
@@ -785,16 +773,66 @@ class IPTVClient(wx.Frame):
             if txt in ch.get("name", "").lower():
                 self.filtered.append(ch)
                 self.channel_list.Append(ch.get("name", ""))
+        # EPG results: runs in a thread to avoid freezing UI
+        if txt:
+            def epg_search():
+                db = EPGDatabase(get_db_path())
+                try:
+                    results = db.get_channels_with_show(txt)
+                    # Map channel_id to playlist channel for launching
+                    playlist_map = {}
+                    for ch in self.all_channels:
+                        tid = ch.get("tvg-id", "") or ch.get("name", "")
+                        playlist_map[tid] = ch
+                    found = []
+                    for res in results:
+                        # Match by EPG channel_id to playlist channel
+                        best_ch = None
+                        # Try by tvg-id
+                        for ch in self.all_channels:
+                            if (ch.get("tvg-id", "") == res["channel_id"] or
+                                canonicalize_name(ch.get("name", "")) == canonicalize_name(res["name"])):
+                                best_ch = ch
+                                break
+                        if best_ch:
+                            start_dt = datetime.datetime.strptime(res["start"], "%Y%m%d%H%M%S")
+                            local_start = utc_to_local(start_dt).strftime("%Y-%m-%d %H:%M")
+                            name_disp = f"{res['name']}: {res['show_title']} (Starts {local_start})"
+                            # Only add if not already in list
+                            if not any(c.get("url", "") == best_ch.get("url", "") and c.get("epg_show", None) == res["show_title"] and c.get("epg_start", None) == res["start"] for c in self.epg_filtered):
+                                show_info = dict(best_ch)
+                                show_info["epg_show"] = res["show_title"]
+                                show_info["epg_start"] = res["start"]
+                                self.epg_filtered.append(show_info)
+                                wx.CallAfter(self.channel_list.Append, name_disp)
+                    # If this is the first EPG search run, also call highlight
+                    if not self.filtered and self.epg_filtered:
+                        wx.CallAfter(self.channel_list.SetSelection, 0)
+                        wx.CallAfter(self.on_highlight)
+                finally:
+                    db.close()
+            threading.Thread(target=epg_search, daemon=True).start()
 
     def on_highlight(self):
         i = self.channel_list.GetSelection()
-        if 0 <= i < len(self.filtered):
-            self.url_display.SetValue(self.filtered[i].get("url", ""))
-            epg_txt = self.get_epg_info(self.filtered[i])
-            self.epg_display.SetValue(epg_txt)
-        else:
+        idx = i
+        if idx is None or idx < 0:
             self.epg_display.SetValue("")
             self.url_display.SetValue("")
+            return
+        # If within filtered playlist channels
+        if idx < len(self.filtered):
+            ch = self.filtered[idx]
+            self.url_display.SetValue(ch.get("url", ""))
+            epg_txt = self.get_epg_info(ch)
+            self.epg_display.SetValue(epg_txt)
+        else:
+            # EPG-based result
+            eidx = idx - len(self.filtered)
+            if eidx < len(self.epg_filtered):
+                ch = self.epg_filtered[eidx]
+                self.url_display.SetValue(ch.get("url", ""))
+                self.epg_display.SetValue(f"Upcoming: {ch.get('epg_show', '')}\nStart: {ch.get('epg_start', '')}")
 
     def get_epg_info(self, channel):
         if self.epg_importing:
@@ -821,9 +859,17 @@ class IPTVClient(wx.Frame):
 
     def play_selected(self):
         i = self.channel_list.GetSelection()
-        if not (0 <= i < len(self.filtered)):
+        if i is None or i < 0:
             return
-        url = self.filtered[i].get("url", "")
+        if i < len(self.filtered):
+            ch = self.filtered[i]
+        else:
+            eidx = i - len(self.filtered)
+            if eidx < len(self.epg_filtered):
+                ch = self.epg_filtered[eidx]
+            else:
+                return
+        url = ch.get("url", "")
         exe_list = {
             "VLC": [r"C:\Program Files\VideoLAN\VLC\vlc.exe",
                     r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"],
