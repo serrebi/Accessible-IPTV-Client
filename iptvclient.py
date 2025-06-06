@@ -531,7 +531,7 @@ class IPTVClient(wx.Frame):
         self.all_channels: List[Dict[str, str]] = []
         self.displayed: List[Dict[str, str]] = []
         self.current_group = "All Channels"
-        self.default_player = "VLC"
+        self.default_player = self.config.get("media_player", "VLC")
         self.epg_importing = False
         self._build_ui()
         self.Centre()
@@ -707,18 +707,22 @@ class IPTVClient(wx.Frame):
                      self.player_Winamp, self.player_Foobar2000):
             self.Bind(wx.EVT_MENU, lambda _: self._select_player(), item)
 
+        # Set the checked radio item based on the config
+        if hasattr(self, f'player_{self.default_player}'):
+            getattr(self, f'player_{self.default_player}').Check()
+        else:
+            self.player_VLC.Check()
+
     def apply_filter(self):
         txt = self.filter_box.GetValue().strip().lower()
         self.displayed = []
         self.channel_list.Clear()
-        # Show channels instantly
         source = (self.all_channels if self.current_group == "All Channels"
                   else self.channels_by_group.get(self.current_group, []))
         for ch in source:
             if txt in ch.get("name", "").lower():
                 self.displayed.append({"type": "channel", "data": ch})
                 self.channel_list.Append(ch.get("name", ""))
-        # EPG in background (non-blocking)
         if not txt:
             return
         def epg_search():
@@ -730,7 +734,7 @@ class IPTVClient(wx.Frame):
                 results = []
             def update_ui():
                 if txt != self.filter_box.GetValue().strip().lower():
-                    return  # Search changed
+                    return
                 for r in results:
                     label = f"{r['channel_name']} - {r['show_title']} ({self._fmt_time(r['start'])}–{self._fmt_time(r['end'])})"
                     self.displayed.append({"type": "epg", "data": r})
@@ -791,6 +795,8 @@ class IPTVClient(wx.Frame):
             item = getattr(self, f"player_{attr}")
             if item.IsChecked():
                 self.default_player = attr
+                self.config["media_player"] = attr  # Save to config
+                save_config(self.config)
                 break
 
     def on_highlight(self):
@@ -802,9 +808,8 @@ class IPTVClient(wx.Frame):
                 epg_txt = self.get_epg_info(item["data"])
                 self.epg_display.SetValue(epg_txt)
             elif item["type"] == "epg":
-                self.url_display.SetValue("")  # No direct URL for EPG results
+                self.url_display.SetValue("")
                 r = item["data"]
-                # Try to find url for channel
                 url = ""
                 for ch in self.all_channels:
                     if canonicalize_name(ch["name"]) == canonicalize_name(r["channel_name"]):
@@ -850,7 +855,6 @@ class IPTVClient(wx.Frame):
             url = item["data"].get("url", "")
         elif item["type"] == "epg":
             chname = item["data"]["channel_name"]
-            # Try exact
             for ch in self.all_channels:
                 if canonicalize_name(ch["name"]) == canonicalize_name(chname):
                     url = ch.get("url", "")
