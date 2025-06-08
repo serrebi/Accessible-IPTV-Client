@@ -12,6 +12,7 @@ import wx
 import xml.etree.ElementTree as ET
 import datetime
 import re
+import shutil
 
 CONFIG_FILE = "iptvclient.conf"
 DB_FILE = "epg.db"
@@ -696,6 +697,9 @@ class IPTVClient(wx.Frame):
         self.player_Kodi = player_menu.AppendRadioItem(wx.ID_ANY, "Kodi")
         self.player_Winamp = player_menu.AppendRadioItem(wx.ID_ANY, "Winamp")
         self.player_Foobar2000 = player_menu.AppendRadioItem(wx.ID_ANY, "Foobar2000")
+        self.player_MPV = player_menu.AppendRadioItem(wx.ID_ANY, "MPV")
+        self.player_SMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "SMPlayer")
+        self.player_Totem = player_menu.AppendRadioItem(wx.ID_ANY, "Totem")
         om.AppendSubMenu(player_menu, "Media Player to Use")
         mb.Append(om, "Options")
         self.SetMenuBar(mb)
@@ -703,15 +707,33 @@ class IPTVClient(wx.Frame):
         self.Bind(wx.EVT_MENU, self.show_epg_manager, m_epg)
         self.Bind(wx.EVT_MENU, self.import_epg, m_imp)
         self.Bind(wx.EVT_MENU, lambda _: self.Close(), m_exit)
-        for item in (self.player_VLC, self.player_MPC, self.player_Kodi,
-                     self.player_Winamp, self.player_Foobar2000):
+        for item in (
+            self.player_VLC, self.player_MPC, self.player_Kodi,
+            self.player_Winamp, self.player_Foobar2000,
+            self.player_MPV, self.player_SMPlayer, self.player_Totem):
             self.Bind(wx.EVT_MENU, lambda _: self._select_player(), item)
-
-        # Set the checked radio item based on the config
-        if hasattr(self, f'player_{self.default_player}'):
-            getattr(self, f'player_{self.default_player}').Check()
+        # Set radio button checked from config
+        default_attr = f'player_{self.default_player}'
+        if hasattr(self, default_attr):
+            getattr(self, default_attr).Check()
         else:
             self.player_VLC.Check()
+
+    def on_channel_key(self, event):
+        key = event.GetKeyCode()
+        if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            self.play_selected()
+        elif key in (wx.WXK_LEFT, wx.WXK_RIGHT):
+            return  # Block left/right on all platforms
+        else:
+            event.Skip()
+
+    def on_group_key(self, event):
+        key = event.GetKeyCode()
+        if key in (wx.WXK_LEFT, wx.WXK_RIGHT):
+            return  # Block left/right on all platforms
+        else:
+            event.Skip()
 
     def apply_filter(self):
         txt = self.filter_box.GetValue().strip().lower()
@@ -754,44 +776,8 @@ class IPTVClient(wx.Frame):
         self.current_group = sel
         self.apply_filter()
 
-    def on_group_key(self, event):
-        key = event.GetKeyCode()
-        sel = self.group_list.GetSelection()
-        count = self.group_list.GetCount()
-        if key in (wx.WXK_LEFT, wx.WXK_RIGHT):
-            return
-        if key == wx.WXK_UP:
-            if sel > 0:
-                self.group_list.SetSelection(sel - 1)
-                self.on_group_select()
-        elif key == wx.WXK_DOWN:
-            if sel < count - 1:
-                self.group_list.SetSelection(sel + 1)
-                self.on_group_select()
-        else:
-            event.Skip()
-
-    def on_channel_key(self, event):
-        key = event.GetKeyCode()
-        sel = self.channel_list.GetSelection()
-        count = self.channel_list.GetCount()
-        if key in (wx.WXK_LEFT, wx.WXK_RIGHT):
-            return
-        if key == wx.WXK_UP:
-            if sel > 0:
-                self.channel_list.SetSelection(sel - 1)
-                self.on_highlight()
-        elif key == wx.WXK_DOWN:
-            if sel < count - 1:
-                self.channel_list.SetSelection(sel + 1)
-                self.on_highlight()
-        elif key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
-            self.play_selected()
-        else:
-            event.Skip()
-
     def _select_player(self):
-        for attr in ("VLC", "MPC", "Kodi", "Winamp", "Foobar2000"):
+        for attr in ("VLC", "MPC", "Kodi", "Winamp", "Foobar2000", "MPV", "SMPlayer", "Totem"):
             item = getattr(self, f"player_{attr}")
             if item.IsChecked():
                 self.default_player = attr
@@ -863,21 +849,47 @@ class IPTVClient(wx.Frame):
             wx.MessageBox("Could not find stream URL for this show.", "Not Found",
                           wx.OK | wx.ICON_WARNING)
             return
-        exe_list = {
-            "VLC": [r"C:\Program Files\VideoLAN\VLC\vlc.exe",
-                    r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"],
-            "MPC": [r"C:\Program Files\MPC-HC\mpc-hc64.exe",
-                    r"C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe"],
-            "Kodi": [r"C:\Program Files\Kodi\kodi.exe"],
-            "Winamp": [r"C:\Program Files\Winamp\winamp.exe"],
-            "Foobar2000": [r"C:\Program Files\foobar2000\foobar2000.exe"],
-        }[self.default_player]
-        for p in exe_list:
-            if os.path.exists(p):
-                os.spawnl(os.P_NOWAIT, p, os.path.basename(p), url)
+
+        player = self.default_player
+
+        if sys.platform.startswith("win"):
+            exe_list = {
+                "VLC": [r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+                        r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"],
+                "MPC": [r"C:\Program Files\MPC-HC\mpc-hc64.exe",
+                        r"C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe"],
+                "Kodi": [r"C:\Program Files\Kodi\kodi.exe"],
+                "Winamp": [r"C:\Program Files\Winamp\winamp.exe"],
+                "Foobar2000": [r"C:\Program Files\foobar2000\foobar2000.exe"],
+                "MPV": [r"C:\Program Files\mpv\mpv.exe",
+                        r"C:\Program Files (x86)\mpv\mpv.exe"],
+                "SMPlayer": [r"C:\Program Files\SMPlayer\smplayer.exe"],
+                "Totem": [],
+            }.get(player, [])
+            for p in exe_list:
+                if os.path.exists(p):
+                    os.spawnl(os.P_NOWAIT, p, os.path.basename(p), url)
+                    return
+            wx.MessageBox(f"{player} not found.", "Error",
+                          wx.OK | wx.ICON_ERROR)
+        else:
+            linux_players = {
+                "VLC": "vlc",
+                "MPV": "mpv",
+                "Kodi": "kodi",
+                "SMPlayer": "smplayer",
+                "Totem": "totem",
+            }
+            exe = linux_players.get(player, player.lower())
+            found = shutil.which(exe)
+            if found:
+                try:
+                    threading.Thread(target=lambda: os.system(f'"{found}" "{url}" &'), daemon=True).start()
+                except Exception as e:
+                    wx.MessageBox(f"Failed to start {player}: {e}", "Error", wx.OK | wx.ICON_ERROR)
                 return
-        wx.MessageBox(f"{self.default_player} not found.", "Error",
-                      wx.OK | wx.ICON_ERROR)
+            wx.MessageBox(f"{player} not found in PATH.", "Error",
+                          wx.OK | wx.ICON_ERROR)
 
     def _refresh_group_ui(self):
         self.group_list.Clear()
