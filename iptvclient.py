@@ -1004,7 +1004,7 @@ class IPTVClient(wx.Frame):
         return out
 
     def Destroy(self):
-        super().Destroy()
+        return super().Destroy()
 
 if __name__ == '__main__':
     # underlying wxgtk is configured to move the menu to the top pannel by default on linux
