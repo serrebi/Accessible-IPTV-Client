@@ -64,6 +64,7 @@ STRIP_TAGS = [
     'hd', 'sd', 'hevc', 'fhd', 'uhd', '4k', '8k', 'hdr', 'dash', 'hq', 'st',
     'us', 'usa', 'ca', 'canada', 'car', 'uk', 'u.k.', 'u.k', 'uk.', 'u.s.', 'u.s', 'us.', 'au', 'aus', 'nz'
 ]
+
 def canonicalize_name(name: str) -> str:
     name = name.strip().lower()
     tags = STRIP_TAGS
@@ -541,6 +542,22 @@ class IPTVClient(wx.Frame):
         self.Show()
         self.start_epg_import_background()
 
+        # ======== LINUX MENU BAR HANDLING CODE BELOW ========
+        # Add keyboard menu bar access for Linux.
+        if sys.platform.startswith("linux"):
+            self.Bind(wx.EVT_CHAR_HOOK, self.on_linux_menu_bar_key)
+
+    def on_linux_menu_bar_key(self, event):
+        keycode = event.GetKeyCode()
+        alt_down = event.AltDown()
+        if keycode == wx.WXK_F10 or (keycode == wx.WXK_ALT and not event.ControlDown() and not event.ShiftDown()):
+            menubar = self.GetMenuBar()
+            if menubar is not None:
+                menubar.SetFocus()
+                menubar.EnableTop(0, True)
+            return
+        event.Skip()
+
     def reload_all_sources_initial(self):
         self.playlist_sources = self.config.get("playlists", [])
         self.channels_by_group.clear()
@@ -1006,6 +1023,13 @@ class IPTVClient(wx.Frame):
         super().Destroy()
 
 if __name__ == '__main__':
-    app = wx.App(False)
-    IPTVClient()
-    app.MainLoop()
+    try:
+        app = wx.App(False)
+        IPTVClient()
+        app.MainLoop()
+    except Exception as e:
+        try:
+            wx.MessageBox(f"An unexpected error occurred:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
+        except Exception:
+            print(f"An unexpected error occurred: {e}")
+        sys.exit(1)
