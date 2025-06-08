@@ -45,7 +45,8 @@ Clone this repo, or download the zip. Then
 pip install pyinstaller
 pyinstaller --noconsole --onefile iptvclient.py
 ```
-
+or if you want to build using the split version
+pyinstaller --noconsole --onefile main.py
 Your `.exe` will be in the `dist` folder.
 
 ## Usage
