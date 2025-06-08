@@ -39,14 +39,15 @@ def get_cache_path_for_url(url):
 
 def load_config() -> Dict:
     path = get_config_path()
-    default = {"playlists": [], "epgs": []}
+    default = {"playlists": [], "epgs": [], "media_player": "VLC", "custom_player_path": ""}
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict):
-                    if "playlists" not in data: data["playlists"] = []
-                    if "epgs" not in data: data["epgs"] = []
+                    for k in default:
+                        if k not in data:
+                            data[k] = default[k]
                     return data
         except Exception as e:
             wx.LogError(f"Failed to load config: {e}")
@@ -64,7 +65,6 @@ STRIP_TAGS = [
     'hd', 'sd', 'hevc', 'fhd', 'uhd', '4k', '8k', 'hdr', 'dash', 'hq', 'st',
     'us', 'usa', 'ca', 'canada', 'car', 'uk', 'u.k.', 'u.k', 'uk.', 'u.s.', 'u.s', 'us.', 'au', 'aus', 'nz'
 ]
-
 def canonicalize_name(name: str) -> str:
     name = name.strip().lower()
     tags = STRIP_TAGS
@@ -112,6 +112,27 @@ def utc_to_local(dt):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=datetime.timezone.utc)
     return dt.astimezone()
+
+class CustomPlayerDialog(wx.Dialog):
+    def __init__(self, parent, initial_path):
+        super().__init__(parent, title="Select Custom Player")
+        self.path = initial_path or ""
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        self.txt = wx.TextCtrl(self, value=self.path)
+        browse = wx.Button(self, label="Browse...")
+        btns = self.CreateButtonSizer(wx.OK|wx.CANCEL)
+        sizer.Add(wx.StaticText(self, label="Enter player executable or path:"), 0, wx.ALL, 5)
+        sizer.Add(self.txt, 0, wx.EXPAND|wx.ALL, 5)
+        sizer.Add(browse, 0, wx.ALL, 5)
+        sizer.Add(btns, 0, wx.ALL|wx.ALIGN_RIGHT, 5)
+        self.SetSizerAndFit(sizer)
+        browse.Bind(wx.EVT_BUTTON, self.on_browse)
+    def on_browse(self, _):
+        with wx.FileDialog(self, "Select Player Executable", style=wx.FD_OPEN) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                self.txt.SetValue(dlg.GetPath())
+    def GetPath(self):
+        return self.txt.GetValue()
 
 class EPGDatabase:
     def __init__(self, db_path: str, for_threading=False, readonly=False):
@@ -179,23 +200,19 @@ class EPGDatabase:
         name = channel.get("name", "")
 
         c = self.conn.cursor()
-        # Try exact id
         if tvg_id:
             row = c.execute("SELECT id FROM channels WHERE id = ?", (tvg_id,)).fetchone()
             if row:
                 return row[0]
-        # Try exact normalized name within group
         norm = canonicalize_name(name)
         row = c.execute("SELECT id FROM channels WHERE norm_name = ? AND group_tag = ?", (norm, group_tag)).fetchone()
         if row:
             return row[0]
-        # Try relaxed name within group
         relaxed = relaxed_name(name)
         rows = c.execute("SELECT id, display_name FROM channels WHERE group_tag = ?", (group_tag,)).fetchall()
         for ch_id, display_name in rows:
             if relaxed_name(display_name) == relaxed:
                 return ch_id
-        # If all else fails, try global match
         row = c.execute("SELECT id FROM channels WHERE norm_name = ?", (norm,)).fetchone()
         if row:
             return row[0]
@@ -534,6 +551,7 @@ class IPTVClient(wx.Frame):
         self.displayed: List[Dict[str, str]] = []
         self.current_group = "All Channels"
         self.default_player = self.config.get("media_player", "VLC")
+        self.custom_player_path = self.config.get("custom_player_path", "")
         self.epg_importing = False
         self._build_ui()
         self.Centre()
@@ -541,22 +559,6 @@ class IPTVClient(wx.Frame):
         self.reload_epg_sources()
         self.Show()
         self.start_epg_import_background()
-
-        # ======== LINUX MENU BAR HANDLING CODE BELOW ========
-        # Add keyboard menu bar access for Linux.
-        if sys.platform.startswith("linux"):
-            self.Bind(wx.EVT_CHAR_HOOK, self.on_linux_menu_bar_key)
-
-    def on_linux_menu_bar_key(self, event):
-        keycode = event.GetKeyCode()
-        alt_down = event.AltDown()
-        if keycode == wx.WXK_F10 or (keycode == wx.WXK_ALT and not event.ControlDown() and not event.ShiftDown()):
-            menubar = self.GetMenuBar()
-            if menubar is not None:
-                menubar.SetFocus()
-                menubar.EnableTop(0, True)
-            return
-        event.Skip()
 
     def reload_all_sources_initial(self):
         self.playlist_sources = self.config.get("playlists", [])
@@ -717,6 +719,9 @@ class IPTVClient(wx.Frame):
         self.player_MPV = player_menu.AppendRadioItem(wx.ID_ANY, "MPV")
         self.player_SMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "SMPlayer")
         self.player_Totem = player_menu.AppendRadioItem(wx.ID_ANY, "Totem")
+        self.player_QuickTime = player_menu.AppendRadioItem(wx.ID_ANY, "QuickTime")
+        self.player_iTunes = player_menu.AppendRadioItem(wx.ID_ANY, "iTunes/Apple Music")
+        self.player_Custom = player_menu.AppendRadioItem(wx.ID_ANY, "Custom Player...")
         om.AppendSubMenu(player_menu, "Media Player to Use")
         mb.Append(om, "Options")
         self.SetMenuBar(mb)
@@ -724,17 +729,43 @@ class IPTVClient(wx.Frame):
         self.Bind(wx.EVT_MENU, self.show_epg_manager, m_epg)
         self.Bind(wx.EVT_MENU, self.import_epg, m_imp)
         self.Bind(wx.EVT_MENU, lambda _: self.Close(), m_exit)
-        for item in (
-            self.player_VLC, self.player_MPC, self.player_Kodi,
-            self.player_Winamp, self.player_Foobar2000,
-            self.player_MPV, self.player_SMPlayer, self.player_Totem):
-            self.Bind(wx.EVT_MENU, lambda _: self._select_player(), item)
+        for item, key in [
+            (self.player_VLC, "VLC"), (self.player_MPC, "MPC"),
+            (self.player_Kodi, "Kodi"), (self.player_Winamp, "Winamp"),
+            (self.player_Foobar2000, "Foobar2000"), (self.player_MPV, "MPV"),
+            (self.player_SMPlayer, "SMPlayer"), (self.player_Totem, "Totem"),
+            (self.player_QuickTime, "QuickTime"), (self.player_iTunes, "iTunes/Apple Music")
+        ]:
+            self.Bind(wx.EVT_MENU, lambda evt, attr=key: self._select_player(attr), item)
+        self.Bind(wx.EVT_MENU, self._select_custom_player, self.player_Custom)
         # Set radio button checked from config
-        default_attr = f'player_{self.default_player}'
-        if hasattr(self, default_attr):
-            getattr(self, default_attr).Check()
+        defplayer = self.config.get("media_player", "VLC")
+        if defplayer == "Custom":
+            self.player_Custom.Check()
         else:
-            self.player_VLC.Check()
+            attr = f"player_{defplayer.replace('/','').replace(' ','')}"
+            if hasattr(self, attr):
+                getattr(self, attr).Check()
+            else:
+                self.player_VLC.Check()
+
+    def _select_player(self, player):
+        self.default_player = player
+        self.config["media_player"] = player
+        save_config(self.config)
+
+    def _select_custom_player(self, _):
+        dlg = CustomPlayerDialog(self, self.config.get("custom_player_path", ""))
+        if dlg.ShowModal() == wx.ID_OK:
+            path = dlg.GetPath().strip()
+            if path:
+                self.custom_player_path = path
+                self.default_player = "Custom"
+                self.config["media_player"] = "Custom"
+                self.config["custom_player_path"] = path
+                save_config(self.config)
+        dlg.Destroy()
+        self.player_Custom.Check()
 
     def on_channel_key(self, event):
         key = event.GetKeyCode()
@@ -792,15 +823,6 @@ class IPTVClient(wx.Frame):
         sel = self.group_list.GetStringSelection().split(" (", 1)[0]
         self.current_group = sel
         self.apply_filter()
-
-    def _select_player(self):
-        for attr in ("VLC", "MPC", "Kodi", "Winamp", "Foobar2000", "MPV", "SMPlayer", "Totem"):
-            item = getattr(self, f"player_{attr}")
-            if item.IsChecked():
-                self.default_player = attr
-                self.config["media_player"] = attr  # Save to config
-                save_config(self.config)
-                break
 
     def on_highlight(self):
         i = self.channel_list.GetSelection()
@@ -868,35 +890,115 @@ class IPTVClient(wx.Frame):
             return
 
         player = self.default_player
+        custom_path = self.config.get("custom_player_path", "")
+
+        # Build exec path lists
+        win_paths = {
+            "VLC": [
+                r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+                r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"
+            ],
+            "MPC": [
+                r"C:\Program Files\MPC-HC\mpc-hc64.exe",
+                r"C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe"
+            ],
+            "Kodi": [r"C:\Program Files\Kodi\kodi.exe"],
+            "Winamp": [r"C:\Program Files\Winamp\winamp.exe"],
+            "Foobar2000": [r"C:\Program Files\foobar2000\foobar2000.exe"],
+            "MPV": [
+                r"C:\Program Files\mpv\mpv.exe",
+                r"C:\Program Files (x86)\mpv\mpv.exe"
+            ],
+            "SMPlayer": [r"C:\Program Files\SMPlayer\smplayer.exe"],
+            "Totem": [],
+            "QuickTime": [
+                r"C:\Program Files\QuickTime\QuickTimePlayer.exe",
+                r"C:\Program Files (x86)\QuickTime\QuickTimePlayer.exe"
+            ],
+            "iTunes/Apple Music": [
+                r"C:\Program Files\iTunes\iTunes.exe",
+                r"C:\Program Files (x86)\iTunes\iTunes.exe",
+                r"C:\Program Files\WindowsApps\AppleInc.AppleMusic_*",
+                r"C:\Program Files\Apple\Music\AppleMusic.exe",
+            ]
+        }
+        mac_paths = {
+            "VLC": ["/Applications/VLC.app/Contents/MacOS/VLC"],
+            "QuickTime": ["/Applications/QuickTime Player.app/Contents/MacOS/QuickTime Player"],
+            "iTunes/Apple Music": [
+                "/Applications/iTunes.app/Contents/MacOS/iTunes",
+                "/Applications/Music.app/Contents/MacOS/Music"
+            ]
+        }
+        linux_players = {
+            "VLC": "vlc",
+            "MPV": "mpv",
+            "Kodi": "kodi",
+            "SMPlayer": "smplayer",
+            "Totem": "totem"
+        }
+
+        if player == "Custom":
+            exe = custom_path
+            if not exe:
+                wx.MessageBox("No custom player set.", "Error", wx.OK | wx.ICON_ERROR)
+                return
+            if not os.path.exists(exe):
+                wx.MessageBox("Custom player path does not exist.", "Error", wx.OK | wx.ICON_ERROR)
+                return
+            try:
+                if sys.platform.startswith("win"):
+                    os.spawnl(os.P_NOWAIT, exe, os.path.basename(exe), url)
+                else:
+                    threading.Thread(target=lambda: os.system(f'"{exe}" "{url}" &'), daemon=True).start()
+            except Exception as e:
+                wx.MessageBox(f"Failed to start custom player: {e}", "Error", wx.OK | wx.ICON_ERROR)
+            return
 
         if sys.platform.startswith("win"):
-            exe_list = {
-                "VLC": [r"C:\Program Files\VideoLAN\VLC\vlc.exe",
-                        r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"],
-                "MPC": [r"C:\Program Files\MPC-HC\mpc-hc64.exe",
-                        r"C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe"],
-                "Kodi": [r"C:\Program Files\Kodi\kodi.exe"],
-                "Winamp": [r"C:\Program Files\Winamp\winamp.exe"],
-                "Foobar2000": [r"C:\Program Files\foobar2000\foobar2000.exe"],
-                "MPV": [r"C:\Program Files\mpv\mpv.exe",
-                        r"C:\Program Files (x86)\mpv\mpv.exe"],
-                "SMPlayer": [r"C:\Program Files\SMPlayer\smplayer.exe"],
-                "Totem": [],
-            }.get(player, [])
+            exe_list = win_paths.get(player, [])
+            found = ""
             for p in exe_list:
+                # Wildcard for Apple Music WindowsApps
+                if "*" in p:
+                    folder = os.path.dirname(p)
+                    try:
+                        import glob
+                        matches = glob.glob(p)
+                        if matches:
+                            # Try AppleMusic.exe inside found folder(s)
+                            for match in matches:
+                                am = os.path.join(match, "AppleMusic.exe")
+                                if os.path.exists(am):
+                                    found = am
+                                    break
+                            if found:
+                                break
+                    except Exception:
+                        continue
                 if os.path.exists(p):
-                    os.spawnl(os.P_NOWAIT, p, os.path.basename(p), url)
-                    return
+                    found = p
+                    break
+            if found:
+                try:
+                    os.spawnl(os.P_NOWAIT, found, os.path.basename(found), url)
+                except Exception as e:
+                    wx.MessageBox(f"Failed to start {player}: {e}", "Error", wx.OK | wx.ICON_ERROR)
+                return
             wx.MessageBox(f"{player} not found.", "Error",
                           wx.OK | wx.ICON_ERROR)
+        elif sys.platform == "darwin":
+            plist = mac_paths.get(player, [])
+            for path in plist:
+                if os.path.exists(path):
+                    try:
+                        threading.Thread(target=lambda: os.system(f'"{path}" "{url}" &'), daemon=True).start()
+                    except Exception as e:
+                        wx.MessageBox(f"Failed to start {player}: {e}", "Error", wx.OK | wx.ICON_ERROR)
+                    return
+            wx.MessageBox(f"{player} not found in /Applications.", "Error",
+                          wx.OK | wx.ICON_ERROR)
         else:
-            linux_players = {
-                "VLC": "vlc",
-                "MPV": "mpv",
-                "Kodi": "kodi",
-                "SMPlayer": "smplayer",
-                "Totem": "totem",
-            }
             exe = linux_players.get(player, player.lower())
             found = shutil.which(exe)
             if found:
@@ -1023,13 +1125,6 @@ class IPTVClient(wx.Frame):
         super().Destroy()
 
 if __name__ == '__main__':
-    try:
-        app = wx.App(False)
-        IPTVClient()
-        app.MainLoop()
-    except Exception as e:
-        try:
-            wx.MessageBox(f"An unexpected error occurred:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
-        except Exception:
-            print(f"An unexpected error occurred: {e}")
-        sys.exit(1)
+    app = wx.App(False)
+    IPTVClient()
+    app.MainLoop()
