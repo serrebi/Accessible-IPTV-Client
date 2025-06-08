@@ -703,6 +703,7 @@ class IPTVClient(wx.Frame):
         om.AppendSubMenu(player_menu, "Media Player to Use")
         mb.Append(om, "Options")
         self.SetMenuBar(mb)
+        mb.EnableTop(pos=0,enable=True)
         self.Bind(wx.EVT_MENU, self.show_manager, m_mgr)
         self.Bind(wx.EVT_MENU, self.show_epg_manager, m_epg)
         self.Bind(wx.EVT_MENU, self.import_epg, m_imp)
@@ -1006,6 +1007,11 @@ class IPTVClient(wx.Frame):
         super().Destroy()
 
 if __name__ == '__main__':
+    # underlying wxgtk is configured to move the menu to the top pannel by default on linux
+    # This was a common thing in 2012.
+    # Now there is no global menu, so we need to hack this in.
+    # It allows focusing menu by pressing F10 key.
+    os.environ["UBUNTU_MENUPROXY"] = "0"
     app = wx.App(False)
     IPTVClient()
     app.MainLoop()
