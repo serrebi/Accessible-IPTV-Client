@@ -13,6 +13,73 @@ import xml.etree.ElementTree as ET
 import datetime
 import re
 import shutil
+import platform
+
+def set_linux_env():
+    if platform.system() != "Linux":
+        return
+
+    # Set for all Linux
+    os.environ["UBUNTU_MENUPROXY"] = "0"
+    # Add any other vars you want set for all Linux distros here
+
+    # Identify distribution
+    distro = "unknown"
+    try:
+        with open("/etc/os-release") as f:
+            os_release = f.read().lower()
+        if "ubuntu" in os_release:
+            distro = "ubuntu"
+        elif "debian" in os_release:
+            distro = "debian"
+        elif "arch" in os_release and "manjaro" not in os_release:
+            distro = "arch"
+        elif "manjaro" in os_release:
+            distro = "manjaro"
+        elif "fedora" in os_release:
+            distro = "fedora"
+        elif "centos" in os_release:
+            distro = "centos"
+        elif "rhel" in os_release or "red hat" in os_release:
+            distro = "rhel"
+        elif "opensuse" in os_release or "suse" in os_release:
+            distro = "opensuse"
+        elif "mint" in os_release:
+            distro = "mint"
+        elif "pop" in os_release and "pop_os" in os_release:
+            distro = "popos"
+    except Exception:
+        pass
+
+    os.environ["MYAPP_DISTRO"] = distro
+
+    # Per-distro variables
+    if distro == "ubuntu":
+        os.environ["UBUNTU_MENUPROXY"] = "0"
+        os.environ["GTK_MODULES"] = os.environ.get("GTK_MODULES", "")  # Example, add as needed
+
+    elif distro == "debian":
+        os.environ["GTK_OVERLAY_SCROLLING"] = "0"
+    elif distro == "arch":
+        os.environ["NO_AT_BRIDGE"] = "1"
+    elif distro == "manjaro":
+        os.environ["NO_AT_BRIDGE"] = "1"
+    elif distro == "fedora":
+        os.environ["GTK_USE_PORTAL"] = "1"
+    elif distro == "centos":
+        os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
+    elif distro == "rhel":
+        os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
+    elif distro == "opensuse":
+        os.environ["XDG_CURRENT_DESKTOP"] = os.environ.get("XDG_CURRENT_DESKTOP", "KDE")
+    elif distro == "mint":
+        os.environ["XDG_CURRENT_DESKTOP"] = os.environ.get("XDG_CURRENT_DESKTOP", "X-Cinnamon")
+    elif distro == "popos":
+        os.environ["GDK_BACKEND"] = os.environ.get("GDK_BACKEND", "x11")
+
+    # Add or modify per-distro variables above as needed!
+
+set_linux_env()
 
 from options import (
     load_config, save_config, get_cache_path_for_url, get_cache_dir,
@@ -601,7 +668,7 @@ class IPTVClient(wx.Frame):
         return out
 
     def Destroy(self):
-        return super().Destroy()   # <--- THIS IS THE FIX
+        return super().Destroy()
 
 if __name__ == '__main__':
     app = wx.App(False)
