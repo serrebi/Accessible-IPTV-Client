@@ -601,7 +601,7 @@ class IPTVClient(wx.Frame):
         return out
 
     def Destroy(self):
-        super().Destroy()
+        return super().Destroy()   # <--- THIS IS THE FIX
 
 if __name__ == '__main__':
     app = wx.App(False)
