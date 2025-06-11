@@ -61,9 +61,9 @@ def set_linux_env():
     elif distro == "debian":
         os.environ["GTK_OVERLAY_SCROLLING"] = "0"
     elif distro == "arch":
-        os.environ["NO_AT_BRIDGE"] = "1"
+        os.environ["NO_AT_BRIDGE"] = "0"
     elif distro == "manjaro":
-        os.environ["NO_AT_BRIDGE"] = "1"
+        os.environ["NO_AT_BRIDGE"] = "0"
     elif distro == "fedora":
         os.environ["GTK_USE_PORTAL"] = "1"
     elif distro == "centos":
