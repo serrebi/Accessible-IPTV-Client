@@ -8,6 +8,7 @@ import datetime
 import re
 import wx
 from typing import Dict, List, Optional
+import difflib
 
 STRIP_TAGS = [
     'hd', 'sd', 'hevc', 'fhd', 'uhd', '4k', '8k', 'hdr', 'dash', 'hq', 'st',
@@ -118,33 +119,74 @@ class EPGDatabase:
         self.conn.commit()
 
     def get_matching_channel_id(self, channel: Dict[str, str]) -> Optional[str]:
+        """Return the best‑guess EPG channel id for a given playlist entry.
+    
+        Matching strategy (in order):
+        1. Exact ``tvg-id`` match.
+        2. Exact canonicalised ``tvg-name`` match.
+        3. Exact canonicalised playlist name + group tag match.
+        4. Exact relaxed token match inside the same group.
+        5. Fuzzy (SequenceMatcher ratio >= 0.85) inside the same group.
+        6. Fuzzy (ratio >= 0.90) across all channels.
+    
+        Improves matching for variants such as “Sky Mix”, “SkyMix”, “Sky Mix HD”.
+        """
         tvg_id = channel.get("tvg-id", "").strip()
-        group_tag = extract_group(channel.get("group", ""))
+        tvg_name = channel.get("tvg-name", "").strip()
+        group_tag = extract_group(channel.get("group", "")) if channel.get("group") else ''
         name = channel.get("name", "")
-
+    
         c = self.conn.cursor()
+    
+        # 1. Exact ID
         if tvg_id:
             row = c.execute("SELECT id FROM channels WHERE id = ?", (tvg_id,)).fetchone()
             if row:
                 return row[0]
-        norm = canonicalize_name(name)
-        row = c.execute("SELECT id FROM channels WHERE norm_name = ? AND group_tag = ?", (norm, group_tag)).fetchone()
+    
+        # 2. Exact canonicalised ``tvg-name``
+        if tvg_name:
+            norm_tvg_name = canonicalize_name(tvg_name)
+            row = c.execute("SELECT id FROM channels WHERE norm_name = ?", (norm_tvg_name,)).fetchone()
+            if row:
+                return row[0]
+    
+        # 3. Exact canonicalised playlist name + group
+        norm_name_pl = canonicalize_name(name)
+        row = c.execute("SELECT id FROM channels WHERE norm_name = ? AND group_tag = ?", (norm_name_pl, group_tag)).fetchone()
         if row:
             return row[0]
-        relaxed = relaxed_name(name)
-        rows = c.execute("SELECT id, display_name FROM channels WHERE group_tag = ?", (group_tag,)).fetchall()
-        for ch_id, display_name in rows:
-            if relaxed_name(display_name) == relaxed:
+    
+        # Collect candidate rows
+        relaxed_target = relaxed_name(name)
+    
+        rows_same_group = c.execute("SELECT id, display_name FROM channels WHERE group_tag = ?", (group_tag,)).fetchall() if group_tag else []
+        rows_all = c.execute("SELECT id, display_name FROM channels").fetchall()
+    
+        # 4. Exact relaxed token match inside group
+        for ch_id, disp in rows_same_group:
+            if relaxed_name(disp) == relaxed_target:
                 return ch_id
-        row = c.execute("SELECT id FROM channels WHERE norm_name = ?", (norm,)).fetchone()
-        if row:
-            return row[0]
-        all_rows = c.execute("SELECT id, display_name FROM channels").fetchall()
-        for ch_id, display_name in all_rows:
-            if relaxed_name(display_name) == relaxed:
-                return ch_id
-        return None
-
+    
+        def best_fuzzy(rows, threshold: float) -> Optional[str]:
+            best = None
+            best_ratio = 0.0
+            target = re.sub(r'\s+', '', relaxed_target)
+            for ch_id, disp in rows:
+                cand = re.sub(r'\s+', '', relaxed_name(disp))
+                ratio = difflib.SequenceMatcher(None, target, cand).ratio()
+                if ratio >= threshold and ratio > best_ratio:
+                    best_ratio = ratio
+                    best = ch_id
+            return best
+    
+        # 5. Fuzzy inside same group
+        match = best_fuzzy(rows_same_group, 0.85)
+        if match:
+            return match
+    
+        # 6. Fuzzy across all channels
+        return best_fuzzy(rows_all, 0.90)
     def get_now_next(self, channel: Dict[str, str]) -> Optional[tuple]:
         ch_id = self.get_matching_channel_id(channel)
         if not ch_id:
