@@ -19,11 +19,7 @@ def set_linux_env():
     if platform.system() != "Linux":
         return
 
-    # Set for all Linux
     os.environ["UBUNTU_MENUPROXY"] = "0"
-    # Add any other vars you want set for all Linux distros here
-
-    # Identify distribution
     distro = "unknown"
     try:
         with open("/etc/os-release") as f:
@@ -53,11 +49,9 @@ def set_linux_env():
 
     os.environ["MYAPP_DISTRO"] = distro
 
-    # Per-distro variables
     if distro == "ubuntu":
         os.environ["UBUNTU_MENUPROXY"] = "0"
-        os.environ["GTK_MODULES"] = os.environ.get("GTK_MODULES", "")  # Example, add as needed
-
+        os.environ["GTK_MODULES"] = os.environ.get("GTK_MODULES", "")
     elif distro == "debian":
         os.environ["GTK_OVERLAY_SCROLLING"] = "0"
     elif distro == "arch":
@@ -76,8 +70,6 @@ def set_linux_env():
         os.environ["XDG_CURRENT_DESKTOP"] = os.environ.get("XDG_CURRENT_DESKTOP", "X-Cinnamon")
     elif distro == "popos":
         os.environ["GDK_BACKEND"] = os.environ.get("GDK_BACKEND", "x11")
-
-    # Add or modify per-distro variables above as needed!
 
 set_linux_env()
 
@@ -263,6 +255,7 @@ class IPTVClient(wx.Frame):
         player_menu = wx.Menu()
         self.player_VLC = player_menu.AppendRadioItem(wx.ID_ANY, "VLC")
         self.player_MPC = player_menu.AppendRadioItem(wx.ID_ANY, "MPC")
+        self.player_MPCBE = player_menu.AppendRadioItem(wx.ID_ANY, "MPC-BE")
         self.player_Kodi = player_menu.AppendRadioItem(wx.ID_ANY, "Kodi")
         self.player_Winamp = player_menu.AppendRadioItem(wx.ID_ANY, "Winamp")
         self.player_Foobar2000 = player_menu.AppendRadioItem(wx.ID_ANY, "Foobar2000")
@@ -271,6 +264,13 @@ class IPTVClient(wx.Frame):
         self.player_Totem = player_menu.AppendRadioItem(wx.ID_ANY, "Totem")
         self.player_QuickTime = player_menu.AppendRadioItem(wx.ID_ANY, "QuickTime")
         self.player_iTunes = player_menu.AppendRadioItem(wx.ID_ANY, "iTunes/Apple Music")
+        self.player_PotPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "PotPlayer")
+        self.player_KMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "KMPlayer")
+        self.player_AIMP = player_menu.AppendRadioItem(wx.ID_ANY, "AIMP")
+        self.player_QMPlay2 = player_menu.AppendRadioItem(wx.ID_ANY, "QMPlay2")
+        self.player_GOMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "GOM Player")
+        self.player_Audacious = player_menu.AppendRadioItem(wx.ID_ANY, "Audacious")
+        self.player_Fauxdacious = player_menu.AppendRadioItem(wx.ID_ANY, "Fauxdacious")
         self.player_Custom = player_menu.AppendRadioItem(wx.ID_ANY, "Custom Player...")
         om.AppendSubMenu(player_menu, "Media Player to Use")
         mb.Append(om, "Options")
@@ -280,11 +280,24 @@ class IPTVClient(wx.Frame):
         self.Bind(wx.EVT_MENU, self.import_epg, m_imp)
         self.Bind(wx.EVT_MENU, lambda _: self.Close(), m_exit)
         for item, key in [
-            (self.player_VLC, "VLC"), (self.player_MPC, "MPC"),
-            (self.player_Kodi, "Kodi"), (self.player_Winamp, "Winamp"),
-            (self.player_Foobar2000, "Foobar2000"), (self.player_MPV, "MPV"),
-            (self.player_SMPlayer, "SMPlayer"), (self.player_Totem, "Totem"),
-            (self.player_QuickTime, "QuickTime"), (self.player_iTunes, "iTunes/Apple Music")
+            (self.player_VLC, "VLC"),
+            (self.player_MPC, "MPC"),
+            (self.player_MPCBE, "MPC-BE"),
+            (self.player_Kodi, "Kodi"),
+            (self.player_Winamp, "Winamp"),
+            (self.player_Foobar2000, "Foobar2000"),
+            (self.player_MPV, "MPV"),
+            (self.player_SMPlayer, "SMPlayer"),
+            (self.player_Totem, "Totem"),
+            (self.player_QuickTime, "QuickTime"),
+            (self.player_iTunes, "iTunes/Apple Music"),
+            (self.player_PotPlayer, "PotPlayer"),
+            (self.player_KMPlayer, "KMPlayer"),
+            (self.player_AIMP, "AIMP"),
+            (self.player_QMPlay2, "QMPlay2"),
+            (self.player_GOMPlayer, "GOM Player"),
+            (self.player_Audacious, "Audacious"),
+            (self.player_Fauxdacious, "Fauxdacious"),
         ]:
             self.Bind(wx.EVT_MENU, lambda evt, attr=key: self._select_player(attr), item)
         self.Bind(wx.EVT_MENU, self._select_custom_player, self.player_Custom)
@@ -450,6 +463,11 @@ class IPTVClient(wx.Frame):
                 r"C:\Program Files\MPC-HC\mpc-hc64.exe",
                 r"C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe"
             ],
+            "MPC-BE": [
+                r"C:\Program Files\MPC-BE x64\mpc-be64.exe",
+                r"C:\Program Files\MPC-BE\mpc-be.exe",
+                r"C:\Program Files (x86)\MPC-BE\mpc-be.exe"
+            ],
             "Kodi": [r"C:\Program Files\Kodi\kodi.exe"],
             "Winamp": [r"C:\Program Files\Winamp\winamp.exe"],
             "Foobar2000": [r"C:\Program Files\foobar2000\foobar2000.exe"],
@@ -468,6 +486,34 @@ class IPTVClient(wx.Frame):
                 r"C:\Program Files (x86)\iTunes\iTunes.exe",
                 r"C:\Program Files\WindowsApps\AppleInc.AppleMusic_*",
                 r"C:\Program Files\Apple\Music\AppleMusic.exe",
+            ],
+            "PotPlayer": [
+                r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe",
+                r"C:\Program Files (x86)\DAUM\PotPlayer\PotPlayerMini.exe"
+            ],
+            "KMPlayer": [
+                r"C:\Program Files\KMPlayer\KMPlayer.exe",
+                r"C:\Program Files (x86)\KMPlayer\KMPlayer.exe"
+            ],
+            "AIMP": [
+                r"C:\Program Files\AIMP\AIMP.exe",
+                r"C:\Program Files (x86)\AIMP\AIMP.exe"
+            ],
+            "QMPlay2": [
+                r"C:\Program Files\QMPlay2\QMPlay2.exe",
+                r"C:\Program Files (x86)\QMPlay2\QMPlay2.exe"
+            ],
+            "GOM Player": [
+                r"C:\Program Files\GRETECH\GomPlayer\GOM.exe",
+                r"C:\Program Files (x86)\GRETECH\GomPlayer\GOM.exe"
+            ],
+            "Audacious": [
+                r"C:\Program Files (x86)\Audacious\audacious.exe",
+                r"C:\Program Files\Audacious\audacious.exe"
+            ],
+            "Fauxdacious": [
+                r"C:\Program Files\Fauxdacious\fauxdacious.exe",
+                r"C:\Program Files (x86)\Fauxdacious\fauxdacious.exe"
             ]
         }
         mac_paths = {
@@ -476,14 +522,30 @@ class IPTVClient(wx.Frame):
             "iTunes/Apple Music": [
                 "/Applications/iTunes.app/Contents/MacOS/iTunes",
                 "/Applications/Music.app/Contents/MacOS/Music"
-            ]
+            ],
+            "PotPlayer": [],
+            "KMPlayer": [],
+            "AIMP": [],
+            "QMPlay2": ["/Applications/QMPlay2.app/Contents/MacOS/QMPlay2"],
+            "GOM Player": [],
+            "Audacious": ["/Applications/Audacious.app/Contents/MacOS/Audacious"],
+            "Fauxdacious": ["/Applications/Fauxdacious.app/Contents/MacOS/Fauxdacious"],
+            "MPC-BE": []
         }
         linux_players = {
             "VLC": "vlc",
             "MPV": "mpv",
             "Kodi": "kodi",
             "SMPlayer": "smplayer",
-            "Totem": "totem"
+            "Totem": "totem",
+            "PotPlayer": "potplayer",
+            "KMPlayer": "kmplayer",
+            "AIMP": "aimp",
+            "QMPlay2": "qmplay2",
+            "GOM Player": "gomplayer",
+            "Audacious": "audacious",
+            "Fauxdacious": "fauxdacious",
+            "MPC-BE": "mpc-be"
         }
 
         if player == "Custom":
