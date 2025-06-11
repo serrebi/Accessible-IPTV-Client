@@ -402,7 +402,7 @@ class IPTVClient(wx.Frame):
                     if canonicalize_name(ch["name"]) == canonicalize_name(r["channel_name"]):
                         url = ch.get("url", "")
                         break
-                msg = f"Show: {r['show_title']} | Channel: {r['channel_name']} | Start: {self._fmt_time(r['start'])} | End: {self._fmt_time(r['end'])}"
+                msg = f"Show: {r['show_title']} | Channel: {r['channel_name']} | Start: {self._fmt_time(r['start'])} | End: {self._fmt_time(r['end'])})"
                 self.epg_display.SetValue(msg)
                 self.url_display.SetValue(url)
         else:
@@ -464,9 +464,10 @@ class IPTVClient(wx.Frame):
                 r"C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe"
             ],
             "MPC-BE": [
+                r"C:\Program Files\MPC-BE\mpc-be64.exe",
+                r"C:\Program Files (x86)\MPC-BE\mpc-be.exe",
                 r"C:\Program Files\MPC-BE x64\mpc-be64.exe",
-                r"C:\Program Files\MPC-BE\mpc-be.exe",
-                r"C:\Program Files (x86)\MPC-BE\mpc-be.exe"
+                r"C:\Program Files\MPC-BE\mpc-be.exe"
             ],
             "Kodi": [r"C:\Program Files\Kodi\kodi.exe"],
             "Winamp": [r"C:\Program Files\Winamp\winamp.exe"],
@@ -513,7 +514,9 @@ class IPTVClient(wx.Frame):
             ],
             "Fauxdacious": [
                 r"C:\Program Files\Fauxdacious\fauxdacious.exe",
-                r"C:\Program Files (x86)\Fauxdacious\fauxdacious.exe"
+                r"C:\Program Files (x86)\Fauxdacious\fauxdacious.exe",
+                r"C:\Program Files (x86)\Fauxdacious\bin\fauxdacious.exe",
+                r"C:\Program Files\Fauxdacious\bin\fauxdacious.exe"
             ]
         }
         mac_paths = {
