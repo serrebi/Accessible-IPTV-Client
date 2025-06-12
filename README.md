@@ -7,8 +7,8 @@ An accessible IPTV client VibeCoded using wxPython. Just made this for my own us
 - Fully accessible with all major screen readers on Windows (NVDA, JAWS, etc).
 - Supports m3u and m3u_plus playlists.
 - Playlist Manager: add, remove, and manage playlists. All playlists are stored in `iptvclient.conf` in the same folder as the executable.
-- Supports external media players:
-  Category/Group navigation: browse channels by group.
+- Supports external media players on windows, Mac, and Linux
+- Category/Group navigation: browse channels by group.
 - Channel search and filter field.
 - Keyboard navigation for everything. Mouse not required.
 - Remembers channel and playlist selection after refresh.
@@ -20,8 +20,9 @@ An accessible IPTV client VibeCoded using wxPython. Just made this for my own us
 - Windows 10 or 11
 - Python 3.8+
 - wxPython
-- VLC or any supported player (if you want playback)
-- (Optional) Foobar2000, MPC-HC, Kodi, or Winamp
+- VLC or any supported player
+- a playlist
+
 
 ## Installation
 
@@ -41,6 +42,7 @@ pip install pyinstaller
 pyinstaller --noconsole --onefile iptvclient.py
 ```
 or if you want to build using the split version
+```sh
 pyinstaller --noconsole --onefile main.py
 Your `.exe` will be in the `dist` folder.
 
@@ -65,4 +67,4 @@ Your `.exe` will be in the `dist` folder.
 
 ## Support
 
-I wrote this for myself so there isn't really support. Sorry!
+I wrote this for myself so there isn't really support. Sorry! Would still love to know if something isn't working, though.
