@@ -8,12 +8,7 @@ An accessible IPTV client VibeCoded using wxPython. Just made this for my own us
 - Supports m3u and m3u_plus playlists.
 - Playlist Manager: add, remove, and manage playlists. All playlists are stored in `iptvclient.conf` in the same folder as the executable.
 - Supports external media players:
-  - VLC (external)
-  - Foobar2000
-  - Media Player Classic (MPC-HC)
-  - Kodi
-  - Winamp
-- Category/Group navigation: browse channels by group.
+  Category/Group navigation: browse channels by group.
 - Channel search and filter field.
 - Keyboard navigation for everything. Mouse not required.
 - Remembers channel and playlist selection after refresh.
