@@ -409,9 +409,14 @@ class IPTVClient(wx.Frame):
             self.epg_display.SetValue("")
             self.url_display.SetValue("")
 
+    # LAG FIX IS HERE: Short-circuit DB calls if no EPG sources are loaded!
     def get_epg_info(self, channel):
         if self.epg_importing:
             return "EPG importing…"
+        if not self.epg_sources:
+            return "No EPG data available."
+        if not channel.get("tvg-id") and not channel.get("name"):
+            return "No EPG data available."
         db = EPGDatabase(get_db_path())
         try:
             now_next = db.get_now_next(channel)
@@ -476,7 +481,12 @@ class IPTVClient(wx.Frame):
                 r"C:\Program Files\mpv\mpv.exe",
                 r"C:\Program Files (x86)\mpv\mpv.exe"
             ],
-            "SMPlayer": [r"C:\Program Files\SMPlayer\smplayer.exe"],
+            "SMPlayer": [
+                r"C:\Program Files\SMPlayer\smplayer.exe",
+                r"C:\Program Files (x86)\SMPlayer\smplayer.exe",
+                r"C:\Program Files\WindowsApps\SMPlayerTeam.SMPlayer_*",
+                r"C:\Program Files\WindowsApps\SMPlayerTeam.SMPlayer*\smplayer.exe"
+            ],
             "Totem": [],
             "QuickTime": [
                 r"C:\Program Files\QuickTime\QuickTimePlayer.exe",
@@ -579,6 +589,10 @@ class IPTVClient(wx.Frame):
                         matches = glob.glob(p)
                         if matches:
                             for match in matches:
+                                smplayer_exe = os.path.join(match, "smplayer.exe")
+                                if os.path.exists(smplayer_exe):
+                                    found = smplayer_exe
+                                    break
                                 am = os.path.join(match, "AppleMusic.exe")
                                 if os.path.exists(am):
                                     found = am
