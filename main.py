@@ -95,6 +95,10 @@ class IPTVClient(wx.Frame):
         self.default_player = self.config.get("media_player", "VLC")
         self.custom_player_path = self.config.get("custom_player_path", "")
         self.epg_importing = False
+
+        # EPG cache: key is canonical channel name, value is the (now, next, timestamp)
+        self.epg_cache = {}
+        self.epg_cache_lock = threading.Lock()
         self._build_ui()
         self.Centre()
         self.reload_all_sources_initial()
@@ -386,14 +390,26 @@ class IPTVClient(wx.Frame):
         self.current_group = sel
         self.apply_filter()
 
+    # -- ASYNC LAG-FREE EPG FETCH --
     def on_highlight(self):
         i = self.channel_list.GetSelection()
         if 0 <= i < len(self.displayed):
             item = self.displayed[i]
+            # Channel case
             if item["type"] == "channel":
                 self.url_display.SetValue(item["data"].get("url", ""))
-                epg_txt = self.get_epg_info(item["data"])
-                self.epg_display.SetValue(epg_txt)
+                # Show cached EPG if available, otherwise set to loading
+                cname = canonicalize_name(item["data"].get("name", ""))
+                with self.epg_cache_lock:
+                    cached = self.epg_cache.get(cname)
+                if cached and (datetime.datetime.now() - cached[2]).total_seconds() < 60:
+                    # Fresh cache, display immediately
+                    self.epg_display.SetValue(self._epg_msg_from_tuple(cached[0], cached[1]))
+                else:
+                    self.epg_display.SetValue("Loading program info…")
+                    # Spawn async fetch
+                    threading.Thread(target=self._fetch_and_cache_epg, args=(item["data"], cname), daemon=True).start()
+            # EPG search hit case
             elif item["type"] == "epg":
                 self.url_display.SetValue("")
                 r = item["data"]
@@ -409,26 +425,11 @@ class IPTVClient(wx.Frame):
             self.epg_display.SetValue("")
             self.url_display.SetValue("")
 
-    # LAG FIX IS HERE: Short-circuit DB calls if no EPG sources are loaded!
-    def get_epg_info(self, channel):
-        if self.epg_importing:
-            return "EPG importing…"
-        if not self.epg_sources:
-            return "No EPG data available."
-        if not channel.get("tvg-id") and not channel.get("name"):
-            return "No EPG data available."
-        db = EPGDatabase(get_db_path())
-        try:
-            now_next = db.get_now_next(channel)
-        finally:
-            db.close()
-        if not now_next:
-            return "No EPG data available."
-        now, nxt = now_next
-        msg = ""
+    def _epg_msg_from_tuple(self, now, nxt):
         def localfmt(dt):
             local = utc_to_local(dt)
             return local.strftime('%H:%M')
+        msg = ""
         if now:
             msg += f"Now: {now['title']} ({localfmt(now['start'])} – {localfmt(now['end'])})"
         else:
@@ -436,6 +437,38 @@ class IPTVClient(wx.Frame):
         if nxt:
             msg += f"\nNext: {nxt['title']} ({localfmt(nxt['start'])} – {localfmt(nxt['end'])})"
         return msg
+
+    def _fetch_and_cache_epg(self, channel, cname):
+        if self.epg_importing:
+            wx.CallAfter(self.epg_display.SetValue, "EPG importing…")
+            return
+        if not self.epg_sources:
+            wx.CallAfter(self.epg_display.SetValue, "No EPG data available.")
+            return
+        if not channel.get("tvg-id") and not channel.get("name"):
+            wx.CallAfter(self.epg_display.SetValue, "No EPG data available.")
+            return
+        try:
+            db = EPGDatabase(get_db_path(), readonly=True)
+            now_next = db.get_now_next(channel)
+            db.close()
+        except Exception:
+            now_next = None
+        if not now_next:
+            now_show, next_show = None, None
+        else:
+            now_show, next_show = now_next
+        with self.epg_cache_lock:
+            self.epg_cache[cname] = (now_show, next_show, datetime.datetime.now())
+        # Only update display if this channel is still selected
+        wx.CallAfter(self._update_epg_display_if_selected, channel, now_show, next_show)
+
+    def _update_epg_display_if_selected(self, channel, now_show, next_show):
+        i = self.channel_list.GetSelection()
+        if 0 <= i < len(self.displayed):
+            item = self.displayed[i]
+            if item["type"] == "channel" and canonicalize_name(item["data"].get("name", "")) == canonicalize_name(channel.get("name", "")):
+                self.epg_display.SetValue(self._epg_msg_from_tuple(now_show, next_show))
 
     def play_selected(self):
         i = self.channel_list.GetSelection()

@@ -15,6 +15,12 @@ STRIP_TAGS = [
     'us', 'usa', 'ca', 'canada', 'car', 'uk', 'u.k.', 'u.k', 'uk.', 'u.s.', 'u.s', 'us.', 'au', 'aus', 'nz'
 ]
 
+NOISE_WORDS = [
+    'backup', 'alt', 'feed', 'main', 'extra', 'mirror', 'test', 'temp',
+    '1', '2', '3', '4', '5', '6', '7', '8', '9', '0',
+    'sd', 'hd', 'fhd', 'uhd', '4k', '8k'
+]
+
 def canonicalize_name(name: str) -> str:
     name = name.strip().lower()
     tags = STRIP_TAGS
@@ -28,35 +34,80 @@ def canonicalize_name(name: str) -> str:
     name = re.sub(r'\s+', ' ', name)
     return name.strip()
 
-def relaxed_name(name: str) -> str:
-    n = name.strip().lower()
-    n = re.sub(r'[\(\[].*?[\)\]]', '', n)
-    tags = r'\b(?:' + '|'.join(STRIP_TAGS) + r')\b'
-    n = re.sub(tags, '', n, flags=re.I)
-    n = re.sub(r'[^\w\s]', '', n)
-    n = re.sub(r'\s+', ' ', n)
-    return n.strip()
+def strip_noise_words(text: str) -> str:
+    if not text:
+        return ""
+    text = text.lower()
+    pattern = r'\b(' + '|'.join(re.escape(w) for w in NOISE_WORDS) + r')\b'
+    text = re.sub(pattern, '', text, flags=re.I)
+    text = re.sub(r'[\s\-_]+', ' ', text)
+    return text.strip()
+
+def group_synonyms():
+    return {
+        "us": ["us", "usa", "united states", "u.s.", "u.s", "us.", "america"],
+        "uk": ["uk", "u.k.", "u.k", "uk.", "gb", "great britain", "britain", "england", "scotland", "wales"],
+        "ca": ["ca", "canada", "car"],
+        "au": ["au", "aus", "australia"],
+        "nz": ["nz", "new zealand"],
+        "de": ["de", "germany"],
+        "fr": ["fr", "france"],
+        "it": ["it", "italy"],
+        "es": ["es", "spain"],
+        "pt": ["pt", "portugal"],
+        "ru": ["ru", "russia"],
+        "tr": ["tr", "turkey"],
+        "ro": ["ro", "romania"],
+        "nl": ["nl", "netherlands", "holland"],
+        "se": ["se", "sweden"],
+        "no": ["no", "norway"],
+        "fi": ["fi", "finland"],
+        "dk": ["dk", "denmark"],
+        "pl": ["pl", "poland"],
+        "gr": ["gr", "greece"],
+    }
 
 def extract_group(title: str) -> str:
     if not title:
         return ''
     title = title.lower()
-    country_map = {
-        'us': 'us', 'usa': 'us', 'united states': 'us', 'u.s.': 'us', 'u.s': 'us',
-        'ca': 'ca', 'canada': 'ca', 'car': 'ca',
-        'uk': 'uk', 'u.k.': 'uk', 'u.k': 'uk', 'uk.': 'uk',
-        'gb': 'uk', 'great britain': 'uk',
-        'au': 'au', 'aus': 'au', 'australia': 'au',
-        'nz': 'nz', 'new zealand': 'nz'
-    }
-    for key, val in country_map.items():
-        if re.search(r'\b' + re.escape(key) + r'\b', title):
-            return val
-    m = re.match(r'([a-z]{2,3})', title)
+    for norm_tag, variants in group_synonyms().items():
+        for v in variants:
+            if re.search(r'\b' + re.escape(v) + r'\b', title):
+                return norm_tag
+    m = re.match(r'([a-z]{2,3})\b', title)
     if m:
         code = m.group(1)
-        return country_map.get(code, code)
+        if code in group_synonyms():
+            return code
+    m = re.search(r'\(([a-z]{2,3})\)', title)
+    if m:
+        code = m.group(1)
+        if code in group_synonyms():
+            return code
     return ''
+
+def tokenize_channel_name(name: str) -> set:
+    """Tokenize channel name: split words, pull out callsigns, networks, cities, numbers, ignore case/punct/parentheses."""
+    if not name:
+        return set()
+    # Pull everything inside parens and outside
+    paren = re.findall(r'\(([^)]*)\)', name)
+    outside = re.sub(r'\(.*?\)', '', name)
+    words = re.findall(r'\w+', outside)
+    paren_words = []
+    for p in paren:
+        paren_words.extend(re.findall(r'\w+', p))
+    # Remove obvious noise words, short words, etc.
+    all_words = [w.lower() for w in words + paren_words if len(w) > 1]
+    bad = set(STRIP_TAGS + NOISE_WORDS + [
+        'channel', 'tv', 'the', 'and', 'for', 'with', 'on', 'in', 'f'
+    ])
+    tokens = set([w for w in all_words if w not in bad])
+    return tokens
+
+def strip_backup_terms(name: str) -> str:
+    return strip_noise_words(name)
 
 class EPGDatabase:
     def __init__(self, db_path: str, for_threading=False, readonly=False):
@@ -97,7 +148,7 @@ class EPGDatabase:
         self.conn.commit()
 
     def insert_channel(self, channel_id: str, display_name: str):
-        norm = canonicalize_name(display_name)
+        norm = canonicalize_name(strip_backup_terms(display_name))
         group_tag = extract_group(display_name)
         c = self.conn.cursor()
         c.execute(
@@ -118,105 +169,115 @@ class EPGDatabase:
     def commit(self):
         self.conn.commit()
 
-    def get_matching_channel_id(self, channel: Dict[str, str]) -> Optional[str]:
-        """Return the best‑guess EPG channel id for a given playlist entry.
-    
-        Matching strategy (in order):
-        1. Exact ``tvg-id`` match.
-        2. Exact canonicalised ``tvg-name`` match.
-        3. Exact canonicalised playlist name + group tag match.
-        4. Exact relaxed token match inside the same group.
-        5. Fuzzy (SequenceMatcher ratio >= 0.85) inside the same group.
-        6. Fuzzy (ratio >= 0.90) across all channels.
-    
-        Improves matching for variants such as “Sky Mix”, “SkyMix”, “Sky Mix HD”.
-        """
+    def get_matching_channel_ids(self, channel: Dict[str, str]) -> List[dict]:
+        """Token-based, group-preferred EPG matching."""
         tvg_id = channel.get("tvg-id", "").strip()
         tvg_name = channel.get("tvg-name", "").strip()
-        group_tag = extract_group(channel.get("group", "")) if channel.get("group") else ''
         name = channel.get("name", "")
-    
+        group_tag = extract_group(channel.get("group", "")) if channel.get("group") else ''
+
         c = self.conn.cursor()
-    
+        candidates = {}
+
         # 1. Exact ID
         if tvg_id:
-            row = c.execute("SELECT id FROM channels WHERE id = ?", (tvg_id,)).fetchone()
+            row = c.execute("SELECT id, group_tag, display_name FROM channels WHERE id = ?", (tvg_id,)).fetchone()
             if row:
-                return row[0]
-    
-        # 2. Exact canonicalised ``tvg-name``
+                candidates[row[0]] = {'id': row[0], 'group_tag': row[1], 'score': 100, 'display_name': row[2]}
+
+        # 2. Exact canonicalized tvg-name
         if tvg_name:
-            norm_tvg_name = canonicalize_name(tvg_name)
-            row = c.execute("SELECT id FROM channels WHERE norm_name = ?", (norm_tvg_name,)).fetchone()
-            if row:
-                return row[0]
-    
-        # 3. Exact canonicalised playlist name + group
-        norm_name_pl = canonicalize_name(name)
-        row = c.execute("SELECT id FROM channels WHERE norm_name = ? AND group_tag = ?", (norm_name_pl, group_tag)).fetchone()
-        if row:
-            return row[0]
-    
-        # Collect candidate rows
-        relaxed_target = relaxed_name(name)
-    
-        rows_same_group = c.execute("SELECT id, display_name FROM channels WHERE group_tag = ?", (group_tag,)).fetchall() if group_tag else []
-        rows_all = c.execute("SELECT id, display_name FROM channels").fetchall()
-    
-        # 4. Exact relaxed token match inside group
-        for ch_id, disp in rows_same_group:
-            if relaxed_name(disp) == relaxed_target:
-                return ch_id
-    
-        def best_fuzzy(rows, threshold: float) -> Optional[str]:
-            best = None
-            best_ratio = 0.0
-            target = re.sub(r'\s+', '', relaxed_target)
-            for ch_id, disp in rows:
-                cand = re.sub(r'\s+', '', relaxed_name(disp))
-                ratio = difflib.SequenceMatcher(None, target, cand).ratio()
-                if ratio >= threshold and ratio > best_ratio:
-                    best_ratio = ratio
-                    best = ch_id
-            return best
-    
-        # 5. Fuzzy inside same group
-        match = best_fuzzy(rows_same_group, 0.85)
-        if match:
-            return match
-    
-        # 6. Fuzzy across all channels
-        return best_fuzzy(rows_all, 0.90)
+            norm_tvg_name = canonicalize_name(strip_backup_terms(tvg_name))
+            rows = c.execute("SELECT id, group_tag, display_name FROM channels WHERE norm_name = ?", (norm_tvg_name,)).fetchall()
+            for r in rows:
+                candidates[r[0]] = {'id': r[0], 'group_tag': r[1], 'score': 95, 'display_name': r[2]}
+
+        # 3. Exact canonicalized playlist name
+        norm_name_pl = canonicalize_name(strip_backup_terms(name))
+        rows = c.execute("SELECT id, group_tag, display_name FROM channels WHERE norm_name = ?", (norm_name_pl,)).fetchall()
+        for r in rows:
+            candidates[r[0]] = {'id': r[0], 'group_tag': r[1], 'score': 90, 'display_name': r[2]}
+
+        # 4. Token-based fuzzy matching for group-preferred
+        target_tokens = tokenize_channel_name(name)
+        rows_all = c.execute("SELECT id, display_name, group_tag FROM channels").fetchall()
+        for ch_id, disp, grp in rows_all:
+            epg_tokens = tokenize_channel_name(disp)
+            if group_tag and (grp == group_tag or (group_tag in group_synonyms() and grp in group_synonyms()[group_tag])):
+                overlap = target_tokens & epg_tokens
+                if len(overlap) >= 2:
+                    score = 80 + len(overlap)
+                    candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
+            else:
+                overlap = target_tokens & epg_tokens
+                if len(overlap) >= 3:
+                    score = 60 + len(overlap)
+                    if ch_id not in candidates or candidates[ch_id]['score'] < score:
+                        candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
+
+        # Fallback: Relaxed name fuzzy (ALL EPG channels, score 55+)
+        relaxed_target = re.sub(r'\s+', '', canonicalize_name(strip_backup_terms(name)))
+        for ch_id, disp, grp in rows_all:
+            cand = re.sub(r'\s+', '', canonicalize_name(strip_backup_terms(disp)))
+            ratio = difflib.SequenceMatcher(None, relaxed_target, cand).ratio()
+            if ratio >= 0.8:
+                score = int(55 + 40*ratio)
+                if ch_id not in candidates or candidates[ch_id]['score'] < score:
+                    candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
+
+        return list(candidates.values()), group_tag
+
     def get_now_next(self, channel: Dict[str, str]) -> Optional[tuple]:
-        ch_id = self.get_matching_channel_id(channel)
-        if not ch_id:
+        matches, group_tag = self.get_matching_channel_ids(channel)
+        if not matches:
             return None
         now = datetime.datetime.now(datetime.UTC)
         now_str = now.strftime("%Y%m%d%H%M%S")
         c = self.conn.cursor()
-        row = c.execute(
-            "SELECT title, start, end FROM programmes WHERE channel_id = ? AND start <= ? AND end > ? ORDER BY start DESC LIMIT 1",
-            (ch_id, now_str, now_str)).fetchone()
-        current = None
-        nxt = None
-        if row:
-            title, start, end = row
-            current = {
-                "title": title,
-                "start": datetime.datetime.strptime(start, "%Y%m%d%H%M%S"),
-                "end": datetime.datetime.strptime(end, "%Y%m%d%H%M%S")
-            }
+        current_shows = []
+        next_shows = []
+
+        for match in matches:
+            ch_id = match['id']
+            grp = match['group_tag']
+            group_priority = (grp == group_tag)
+            row = c.execute(
+                "SELECT title, start, end FROM programmes WHERE channel_id = ? AND start <= ? AND end > ? ORDER BY start DESC LIMIT 1",
+                (ch_id, now_str, now_str)).fetchone()
+            if row:
+                title, start, end = row
+                current_shows.append({
+                    "title": title,
+                    "start": datetime.datetime.strptime(start, "%Y%m%d%H%M%S"),
+                    "end": datetime.datetime.strptime(end, "%Y%m%d%H%M%S"),
+                    "channel_id": ch_id,
+                    "group_tag": grp,
+                    "group_priority": group_priority,
+                    "score": match.get("score", 0)
+                })
             row2 = c.execute(
                 "SELECT title, start, end FROM programmes WHERE channel_id = ? AND start > ? ORDER BY start ASC LIMIT 1",
                 (ch_id, now_str)).fetchone()
             if row2:
                 title2, start2, end2 = row2
-                nxt = {
+                next_shows.append({
                     "title": title2,
                     "start": datetime.datetime.strptime(start2, "%Y%m%d%H%M%S"),
-                    "end": datetime.datetime.strptime(end2, "%Y%m%d%H%M%S")
-                }
-        return (current, nxt)
+                    "end": datetime.datetime.strptime(end2, "%Y%m%d%H%M%S"),
+                    "channel_id": ch_id,
+                    "group_tag": grp,
+                    "group_priority": group_priority,
+                    "score": match.get("score", 0)
+                })
+        def pick_best(showlist, is_now):
+            if not showlist:
+                return None
+            showlist = sorted(showlist, key=lambda s: (not s["group_priority"], -s["score"], s["end" if is_now else "start"]))
+            return showlist[0]
+
+        now_show = pick_best(current_shows, True)
+        next_show = pick_best(next_shows, False)
+        return (now_show, next_show)
 
     def get_channels_with_show(self, filter_text: str, max_results: int = 100):
         now = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d%H%M%S")
