@@ -58,6 +58,27 @@ STRIP_TAGS = [
     'us', 'usa', 'ca', 'canada', 'car', 'uk', 'u.k.', 'u.k', 'uk.', 'u.s.', 'u.s', 'us.', 'au', 'aus', 'nz'
 ]
 
+def group_synonyms():
+    # All variants are lowercased, with punctuation, full/abbreviation/alternative names
+    return {
+        "us": [
+            "us", "usa", "u.s.", "u.s", "us.", "united states", "united states of america", "america"
+        ],
+        "uk": [
+            "uk", "u.k.", "u.k", "uk.", "gb", "great britain", "britain", "united kingdom", "england", "scotland", "wales"
+        ],
+        "ca": [
+            "ca", "canada", "car", "ca:", "can"
+        ],
+        "au": [
+            "au", "aus", "australia"
+        ],
+        "nz": [
+            "nz", "new zealand"
+        ],
+        # Extend here for more regions/countries as needed
+    }
+
 def canonicalize_name(name: str) -> str:
     name = name.strip().lower()
     tags = STRIP_TAGS
@@ -84,21 +105,15 @@ def extract_group(title: str) -> str:
     if not title:
         return ''
     title = title.lower()
-    country_map = {
-        'us': 'us', 'usa': 'us', 'united states': 'us', 'u.s.': 'us', 'u.s': 'us',
-        'ca': 'ca', 'canada': 'ca', 'car': 'ca',
-        'uk': 'uk', 'u.k.': 'uk', 'u.k': 'uk', 'uk.': 'uk',
-        'gb': 'uk', 'great britain': 'uk',
-        'au': 'au', 'aus': 'au', 'australia': 'au',
-        'nz': 'nz', 'new zealand': 'nz'
-    }
-    for key, val in country_map.items():
-        if re.search(r'\b' + re.escape(key) + r'\b', title):
-            return val
+    for norm_tag, variants in group_synonyms().items():
+        for v in variants:
+            if re.search(r'\b' + re.escape(v) + r'\b', title):
+                return norm_tag
     m = re.match(r'([a-z]{2,3})', title)
     if m:
         code = m.group(1)
-        return country_map.get(code, code)
+        if code in group_synonyms():
+            return code
     return ''
 
 def utc_to_local(dt):

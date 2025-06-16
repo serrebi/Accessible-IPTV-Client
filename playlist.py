@@ -21,6 +21,27 @@ NOISE_WORDS = [
     'sd', 'hd', 'fhd', 'uhd', '4k', '8k'
 ]
 
+def group_synonyms():
+    # All variants are lowercased, with punctuation, full/abbreviation/alternative names
+    return {
+        "us": [
+            "us", "usa", "u.s.", "u.s", "us.", "united states", "united states of america", "america"
+        ],
+        "uk": [
+            "uk", "u.k.", "u.k", "uk.", "gb", "great britain", "britain", "united kingdom", "england", "scotland", "wales"
+        ],
+        "ca": [
+            "ca", "canada", "car", "ca:", "can"
+        ],
+        "au": [
+            "au", "aus", "australia"
+        ],
+        "nz": [
+            "nz", "new zealand"
+        ],
+        # Extend here for more regions/countries as needed
+    }
+
 def canonicalize_name(name: str) -> str:
     name = name.strip().lower()
     tags = STRIP_TAGS
@@ -43,30 +64,6 @@ def strip_noise_words(text: str) -> str:
     text = re.sub(r'[\s\-_]+', ' ', text)
     return text.strip()
 
-def group_synonyms():
-    return {
-        "us": ["us", "usa", "united states", "u.s.", "u.s", "us.", "america"],
-        "uk": ["uk", "u.k.", "u.k", "uk.", "gb", "great britain", "britain", "england", "scotland", "wales"],
-        "ca": ["ca", "canada", "car"],
-        "au": ["au", "aus", "australia"],
-        "nz": ["nz", "new zealand"],
-        "de": ["de", "germany"],
-        "fr": ["fr", "france"],
-        "it": ["it", "italy"],
-        "es": ["es", "spain"],
-        "pt": ["pt", "portugal"],
-        "ru": ["ru", "russia"],
-        "tr": ["tr", "turkey"],
-        "ro": ["ro", "romania"],
-        "nl": ["nl", "netherlands", "holland"],
-        "se": ["se", "sweden"],
-        "no": ["no", "norway"],
-        "fi": ["fi", "finland"],
-        "dk": ["dk", "denmark"],
-        "pl": ["pl", "poland"],
-        "gr": ["gr", "greece"],
-    }
-
 def extract_group(title: str) -> str:
     if not title:
         return ''
@@ -88,17 +85,14 @@ def extract_group(title: str) -> str:
     return ''
 
 def tokenize_channel_name(name: str) -> set:
-    """Tokenize channel name: split words, pull out callsigns, networks, cities, numbers, ignore case/punct/parentheses."""
     if not name:
         return set()
-    # Pull everything inside parens and outside
     paren = re.findall(r'\(([^)]*)\)', name)
     outside = re.sub(r'\(.*?\)', '', name)
     words = re.findall(r'\w+', outside)
     paren_words = []
     for p in paren:
         paren_words.extend(re.findall(r'\w+', p))
-    # Remove obvious noise words, short words, etc.
     all_words = [w.lower() for w in words + paren_words if len(w) > 1]
     bad = set(STRIP_TAGS + NOISE_WORDS + [
         'channel', 'tv', 'the', 'and', 'for', 'with', 'on', 'in', 'f'
@@ -170,7 +164,6 @@ class EPGDatabase:
         self.conn.commit()
 
     def get_matching_channel_ids(self, channel: Dict[str, str]) -> List[dict]:
-        """Token-based, group-preferred EPG matching."""
         tvg_id = channel.get("tvg-id", "").strip()
         tvg_name = channel.get("tvg-name", "").strip()
         name = channel.get("name", "")
