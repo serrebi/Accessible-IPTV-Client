@@ -19,7 +19,7 @@ def get_config_path():
 
 def load_config() -> Dict:
     path = get_config_path()
-    default = {"playlists": [], "epgs": [], "media_player": "VLC", "custom_player_path": ""}
+    default = {"playlists": [], "epgs": [], "media_player": "VLC", "custom_player_path": "", "epg_enabled": True}
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -59,7 +59,6 @@ STRIP_TAGS = [
 ]
 
 def group_synonyms():
-    # All variants are lowercased, with punctuation, full/abbreviation/alternative names
     return {
         "us": [
             "us", "usa", "u.s.", "u.s", "us.", "united states", "united states of america", "america"
@@ -76,7 +75,6 @@ def group_synonyms():
         "nz": [
             "nz", "new zealand"
         ],
-        # Extend here for more regions/countries as needed
     }
 
 def canonicalize_name(name: str) -> str:

@@ -14,6 +14,7 @@ import datetime
 import re
 import shutil
 import platform
+import time
 
 def set_linux_env():
     if platform.system() != "Linux":
@@ -85,26 +86,169 @@ from playlist import (
 class IPTVClient(wx.Frame):
     def __init__(self):
         super().__init__(None, title="Accessible IPTV Client", size=(800, 600))
-        self.config = load_config()
-        self.playlist_sources = self.config.get("playlists", [])
-        self.epg_sources = self.config.get("epgs", [])
+        self._load_config()
         self.channels_by_group: Dict[str, List[Dict[str, str]]] = {}
         self.all_channels: List[Dict[str, str]] = []
         self.displayed: List[Dict[str, str]] = []
         self.current_group = "All Channels"
-        self.default_player = self.config.get("media_player", "VLC")
-        self.custom_player_path = self.config.get("custom_player_path", "")
         self.epg_importing = False
-
-        # EPG cache: key is canonical channel name, value is the (now, next, timestamp)
         self.epg_cache = {}
         self.epg_cache_lock = threading.Lock()
+        self.epg_text_cache = {}
+        self.epg_text_cache_path = os.path.join(get_cache_dir(), "epg_text_cache.json")
         self._build_ui()
         self.Centre()
         self.reload_all_sources_initial()
         self.reload_epg_sources()
         self.Show()
         self.start_epg_import_background()
+        # Auto-refresh every 3 hours in the background
+        self.keep_running = True
+        self.bg_refresh_thread = threading.Thread(target=self.background_reload_loop, daemon=True)
+        self.bg_refresh_thread.start()
+
+    def background_reload_loop(self):
+        while self.keep_running:
+            for _ in range(3 * 60):
+                if not self.keep_running:
+                    return
+                time.sleep(60)
+            wx.CallAfter(self.reload_all_sources_initial)
+            wx.CallAfter(self.reload_epg_sources)
+            wx.CallAfter(self.start_epg_import_background)
+
+    def Destroy(self):
+        self.keep_running = False
+        return super().Destroy()
+
+    def _load_config(self):
+        self.config = load_config()
+        self.playlist_sources = self.config.get("playlists", [])
+        self.epg_sources = self.config.get("epgs", [])
+        self.default_player = self.config.get("media_player", "VLC")
+        self.custom_player_path = self.config.get("custom_player_path", "")
+        self.epg_enabled = self.config.get("epg_enabled", True)
+
+    def _build_ui(self):
+        p = wx.Panel(self)
+        hs = wx.BoxSizer(wx.HORIZONTAL)
+        vs_l = wx.BoxSizer(wx.VERTICAL)
+        vs_r = wx.BoxSizer(wx.VERTICAL)
+        self.group_list = wx.ListBox(p, style=wx.LB_SINGLE)
+        self.group_list.Bind(wx.EVT_CHAR_HOOK, self.on_group_key)
+        vs_l.Add(self.group_list, 1, wx.EXPAND | wx.ALL, 5)
+        self.filter_box = wx.TextCtrl(p, style=wx.TE_PROCESS_ENTER)
+        self.channel_list = wx.ListBox(p, style=wx.LB_SINGLE)
+        self.channel_list.Bind(wx.EVT_CHAR_HOOK, self.on_channel_key)
+        self.epg_display = wx.TextCtrl(p, style=wx.TE_READONLY | wx.TE_MULTILINE)
+        self.url_display = wx.TextCtrl(p, style=wx.TE_READONLY | wx.TE_MULTILINE)
+        vs_r.Add(self.filter_box, 0, wx.EXPAND | wx.ALL, 5)
+        vs_r.Add(self.channel_list, 1, wx.EXPAND | wx.ALL, 5)
+        vs_r.Add(self.epg_display, 0, wx.EXPAND | wx.ALL, 5)
+        vs_r.Add(self.url_display, 0, wx.EXPAND | wx.ALL, 5)
+        hs.Add(vs_l, 1, wx.EXPAND)
+        hs.Add(vs_r, 2, wx.EXPAND)
+        p.SetSizerAndFit(hs)
+        self.group_list.Bind(wx.EVT_LISTBOX, lambda _: self.on_group_select())
+        self.filter_box.Bind(wx.EVT_TEXT_ENTER, lambda _: self.apply_filter())
+        self.channel_list.Bind(wx.EVT_LISTBOX, lambda _: self.on_highlight())
+        self.channel_list.Bind(wx.EVT_LISTBOX_DCLICK, lambda _: self.play_selected())
+        mb = wx.MenuBar()
+        fm = wx.Menu()
+        m_mgr = fm.Append(wx.ID_ANY, "Playlist Manager\tCtrl+M")
+        m_epg = fm.Append(wx.ID_ANY, "EPG Manager\tCtrl+E")
+        m_imp = fm.Append(wx.ID_ANY, "Import EPG to DB\tCtrl+I")
+        fm.AppendSeparator()
+        m_exit = fm.Append(wx.ID_EXIT, "Exit\tCtrl+Q")
+        mb.Append(fm, "File")
+        om = wx.Menu()
+        player_menu = wx.Menu()
+        self.player_VLC = player_menu.AppendRadioItem(wx.ID_ANY, "VLC")
+        self.player_MPC = player_menu.AppendRadioItem(wx.ID_ANY, "MPC")
+        self.player_MPCBE = player_menu.AppendRadioItem(wx.ID_ANY, "MPC-BE")
+        self.player_Kodi = player_menu.AppendRadioItem(wx.ID_ANY, "Kodi")
+        self.player_Winamp = player_menu.AppendRadioItem(wx.ID_ANY, "Winamp")
+        self.player_Foobar2000 = player_menu.AppendRadioItem(wx.ID_ANY, "Foobar2000")
+        self.player_MPV = player_menu.AppendRadioItem(wx.ID_ANY, "MPV")
+        self.player_SMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "SMPlayer")
+        self.player_Totem = player_menu.AppendRadioItem(wx.ID_ANY, "Totem")
+        self.player_QuickTime = player_menu.AppendRadioItem(wx.ID_ANY, "QuickTime")
+        self.player_iTunes = player_menu.AppendRadioItem(wx.ID_ANY, "iTunes/Apple Music")
+        self.player_PotPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "PotPlayer")
+        self.player_KMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "KMPlayer")
+        self.player_AIMP = player_menu.AppendRadioItem(wx.ID_ANY, "AIMP")
+        self.player_QMPlay2 = player_menu.AppendRadioItem(wx.ID_ANY, "QMPlay2")
+        self.player_GOMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "GOM Player")
+        self.player_Audacious = player_menu.AppendRadioItem(wx.ID_ANY, "Audacious")
+        self.player_Fauxdacious = player_menu.AppendRadioItem(wx.ID_ANY, "Fauxdacious")
+        self.player_Custom = player_menu.AppendRadioItem(wx.ID_ANY, "Custom Player...")
+        om.AppendSubMenu(player_menu, "Media Player to Use")
+        self.player_items = {
+            "VLC": self.player_VLC,
+            "MPC": self.player_MPC,
+            "MPC-BE": self.player_MPCBE,
+            "Kodi": self.player_Kodi,
+            "Winamp": self.player_Winamp,
+            "Foobar2000": self.player_Foobar2000,
+            "MPV": self.player_MPV,
+            "SMPlayer": self.player_SMPlayer,
+            "Totem": self.player_Totem,
+            "QuickTime": self.player_QuickTime,
+            "iTunes/Apple Music": self.player_iTunes,
+            "PotPlayer": self.player_PotPlayer,
+            "KMPlayer": self.player_KMPlayer,
+            "AIMP": self.player_AIMP,
+            "QMPlay2": self.player_QMPlay2,
+            "GOM Player": self.player_GOMPlayer,
+            "Audacious": self.player_Audacious,
+            "Fauxdacious": self.player_Fauxdacious,
+        }
+        for key, item in self.player_items.items():
+            self.Bind(wx.EVT_MENU, lambda evt, attr=key: self._select_player(attr), item)
+        self.Bind(wx.EVT_MENU, self._select_custom_player, self.player_Custom)
+        self.epg_toggle_item = om.AppendCheckItem(wx.ID_ANY, "Enable EPG and Caching")
+        self.epg_toggle_item.Check(self.epg_enabled)
+        self.Bind(wx.EVT_MENU, self._toggle_epg, self.epg_toggle_item)
+        mb.Append(om, "Options")
+        self.SetMenuBar(mb)
+        self.Bind(wx.EVT_MENU, self.show_manager, m_mgr)
+        self.Bind(wx.EVT_MENU, self.show_epg_manager, m_epg)
+        self.Bind(wx.EVT_MENU, self.import_epg, m_imp)
+        self.Bind(wx.EVT_MENU, lambda _: self.Close(), m_exit)
+        self._update_player_menu_check()
+
+    def _update_player_menu_check(self):
+        player = self.config.get("media_player", "VLC")
+        for key, item in self.player_items.items():
+            item.Check(key == player)
+        self.player_Custom.Check(player == "Custom")
+
+    def _toggle_epg(self, _):
+        self.epg_enabled = not self.epg_enabled
+        self.config["epg_enabled"] = self.epg_enabled
+        save_config(self.config)
+        self.epg_toggle_item.Check(self.epg_enabled)
+        self.on_highlight()
+
+    def _select_player(self, player):
+        self.default_player = player
+        self.config["media_player"] = player
+        save_config(self.config)
+        self._update_player_menu_check()
+
+    def _select_custom_player(self, _):
+        dlg = CustomPlayerDialog(self, self.config.get("custom_player_path", ""))
+        if dlg.ShowModal() == wx.ID_OK:
+            path = dlg.GetPath().strip()
+            if path:
+                self.custom_player_path = path
+                self.default_player = "Custom"
+                self.config["media_player"] = "Custom"
+                self.config["custom_player_path"] = path
+                save_config(self.config)
+                self._update_player_menu_check()
+        dlg.Destroy()
+        self.player_Custom.Check()
 
     def reload_all_sources_initial(self):
         self.playlist_sources = self.config.get("playlists", [])
@@ -223,131 +367,119 @@ class IPTVClient(wx.Frame):
                 except Exception:
                     pass
 
-    def _build_ui(self):
-        p = wx.Panel(self)
-        hs = wx.BoxSizer(wx.HORIZONTAL)
-        vs_l = wx.BoxSizer(wx.VERTICAL)
-        vs_r = wx.BoxSizer(wx.VERTICAL)
-        self.group_list = wx.ListBox(p, style=wx.LB_SINGLE)
-        self.group_list.Bind(wx.EVT_CHAR_HOOK, self.on_group_key)
-        vs_l.Add(self.group_list, 1, wx.EXPAND | wx.ALL, 5)
-        self.filter_box = wx.TextCtrl(p, style=wx.TE_PROCESS_ENTER)
-        self.channel_list = wx.ListBox(p, style=wx.LB_SINGLE)
-        self.channel_list.Bind(wx.EVT_CHAR_HOOK, self.on_channel_key)
-        self.epg_display = wx.TextCtrl(p, style=wx.TE_READONLY | wx.TE_MULTILINE)
-        self.url_display = wx.TextCtrl(p, style=wx.TE_READONLY | wx.TE_MULTILINE)
-        vs_r.Add(self.filter_box, 0, wx.EXPAND | wx.ALL, 5)
-        vs_r.Add(self.channel_list, 1, wx.EXPAND | wx.ALL, 5)
-        vs_r.Add(self.epg_display, 0, wx.EXPAND | wx.ALL, 5)
-        vs_r.Add(self.url_display, 0, wx.EXPAND | wx.ALL, 5)
-        hs.Add(vs_l, 1, wx.EXPAND)
-        hs.Add(vs_r, 2, wx.EXPAND)
-        p.SetSizerAndFit(hs)
-        self.group_list.Bind(wx.EVT_LISTBOX, lambda _: self.on_group_select())
-        self.filter_box.Bind(wx.EVT_TEXT_ENTER, lambda _: self.apply_filter())
-        self.channel_list.Bind(wx.EVT_LISTBOX, lambda _: self.on_highlight())
-        self.channel_list.Bind(wx.EVT_LISTBOX_DCLICK, lambda _: self.play_selected())
-        mb = wx.MenuBar()
-        fm = wx.Menu()
-        m_mgr = fm.Append(wx.ID_ANY, "Playlist Manager\tCtrl+M")
-        m_epg = fm.Append(wx.ID_ANY, "EPG Manager\tCtrl+E")
-        m_imp = fm.Append(wx.ID_ANY, "Import EPG to DB\tCtrl+I")
-        fm.AppendSeparator()
-        m_exit = fm.Append(wx.ID_EXIT, "Exit\tCtrl+Q")
-        mb.Append(fm, "File")
-        om = wx.Menu()
-        player_menu = wx.Menu()
-        self.player_VLC = player_menu.AppendRadioItem(wx.ID_ANY, "VLC")
-        self.player_MPC = player_menu.AppendRadioItem(wx.ID_ANY, "MPC")
-        self.player_MPCBE = player_menu.AppendRadioItem(wx.ID_ANY, "MPC-BE")
-        self.player_Kodi = player_menu.AppendRadioItem(wx.ID_ANY, "Kodi")
-        self.player_Winamp = player_menu.AppendRadioItem(wx.ID_ANY, "Winamp")
-        self.player_Foobar2000 = player_menu.AppendRadioItem(wx.ID_ANY, "Foobar2000")
-        self.player_MPV = player_menu.AppendRadioItem(wx.ID_ANY, "MPV")
-        self.player_SMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "SMPlayer")
-        self.player_Totem = player_menu.AppendRadioItem(wx.ID_ANY, "Totem")
-        self.player_QuickTime = player_menu.AppendRadioItem(wx.ID_ANY, "QuickTime")
-        self.player_iTunes = player_menu.AppendRadioItem(wx.ID_ANY, "iTunes/Apple Music")
-        self.player_PotPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "PotPlayer")
-        self.player_KMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "KMPlayer")
-        self.player_AIMP = player_menu.AppendRadioItem(wx.ID_ANY, "AIMP")
-        self.player_QMPlay2 = player_menu.AppendRadioItem(wx.ID_ANY, "QMPlay2")
-        self.player_GOMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "GOM Player")
-        self.player_Audacious = player_menu.AppendRadioItem(wx.ID_ANY, "Audacious")
-        self.player_Fauxdacious = player_menu.AppendRadioItem(wx.ID_ANY, "Fauxdacious")
-        self.player_Custom = player_menu.AppendRadioItem(wx.ID_ANY, "Custom Player...")
-        om.AppendSubMenu(player_menu, "Media Player to Use")
-        mb.Append(om, "Options")
-        self.SetMenuBar(mb)
-        self.Bind(wx.EVT_MENU, self.show_manager, m_mgr)
-        self.Bind(wx.EVT_MENU, self.show_epg_manager, m_epg)
-        self.Bind(wx.EVT_MENU, self.import_epg, m_imp)
-        self.Bind(wx.EVT_MENU, lambda _: self.Close(), m_exit)
-        for item, key in [
-            (self.player_VLC, "VLC"),
-            (self.player_MPC, "MPC"),
-            (self.player_MPCBE, "MPC-BE"),
-            (self.player_Kodi, "Kodi"),
-            (self.player_Winamp, "Winamp"),
-            (self.player_Foobar2000, "Foobar2000"),
-            (self.player_MPV, "MPV"),
-            (self.player_SMPlayer, "SMPlayer"),
-            (self.player_Totem, "Totem"),
-            (self.player_QuickTime, "QuickTime"),
-            (self.player_iTunes, "iTunes/Apple Music"),
-            (self.player_PotPlayer, "PotPlayer"),
-            (self.player_KMPlayer, "KMPlayer"),
-            (self.player_AIMP, "AIMP"),
-            (self.player_QMPlay2, "QMPlay2"),
-            (self.player_GOMPlayer, "GOM Player"),
-            (self.player_Audacious, "Audacious"),
-            (self.player_Fauxdacious, "Fauxdacious"),
-        ]:
-            self.Bind(wx.EVT_MENU, lambda evt, attr=key: self._select_player(attr), item)
-        self.Bind(wx.EVT_MENU, self._select_custom_player, self.player_Custom)
-        defplayer = self.config.get("media_player", "VLC")
-        if defplayer == "Custom":
-            self.player_Custom.Check()
-        else:
-            attr = f"player_{defplayer.replace('/','').replace(' ','')}"
-            if hasattr(self, attr):
-                getattr(self, attr).Check()
-            else:
-                self.player_VLC.Check()
+    def _refresh_group_ui(self):
+        self.group_list.Clear()
+        self.channel_list.Clear()
+        self.group_list.Append(f"All Channels ({len(self.all_channels)})")
+        for grp in sorted(self.channels_by_group):
+            self.group_list.Append(f"{grp} ({len(self.channels_by_group[grp])})")
+        self.group_list.SetSelection(0)
+        self.on_group_select()
 
-    def _select_player(self, player):
-        self.default_player = player
-        self.config["media_player"] = player
-        save_config(self.config)
+    def reload_epg_sources(self):
+        self.epg_sources = self.config.get("epgs", [])
 
-    def _select_custom_player(self, _):
-        dlg = CustomPlayerDialog(self, self.config.get("custom_player_path", ""))
+    def start_epg_import_background(self):
+        if not self.epg_enabled:
+            return
+        sources = list(self.epg_sources)
+        if not sources:
+            return
+        self.epg_importing = True
+        def do_import():
+            try:
+                db = EPGDatabase(get_db_path(), for_threading=True)
+                db.import_epg_xml(sources)
+                wx.CallAfter(self.finish_import_background)
+            except Exception:
+                wx.CallAfter(self.finish_import_background)
+        threading.Thread(target=do_import, daemon=True).start()
+
+    def finish_import_background(self):
+        self.epg_importing = False
+        self.on_highlight()
+
+    def show_manager(self, _):
+        dlg = PlaylistManagerDialog(self, self.playlist_sources)
         if dlg.ShowModal() == wx.ID_OK:
-            path = dlg.GetPath().strip()
-            if path:
-                self.custom_player_path = path
-                self.default_player = "Custom"
-                self.config["media_player"] = "Custom"
-                self.config["custom_player_path"] = path
-                save_config(self.config)
+            self.playlist_sources = dlg.GetResult()
+            self.config["playlists"] = self.playlist_sources
+            save_config(self.config)
+            self.reload_all_sources_initial()
         dlg.Destroy()
-        self.player_Custom.Check()
 
-    def on_channel_key(self, event):
-        key = event.GetKeyCode()
-        if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
-            self.play_selected()
-        elif key in (wx.WXK_LEFT, wx.WXK_RIGHT):
-            return
-        else:
-            event.Skip()
+    def show_epg_manager(self, _):
+        dlg = EPGManagerDialog(self, self.epg_sources)
+        if dlg.ShowModal() == wx.ID_OK:
+            self.epg_sources = dlg.GetResult()
+            self.config["epgs"] = self.epg_sources
+            save_config(self.config)
+            self.reload_epg_sources()
+        dlg.Destroy()
 
-    def on_group_key(self, event):
-        key = event.GetKeyCode()
-        if key in (wx.WXK_LEFT, wx.WXK_RIGHT):
+    def import_epg(self, _):
+        if not self.epg_enabled:
+            wx.MessageBox("EPG is disabled in options.", "EPG Disabled", wx.OK | wx.ICON_INFORMATION)
             return
-        else:
-            event.Skip()
+        if self.epg_importing:
+            wx.MessageBox("EPG import is already in progress.", "Wait", wx.OK | wx.ICON_INFORMATION)
+            return
+        sources = list(self.epg_sources)
+        if not sources:
+            wx.MessageBox("No EPG sources to import.", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        self.epg_importing = True
+        dlg = EPGImportDialog(self, len(sources))
+        self.import_dialog = dlg
+        def do_import():
+            try:
+                def progress_callback(value, total):
+                    wx.CallAfter(dlg.set_progress, value, total)
+                db = EPGDatabase(get_db_path(), for_threading=True)
+                db.import_epg_xml(sources, progress_callback)
+                wx.CallAfter(dlg.Destroy)
+                wx.CallAfter(self.finish_import)
+            except Exception as e:
+                wx.CallAfter(dlg.Destroy)
+                wx.CallAfter(wx.MessageBox, f"EPG import failed: {e}", "Error", wx.OK | wx.ICON_ERROR)
+                wx.CallAfter(self.finish_import)
+        thread = threading.Thread(target=do_import, daemon=True)
+        thread.start()
+        dlg.ShowModal()
+
+    def finish_import(self):
+        self.epg_importing = False
+        wx.MessageBox("EPG import completed.", "Done", wx.OK | wx.ICON_INFORMATION)
+        self.on_highlight()
+
+    def _parse_m3u_return(self, content: str) -> List[Dict[str, str]]:
+        lines = content.splitlines()
+        current_group = "Uncategorized"
+        out = []
+        for i, line in enumerate(lines):
+            if line.startswith("#EXTINF"):
+                group = current_group
+                tvg_id = ""
+                group_match = re.search(r'group-title="([^"]*)"', line)
+                if group_match:
+                    group = group_match.group(1)
+                    current_group = group
+                tvg_id_match = re.search(r'tvg-id="([^"]*)"', line)
+                if tvg_id_match:
+                    tvg_id = tvg_id_match.group(1)
+                if ',' in line:
+                    name = line.rsplit(',', 1)[-1]
+                else:
+                    name = ''
+                name = name.strip(' "\'')
+                url = ''
+                for j in range(i+1, min(i+4, len(lines))):
+                    if lines[j].startswith(('http://', 'https://')):
+                        url = lines[j]
+                        break
+                if name and url:
+                    out.append({"name": name.strip(), "url": url.strip(), "group": group, "tvg-id": tvg_id})
+        return out
 
     def apply_filter(self):
         txt = self.filter_box.GetValue().strip().lower()
@@ -359,7 +491,7 @@ class IPTVClient(wx.Frame):
             if txt in ch.get("name", "").lower():
                 self.displayed.append({"type": "channel", "data": ch})
                 self.channel_list.Append(ch.get("name", ""))
-        if not txt:
+        if not txt or not self.epg_enabled:
             return
         def epg_search():
             try:
@@ -390,26 +522,23 @@ class IPTVClient(wx.Frame):
         self.current_group = sel
         self.apply_filter()
 
-    # -- ASYNC LAG-FREE EPG FETCH --
     def on_highlight(self):
         i = self.channel_list.GetSelection()
         if 0 <= i < len(self.displayed):
             item = self.displayed[i]
-            # Channel case
             if item["type"] == "channel":
                 self.url_display.SetValue(item["data"].get("url", ""))
-                # Show cached EPG if available, otherwise set to loading
                 cname = canonicalize_name(item["data"].get("name", ""))
+                if not self.epg_enabled:
+                    self.epg_display.SetValue(self._get_cached_epg_text(cname))
+                    return
                 with self.epg_cache_lock:
                     cached = self.epg_cache.get(cname)
                 if cached and (datetime.datetime.now() - cached[2]).total_seconds() < 60:
-                    # Fresh cache, display immediately
                     self.epg_display.SetValue(self._epg_msg_from_tuple(cached[0], cached[1]))
                 else:
                     self.epg_display.SetValue("Loading program info…")
-                    # Spawn async fetch
                     threading.Thread(target=self._fetch_and_cache_epg, args=(item["data"], cname), daemon=True).start()
-            # EPG search hit case
             elif item["type"] == "epg":
                 self.url_display.SetValue("")
                 r = item["data"]
@@ -425,6 +554,34 @@ class IPTVClient(wx.Frame):
             self.epg_display.SetValue("")
             self.url_display.SetValue("")
 
+    def _get_cached_epg_text(self, cname):
+        self._load_epg_text_cache()
+        entry = self.epg_text_cache.get(cname)
+        if entry and (datetime.datetime.now().timestamp() - entry["timestamp"] < 86400):
+            return entry["text"]
+        else:
+            return "No program info (EPG/caching disabled)."
+
+    def _set_cached_epg_text(self, cname, text):
+        self._load_epg_text_cache()
+        self.epg_text_cache[cname] = {"text": text, "timestamp": datetime.datetime.now().timestamp()}
+        self._save_epg_text_cache()
+
+    def _load_epg_text_cache(self):
+        if not self.epg_text_cache and os.path.exists(self.epg_text_cache_path):
+            try:
+                with open(self.epg_text_cache_path, "r", encoding="utf-8") as f:
+                    self.epg_text_cache = json.load(f)
+            except Exception:
+                self.epg_text_cache = {}
+
+    def _save_epg_text_cache(self):
+        try:
+            with open(self.epg_text_cache_path, "w", encoding="utf-8") as f:
+                json.dump(self.epg_text_cache, f)
+        except Exception:
+            pass
+
     def _epg_msg_from_tuple(self, now, nxt):
         def localfmt(dt):
             local = utc_to_local(dt)
@@ -439,6 +596,8 @@ class IPTVClient(wx.Frame):
         return msg
 
     def _fetch_and_cache_epg(self, channel, cname):
+        if not self.epg_enabled:
+            return
         if self.epg_importing:
             wx.CallAfter(self.epg_display.SetValue, "EPG importing…")
             return
@@ -460,7 +619,8 @@ class IPTVClient(wx.Frame):
             now_show, next_show = now_next
         with self.epg_cache_lock:
             self.epg_cache[cname] = (now_show, next_show, datetime.datetime.now())
-        # Only update display if this channel is still selected
+        text = self._epg_msg_from_tuple(now_show, next_show)
+        self._set_cached_epg_text(cname, text)
         wx.CallAfter(self._update_epg_display_if_selected, channel, now_show, next_show)
 
     def _update_epg_display_if_selected(self, channel, now_show, next_show):
@@ -485,13 +645,10 @@ class IPTVClient(wx.Frame):
                     url = ch.get("url", "")
                     break
         if not url:
-            wx.MessageBox("Could not find stream URL for this show.", "Not Found",
-                          wx.OK | wx.ICON_WARNING)
+            wx.MessageBox("Could not find stream URL for this show.", "Not Found", wx.OK | wx.ICON_WARNING)
             return
-
-        player = self.default_player
+        player = self.config.get("media_player", "VLC")
         custom_path = self.config.get("custom_player_path", "")
-
         win_paths = {
             "VLC": [
                 r"C:\Program Files\VideoLAN\VLC\vlc.exe",
@@ -593,7 +750,6 @@ class IPTVClient(wx.Frame):
             "Fauxdacious": "fauxdacious",
             "MPC-BE": "mpc-be"
         }
-
         if player == "Custom":
             exe = custom_path
             if not exe:
@@ -610,7 +766,6 @@ class IPTVClient(wx.Frame):
             except Exception as e:
                 wx.MessageBox(f"Failed to start custom player: {e}", "Error", wx.OK | wx.ICON_ERROR)
             return
-
         if sys.platform.startswith("win"):
             exe_list = win_paths.get(player, [])
             found = ""
@@ -668,119 +823,21 @@ class IPTVClient(wx.Frame):
             wx.MessageBox(f"{player} not found in PATH.", "Error",
                           wx.OK | wx.ICON_ERROR)
 
-    def _refresh_group_ui(self):
-        self.group_list.Clear()
-        self.channel_list.Clear()
-        self.group_list.Append(f"All Channels ({len(self.all_channels)})")
-        for grp in sorted(self.channels_by_group):
-            self.group_list.Append(f"{grp} ({len(self.channels_by_group[grp])})")
-        self.group_list.SetSelection(0)
-        self.on_group_select()
-
-    def reload_epg_sources(self):
-        self.epg_sources = self.config.get("epgs", [])
-
-    def start_epg_import_background(self):
-        sources = list(self.epg_sources)
-        if not sources:
+    def on_channel_key(self, event):
+        key = event.GetKeyCode()
+        if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            self.play_selected()
+        elif key in (wx.WXK_LEFT, wx.WXK_RIGHT):
             return
-        self.epg_importing = True
+        else:
+            event.Skip()
 
-        def do_import():
-            try:
-                db = EPGDatabase(get_db_path(), for_threading=True)
-                db.import_epg_xml(sources)
-                wx.CallAfter(self.finish_import_background)
-            except Exception:
-                wx.CallAfter(self.finish_import_background)
-        threading.Thread(target=do_import, daemon=True).start()
-
-    def finish_import_background(self):
-        self.epg_importing = False
-        self.on_highlight()
-
-    def show_manager(self, _):
-        dlg = PlaylistManagerDialog(self, self.playlist_sources)
-        if dlg.ShowModal() == wx.ID_OK:
-            self.playlist_sources = dlg.GetResult()
-            self.config["playlists"] = self.playlist_sources
-            save_config(self.config)
-            self.reload_all_sources_initial()
-        dlg.Destroy()
-
-    def show_epg_manager(self, _):
-        dlg = EPGManagerDialog(self, self.epg_sources)
-        if dlg.ShowModal() == wx.ID_OK:
-            self.epg_sources = dlg.GetResult()
-            self.config["epgs"] = self.epg_sources
-            save_config(self.config)
-            self.reload_epg_sources()
-        dlg.Destroy()
-
-    def import_epg(self, _):
-        if self.epg_importing:
-            wx.MessageBox("EPG import is already in progress.", "Wait", wx.OK | wx.ICON_INFORMATION)
+    def on_group_key(self, event):
+        key = event.GetKeyCode()
+        if key in (wx.WXK_LEFT, wx.WXK_RIGHT):
             return
-        sources = list(self.epg_sources)
-        if not sources:
-            wx.MessageBox("No EPG sources to import.", "Error", wx.OK | wx.ICON_ERROR)
-            return
-        self.epg_importing = True
-        dlg = EPGImportDialog(self, len(sources))
-        self.import_dialog = dlg
-
-        def do_import():
-            try:
-                def progress_callback(value, total):
-                    wx.CallAfter(dlg.set_progress, value, total)
-                db = EPGDatabase(get_db_path(), for_threading=True)
-                db.import_epg_xml(sources, progress_callback)
-                wx.CallAfter(dlg.Destroy)
-                wx.CallAfter(self.finish_import)
-            except Exception as e:
-                wx.CallAfter(dlg.Destroy)
-                wx.CallAfter(wx.MessageBox, f"EPG import failed: {e}", "Error", wx.OK | wx.ICON_ERROR)
-                wx.CallAfter(self.finish_import)
-        thread = threading.Thread(target=do_import, daemon=True)
-        thread.start()
-        dlg.ShowModal()
-
-    def finish_import(self):
-        self.epg_importing = False
-        wx.MessageBox("EPG import completed.", "Done", wx.OK | wx.ICON_INFORMATION)
-        self.on_highlight()
-
-    def _parse_m3u_return(self, content: str) -> List[Dict[str, str]]:
-        lines = content.splitlines()
-        current_group = "Uncategorized"
-        out = []
-        for i, line in enumerate(lines):
-            if line.startswith("#EXTINF"):
-                group = current_group
-                tvg_id = ""
-                group_match = re.search(r'group-title="([^"]*)"', line)
-                if group_match:
-                    group = group_match.group(1)
-                    current_group = group
-                tvg_id_match = re.search(r'tvg-id="([^"]*)"', line)
-                if tvg_id_match:
-                    tvg_id = tvg_id_match.group(1)
-                if ',' in line:
-                    name = line.rsplit(',', 1)[-1]
-                else:
-                    name = ''
-                name = name.strip(' "\'')
-                url = ''
-                for j in range(i+1, min(i+4, len(lines))):
-                    if lines[j].startswith(('http://', 'https://')):
-                        url = lines[j]
-                        break
-                if name and url:
-                    out.append({"name": name.strip(), "url": url.strip(), "group": group, "tvg-id": tvg_id})
-        return out
-
-    def Destroy(self):
-        return super().Destroy()
+        else:
+            event.Skip()
 
 if __name__ == '__main__':
     app = wx.App(False)
