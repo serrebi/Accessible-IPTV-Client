@@ -22,6 +22,7 @@ NOISE_WORDS = [
 ]
 
 def group_synonyms():
+    # All variants are lowercased, with punctuation, full/abbreviation/alternative names
     return {
         "us": [
             "us", "usa", "u.s.", "u.s", "us.", "united states", "united states of america", "america"
@@ -38,6 +39,7 @@ def group_synonyms():
         "nz": [
             "nz", "new zealand"
         ],
+        # Extend here for more regions/countries as needed
     }
 
 def canonicalize_name(name: str) -> str:
@@ -170,19 +172,26 @@ class EPGDatabase:
         c = self.conn.cursor()
         candidates = {}
 
+        # 1. Exact ID
         if tvg_id:
             row = c.execute("SELECT id, group_tag, display_name FROM channels WHERE id = ?", (tvg_id,)).fetchone()
             if row:
                 candidates[row[0]] = {'id': row[0], 'group_tag': row[1], 'score': 100, 'display_name': row[2]}
+
+        # 2. Exact canonicalized tvg-name
         if tvg_name:
             norm_tvg_name = canonicalize_name(strip_backup_terms(tvg_name))
             rows = c.execute("SELECT id, group_tag, display_name FROM channels WHERE norm_name = ?", (norm_tvg_name,)).fetchall()
             for r in rows:
                 candidates[r[0]] = {'id': r[0], 'group_tag': r[1], 'score': 95, 'display_name': r[2]}
+
+        # 3. Exact canonicalized playlist name
         norm_name_pl = canonicalize_name(strip_backup_terms(name))
         rows = c.execute("SELECT id, group_tag, display_name FROM channels WHERE norm_name = ?", (norm_name_pl,)).fetchall()
         for r in rows:
             candidates[r[0]] = {'id': r[0], 'group_tag': r[1], 'score': 90, 'display_name': r[2]}
+
+        # 4. Token-based fuzzy matching for group-preferred
         target_tokens = tokenize_channel_name(name)
         rows_all = c.execute("SELECT id, display_name, group_tag FROM channels").fetchall()
         for ch_id, disp, grp in rows_all:
@@ -198,6 +207,8 @@ class EPGDatabase:
                     score = 60 + len(overlap)
                     if ch_id not in candidates or candidates[ch_id]['score'] < score:
                         candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
+
+        # Fallback: Relaxed name fuzzy (ALL EPG channels, score 55+)
         relaxed_target = re.sub(r'\s+', '', canonicalize_name(strip_backup_terms(name)))
         for ch_id, disp, grp in rows_all:
             cand = re.sub(r'\s+', '', canonicalize_name(strip_backup_terms(disp)))
@@ -206,6 +217,7 @@ class EPGDatabase:
                 score = int(55 + 40*ratio)
                 if ch_id not in candidates or candidates[ch_id]['score'] < score:
                     candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
+
         return list(candidates.values()), group_tag
 
     def get_now_next(self, channel: Dict[str, str]) -> Optional[tuple]:
@@ -217,6 +229,7 @@ class EPGDatabase:
         c = self.conn.cursor()
         current_shows = []
         next_shows = []
+
         for match in matches:
             ch_id = match['id']
             grp = match['group_tag']
@@ -296,7 +309,7 @@ class EPGDatabase:
     def close(self):
         self.conn.close()
 
-    def import_epg_xml(self, xml_sources: List[str], progress_callback=None, days: int = 1):
+    def import_epg_xml(self, xml_sources: List[str], progress_callback=None):
         thread_db = EPGDatabase(self.db_path, for_threading=True)
         total = len(xml_sources)
         for idx, src in enumerate(xml_sources):
@@ -324,7 +337,7 @@ class EPGDatabase:
             if progress_callback:
                 progress_callback(idx + 1, total)
         thread_db.commit()
-        thread_db.prune_old_programmes(days)
+        thread_db.prune_old_programmes(4)
         thread_db.close()
 
     def _stream_parse_epg(self, filelike):

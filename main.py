@@ -96,6 +96,7 @@ class IPTVClient(wx.Frame):
         self.custom_player_path = self.config.get("custom_player_path", "")
         self.epg_importing = False
 
+        # EPG cache: key is canonical channel name, value is the (now, next, timestamp)
         self.epg_cache = {}
         self.epg_cache_lock = threading.Lock()
         self._build_ui()
@@ -103,16 +104,6 @@ class IPTVClient(wx.Frame):
         self.reload_all_sources_initial()
         self.reload_epg_sources()
         self.Show()
-        self.start_epg_import_background()
-
-        # Periodic refresh every 3 hours
-        self.refresh_timer = wx.Timer(self)
-        self.Bind(wx.EVT_TIMER, self.on_refresh_timer, self.refresh_timer)
-        self.refresh_timer.Start(3 * 60 * 60 * 1000)  # 3 hours in milliseconds
-
-    def on_refresh_timer(self, event):
-        self.reload_all_sources_initial()
-        self.reload_epg_sources()
         self.start_epg_import_background()
 
     def reload_all_sources_initial(self):
@@ -399,20 +390,26 @@ class IPTVClient(wx.Frame):
         self.current_group = sel
         self.apply_filter()
 
+    # -- ASYNC LAG-FREE EPG FETCH --
     def on_highlight(self):
         i = self.channel_list.GetSelection()
         if 0 <= i < len(self.displayed):
             item = self.displayed[i]
+            # Channel case
             if item["type"] == "channel":
                 self.url_display.SetValue(item["data"].get("url", ""))
+                # Show cached EPG if available, otherwise set to loading
                 cname = canonicalize_name(item["data"].get("name", ""))
                 with self.epg_cache_lock:
                     cached = self.epg_cache.get(cname)
                 if cached and (datetime.datetime.now() - cached[2]).total_seconds() < 60:
+                    # Fresh cache, display immediately
                     self.epg_display.SetValue(self._epg_msg_from_tuple(cached[0], cached[1]))
                 else:
                     self.epg_display.SetValue("Loading program info…")
+                    # Spawn async fetch
                     threading.Thread(target=self._fetch_and_cache_epg, args=(item["data"], cname), daemon=True).start()
+            # EPG search hit case
             elif item["type"] == "epg":
                 self.url_display.SetValue("")
                 r = item["data"]
@@ -463,6 +460,7 @@ class IPTVClient(wx.Frame):
             now_show, next_show = now_next
         with self.epg_cache_lock:
             self.epg_cache[cname] = (now_show, next_show, datetime.datetime.now())
+        # Only update display if this channel is still selected
         wx.CallAfter(self._update_epg_display_if_selected, channel, now_show, next_show)
 
     def _update_epg_display_if_selected(self, channel, now_show, next_show):
@@ -691,7 +689,7 @@ class IPTVClient(wx.Frame):
         def do_import():
             try:
                 db = EPGDatabase(get_db_path(), for_threading=True)
-                db.import_epg_xml(sources, days=1)  # store only 24 hours
+                db.import_epg_xml(sources)
                 wx.CallAfter(self.finish_import_background)
             except Exception:
                 wx.CallAfter(self.finish_import_background)
@@ -736,7 +734,7 @@ class IPTVClient(wx.Frame):
                 def progress_callback(value, total):
                     wx.CallAfter(dlg.set_progress, value, total)
                 db = EPGDatabase(get_db_path(), for_threading=True)
-                db.import_epg_xml(sources, progress_callback, days=1)
+                db.import_epg_xml(sources, progress_callback)
                 wx.CallAfter(dlg.Destroy)
                 wx.CallAfter(self.finish_import)
             except Exception as e:

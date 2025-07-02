@@ -1,12 +1,12 @@
 # Accessible IPTV Client
 
-An accessible IPTV client VibeCoded using wxPython. 
+An accessible IPTV client VibeCoded using wxPython. Just made this for my own use.
 
 ## Features
 
 - Fully accessible with all major screen readers on Windows (NVDA, JAWS, etc).
 - Supports m3u and m3u_plus playlists.
-- Playlist Manager: add, remove, and manage playlists. EPG: add xml, or xml gz EPG sources. All playlists and EPG are stored in `iptvclient.conf` and EPG.DB in the same folder as the executable.
+- Playlist Manager: add, remove, and manage playlists. All playlists are stored in `iptvclient.conf` in the same folder as the executable.
 - Supports external media players on windows, Mac, and Linux
 - Category/Group navigation: browse channels by group.
 - Channel search and filter field.
@@ -56,14 +56,14 @@ Your `.exe` will be in the `dist` folder.
 
 ## Known Limitations
 
-- Tentative EPG
+- Tentative  EPG/TV Guide. It is what it is for now. If you want to help or fork, feel free. EPG is loaded on startup and then it is checked in the background and kept in a sqLite database in the directory where the script, or executable is. Supports XMLTV, and EPG GZ
 - No recording or catchup support.
 - App opens streams in external player windows, because that's all I need it to do.
 
 ## Tips
 
 - Player paths are auto-detected from default install locations, so make sure they are installed first.
--  You are restricted by what the player you choose supports. VLC and Media player classic support a wide variety of formats. I use MPC BE myself. Make sure you have installed your player of choice.
+-  You are restricted by what the player you choose supports. VLC and Media player classic support a wide variety of formats.
 
 ## Support
 
