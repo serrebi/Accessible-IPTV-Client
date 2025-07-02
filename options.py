@@ -6,15 +6,18 @@ import datetime
 import re
 import wx
 from typing import Dict
+import tempfile
 
 CONFIG_FILE = "iptvclient.conf"
 
 def get_base_path():
+    # The config file stays with the app, but all other files go to temp
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
 def get_config_path():
+    # Config stays with the app
     return os.path.join(get_base_path(), CONFIG_FILE)
 
 def load_config() -> Dict:
@@ -42,7 +45,8 @@ def save_config(cfg: Dict):
         wx.LogError(f"Failed to save config: {e}")
 
 def get_cache_dir():
-    cache_dir = os.path.join(get_base_path(), "cache")
+    # Store cache in the system temp directory
+    cache_dir = os.path.join(tempfile.gettempdir(), "iptv_cache")
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir
 
@@ -51,7 +55,8 @@ def get_cache_path_for_url(url):
     return os.path.join(get_cache_dir(), f"{h}.m3u")
 
 def get_db_path():
-    return os.path.join(get_base_path(), "epg.db")
+    # Store EPG DB in the system temp directory
+    return os.path.join(tempfile.gettempdir(), "epg.db")
 
 STRIP_TAGS = [
     'hd', 'sd', 'hevc', 'fhd', 'uhd', '4k', '8k', 'hdr', 'dash', 'hq', 'st',
@@ -59,7 +64,6 @@ STRIP_TAGS = [
 ]
 
 def group_synonyms():
-    # All variants are lowercased, with punctuation, full/abbreviation/alternative names
     return {
         "us": [
             "us", "usa", "u.s.", "u.s", "us.", "united states", "united states of america", "america"
@@ -76,7 +80,6 @@ def group_synonyms():
         "nz": [
             "nz", "new zealand"
         ],
-        # Extend here for more regions/countries as needed
     }
 
 def canonicalize_name(name: str) -> str:

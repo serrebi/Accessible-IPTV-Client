@@ -14,6 +14,18 @@ import datetime
 import re
 import shutil
 import platform
+import time
+
+import wx.adv
+
+from options import (
+    load_config, save_config, get_cache_path_for_url, get_cache_dir,
+    get_db_path, canonicalize_name, relaxed_name, extract_group, utc_to_local,
+    CustomPlayerDialog
+)
+from playlist import (
+    EPGDatabase, EPGImportDialog, EPGManagerDialog, PlaylistManagerDialog
+)
 
 def set_linux_env():
     if platform.system() != "Linux":
@@ -73,14 +85,39 @@ def set_linux_env():
 
 set_linux_env()
 
-from options import (
-    load_config, save_config, get_cache_path_for_url, get_cache_dir,
-    get_db_path, canonicalize_name, relaxed_name, extract_group, utc_to_local,
-    CustomPlayerDialog
-)
-from playlist import (
-    EPGDatabase, EPGImportDialog, EPGManagerDialog, PlaylistManagerDialog
-)
+class TrayIcon(wx.adv.TaskBarIcon):
+    TBMENU_RESTORE = wx.NewIdRef()
+    TBMENU_EXIT = wx.NewIdRef()
+
+    def __init__(self, parent, on_restore, on_exit):
+        super().__init__()
+        self.parent = parent
+        self.on_restore = on_restore
+        self.on_exit = on_exit
+        self.Bind(wx.adv.EVT_TASKBAR_LEFT_DCLICK, self.on_taskbar_activate)
+        self.Bind(wx.EVT_MENU, self.on_menu_select)
+        self.set_icon()
+
+    def set_icon(self):
+        icon = wx.Icon(wx.ArtProvider.GetBitmap(wx.ART_INFORMATION, wx.ART_TOOLBAR, (16, 16)))
+        self.SetIcon(icon, "Accessible IPTV Client")
+
+    def CreatePopupMenu(self):
+        menu = wx.Menu()
+        menu.Append(self.TBMENU_RESTORE, "Restore")
+        menu.AppendSeparator()
+        menu.Append(self.TBMENU_EXIT, "Exit")
+        return menu
+
+    def on_taskbar_activate(self, event):
+        self.on_restore()
+
+    def on_menu_select(self, event):
+        eid = event.GetId()
+        if eid == self.TBMENU_RESTORE:
+            self.on_restore()
+        elif eid == self.TBMENU_EXIT:
+            self.on_exit()
 
 class IPTVClient(wx.Frame):
     def __init__(self):
@@ -96,14 +133,34 @@ class IPTVClient(wx.Frame):
         self.custom_player_path = self.config.get("custom_player_path", "")
         self.epg_importing = False
 
-        # EPG cache: key is canonical channel name, value is the (now, next, timestamp)
         self.epg_cache = {}
         self.epg_cache_lock = threading.Lock()
+        self.refresh_timer = None
+
+        self.minimize_to_tray = self.config.get("minimize_to_tray", False)
+        self.tray_icon = None
+
         self._build_ui()
         self.Centre()
         self.reload_all_sources_initial()
         self.reload_epg_sources()
         self.Show()
+        self.start_epg_import_background()
+        self.start_refresh_timer()
+
+        self.Bind(wx.EVT_ICONIZE, self.on_minimize)
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+
+    def start_refresh_timer(self):
+        if self.refresh_timer:
+            self.refresh_timer.Stop()
+        self.refresh_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_timer_refresh, self.refresh_timer)
+        self.refresh_timer.Start(3 * 60 * 60 * 1000, wx.TIMER_CONTINUOUS)  # 3 hours
+
+    def on_timer_refresh(self, event):
+        self.reload_all_sources_initial()
+        self.reload_epg_sources()
         self.start_epg_import_background()
 
     def reload_all_sources_initial(self):
@@ -277,7 +334,11 @@ class IPTVClient(wx.Frame):
         self.player_Fauxdacious = player_menu.AppendRadioItem(wx.ID_ANY, "Fauxdacious")
         self.player_Custom = player_menu.AppendRadioItem(wx.ID_ANY, "Custom Player...")
         om.AppendSubMenu(player_menu, "Media Player to Use")
+
+        self.min_to_tray_item = om.AppendCheckItem(wx.ID_ANY, "Minimize to System Tray")
+        om.AppendSeparator()
         mb.Append(om, "Options")
+
         self.SetMenuBar(mb)
         self.Bind(wx.EVT_MENU, self.show_manager, m_mgr)
         self.Bind(wx.EVT_MENU, self.show_epg_manager, m_epg)
@@ -305,6 +366,7 @@ class IPTVClient(wx.Frame):
         ]:
             self.Bind(wx.EVT_MENU, lambda evt, attr=key: self._select_player(attr), item)
         self.Bind(wx.EVT_MENU, self._select_custom_player, self.player_Custom)
+        self.Bind(wx.EVT_MENU, self.on_toggle_min_to_tray, self.min_to_tray_item)
         defplayer = self.config.get("media_player", "VLC")
         if defplayer == "Custom":
             self.player_Custom.Check()
@@ -314,6 +376,54 @@ class IPTVClient(wx.Frame):
                 getattr(self, attr).Check()
             else:
                 self.player_VLC.Check()
+        self.min_to_tray_item.Check(self.minimize_to_tray)
+
+    def on_toggle_min_to_tray(self, event):
+        self.minimize_to_tray = self.min_to_tray_item.IsChecked()
+        self.config["minimize_to_tray"] = self.minimize_to_tray
+        save_config(self.config)
+
+    def show_tray_icon(self):
+        if not self.tray_icon:
+            self.tray_icon = TrayIcon(
+                self,
+                on_restore=self.restore_from_tray,
+                on_exit=self.exit_from_tray
+            )
+        self.Hide()
+
+    def restore_from_tray(self):
+        if self.tray_icon:
+            self.tray_icon.RemoveIcon()
+            self.tray_icon.Destroy()
+            self.tray_icon = None
+        self.Show()
+        self.Raise()
+        self.Iconize(False)
+
+    def exit_from_tray(self):
+        if self.tray_icon:
+            self.tray_icon.RemoveIcon()
+            self.tray_icon.Destroy()
+            self.tray_icon = None
+        self.Destroy()
+
+    def on_minimize(self, event):
+        if self.minimize_to_tray and event.IsIconized():
+            wx.CallAfter(self.show_tray_icon)
+        else:
+            event.Skip()
+
+    def on_close(self, event):
+        if self.minimize_to_tray:
+            wx.CallAfter(self.show_tray_icon)
+            event.Veto()
+        else:
+            if self.tray_icon:
+                self.tray_icon.RemoveIcon()
+                self.tray_icon.Destroy()
+                self.tray_icon = None
+            self.Destroy()
 
     def _select_player(self, player):
         self.default_player = player
@@ -390,26 +500,20 @@ class IPTVClient(wx.Frame):
         self.current_group = sel
         self.apply_filter()
 
-    # -- ASYNC LAG-FREE EPG FETCH --
     def on_highlight(self):
         i = self.channel_list.GetSelection()
         if 0 <= i < len(self.displayed):
             item = self.displayed[i]
-            # Channel case
             if item["type"] == "channel":
                 self.url_display.SetValue(item["data"].get("url", ""))
-                # Show cached EPG if available, otherwise set to loading
                 cname = canonicalize_name(item["data"].get("name", ""))
                 with self.epg_cache_lock:
                     cached = self.epg_cache.get(cname)
                 if cached and (datetime.datetime.now() - cached[2]).total_seconds() < 60:
-                    # Fresh cache, display immediately
                     self.epg_display.SetValue(self._epg_msg_from_tuple(cached[0], cached[1]))
                 else:
                     self.epg_display.SetValue("Loading program info…")
-                    # Spawn async fetch
                     threading.Thread(target=self._fetch_and_cache_epg, args=(item["data"], cname), daemon=True).start()
-            # EPG search hit case
             elif item["type"] == "epg":
                 self.url_display.SetValue("")
                 r = item["data"]
@@ -460,7 +564,6 @@ class IPTVClient(wx.Frame):
             now_show, next_show = now_next
         with self.epg_cache_lock:
             self.epg_cache[cname] = (now_show, next_show, datetime.datetime.now())
-        # Only update display if this channel is still selected
         wx.CallAfter(self._update_epg_display_if_selected, channel, now_show, next_show)
 
     def _update_epg_display_if_selected(self, channel, now_show, next_show):
@@ -747,40 +850,37 @@ class IPTVClient(wx.Frame):
 
     def finish_import(self):
         self.epg_importing = False
-        wx.MessageBox("EPG import completed.", "Done", wx.OK | wx.ICON_INFORMATION)
         self.on_highlight()
 
-    def _parse_m3u_return(self, content: str) -> List[Dict[str, str]]:
-        lines = content.splitlines()
-        current_group = "Uncategorized"
+    def _parse_m3u_return(self, text):
+        lines = text.splitlines()
         out = []
-        for i, line in enumerate(lines):
+        meta = {}
+        for line in lines:
             if line.startswith("#EXTINF"):
-                group = current_group
-                tvg_id = ""
-                group_match = re.search(r'group-title="([^"]*)"', line)
-                if group_match:
-                    group = group_match.group(1)
-                    current_group = group
-                tvg_id_match = re.search(r'tvg-id="([^"]*)"', line)
-                if tvg_id_match:
-                    tvg_id = tvg_id_match.group(1)
-                if ',' in line:
-                    name = line.rsplit(',', 1)[-1]
-                else:
-                    name = ''
-                name = name.strip(' "\'')
-                url = ''
-                for j in range(i+1, min(i+4, len(lines))):
-                    if lines[j].startswith(('http://', 'https://')):
-                        url = lines[j]
-                        break
-                if name and url:
-                    out.append({"name": name.strip(), "url": url.strip(), "group": group, "tvg-id": tvg_id})
+                meta = {"name": "", "group": "", "tvg-id": "", "tvg-name": ""}
+                if "group-title=" in line:
+                    match = re.search(r'group-title="([^"]+)"', line)
+                    if match:
+                        meta["group"] = match.group(1)
+                if "tvg-id=" in line:
+                    match = re.search(r'tvg-id="([^"]+)"', line)
+                    if match:
+                        meta["tvg-id"] = match.group(1)
+                if "tvg-name=" in line:
+                    match = re.search(r'tvg-name="([^"]+)"', line)
+                    if match:
+                        meta["tvg-name"] = match.group(1)
+                if "," in line:
+                    meta["name"] = line.split(",", 1)[1].strip()
+            elif line.startswith("#"):
+                continue
+            elif line.strip():
+                url = line.strip()
+                row = dict(meta)
+                row["url"] = url
+                out.append(row)
         return out
-
-    def Destroy(self):
-        return super().Destroy()
 
 if __name__ == '__main__':
     app = wx.App(False)
