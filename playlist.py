@@ -131,10 +131,11 @@ class EPGDatabase:
                 title TEXT,
                 start TEXT,
                 end TEXT,
-                FOREIGN KEY(channel_id) REFERENCES channels(id)
+                FOREIGN KEY(channel_id) REFERENCES channels(id),
+                UNIQUE(channel_id, start, end)
             )
         """)
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_programmes_channel_start_end ON programmes (channel_id, start, end)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_programmes_channel_start ON programmes (channel_id, start)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_programmes_title ON programmes (title)")
         self.conn.commit()
 
@@ -147,25 +148,14 @@ class EPGDatabase:
             (channel_id, display_name, norm, group_tag)
         )
 
-    def clear_programmes_for_channel(self, channel_id: str):
+    def insert_programme(self, channel_id: str, title: str, start: str, end: str):
         c = self.conn.cursor()
-        c.execute("DELETE FROM programmes WHERE channel_id = ?", (channel_id,))
+        c.execute("INSERT OR IGNORE INTO programmes (channel_id, title, start, end) VALUES (?, ?, ?, ?)", (channel_id, title, start, end))
 
-    def insert_now_next(self, channel_id: str, shows: list):
-        self.clear_programmes_for_channel(channel_id)
+    def prune_old_programmes(self, days: int = 4):
+        cutoff = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=days)).strftime("%Y%m%d%H%M%S")
         c = self.conn.cursor()
-        for show in shows[:2]:  # Only store now and next
-            c.execute(
-                "INSERT OR REPLACE INTO programmes (channel_id, title, start, end) VALUES (?, ?, ?, ?)",
-                (channel_id, show['title'], show['start'], show['end'])
-            )
-
-    def prune_old_programmes(self):
-        now = datetime.datetime.now(datetime.timezone.utc)
-        lower = (now - datetime.timedelta(hours=2)).strftime("%Y%m%d%H%M%S")
-        upper = (now + datetime.timedelta(hours=24)).strftime("%Y%m%d%H%M%S")
-        c = self.conn.cursor()
-        c.execute("DELETE FROM programmes WHERE end < ? OR start > ?", (lower, upper))
+        c.execute("DELETE FROM programmes WHERE end < ?", (cutoff,))
         self.conn.commit()
 
     def commit(self):
@@ -184,18 +174,15 @@ class EPGDatabase:
             row = c.execute("SELECT id, group_tag, display_name FROM channels WHERE id = ?", (tvg_id,)).fetchone()
             if row:
                 candidates[row[0]] = {'id': row[0], 'group_tag': row[1], 'score': 100, 'display_name': row[2]}
-
         if tvg_name:
             norm_tvg_name = canonicalize_name(strip_backup_terms(tvg_name))
             rows = c.execute("SELECT id, group_tag, display_name FROM channels WHERE norm_name = ?", (norm_tvg_name,)).fetchall()
             for r in rows:
                 candidates[r[0]] = {'id': r[0], 'group_tag': r[1], 'score': 95, 'display_name': r[2]}
-
         norm_name_pl = canonicalize_name(strip_backup_terms(name))
         rows = c.execute("SELECT id, group_tag, display_name FROM channels WHERE norm_name = ?", (norm_name_pl,)).fetchall()
         for r in rows:
             candidates[r[0]] = {'id': r[0], 'group_tag': r[1], 'score': 90, 'display_name': r[2]}
-
         target_tokens = tokenize_channel_name(name)
         rows_all = c.execute("SELECT id, display_name, group_tag FROM channels").fetchall()
         for ch_id, disp, grp in rows_all:
@@ -211,7 +198,6 @@ class EPGDatabase:
                     score = 60 + len(overlap)
                     if ch_id not in candidates or candidates[ch_id]['score'] < score:
                         candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
-
         relaxed_target = re.sub(r'\s+', '', canonicalize_name(strip_backup_terms(name)))
         for ch_id, disp, grp in rows_all:
             cand = re.sub(r'\s+', '', canonicalize_name(strip_backup_terms(disp)))
@@ -220,7 +206,6 @@ class EPGDatabase:
                 score = int(55 + 40*ratio)
                 if ch_id not in candidates or candidates[ch_id]['score'] < score:
                     candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
-
         return list(candidates.values()), group_tag
 
     def get_now_next(self, channel: Dict[str, str]) -> Optional[tuple]:
@@ -232,7 +217,6 @@ class EPGDatabase:
         c = self.conn.cursor()
         current_shows = []
         next_shows = []
-
         for match in matches:
             ch_id = match['id']
             grp = match['group_tag']
@@ -312,7 +296,7 @@ class EPGDatabase:
     def close(self):
         self.conn.close()
 
-    def import_epg_xml(self, xml_sources: List[str], progress_callback=None):
+    def import_epg_xml(self, xml_sources: List[str], progress_callback=None, days: int = 1):
         thread_db = EPGDatabase(self.db_path, for_threading=True)
         total = len(xml_sources)
         for idx, src in enumerate(xml_sources):
@@ -340,15 +324,12 @@ class EPGDatabase:
             if progress_callback:
                 progress_callback(idx + 1, total)
         thread_db.commit()
-        thread_db.prune_old_programmes()
+        thread_db.prune_old_programmes(days)
         thread_db.close()
 
     def _stream_parse_epg(self, filelike):
-        # Only store now/next for each channel
-        channel_shows = {}
-        now = datetime.datetime.now(datetime.timezone.utc)
-        upper = now + datetime.timedelta(hours=24)
-        for event, elem in ET.iterparse(filelike, events=("end",)):
+        context = ET.iterparse(filelike, events=("end",))
+        for event, elem in context:
             if elem.tag == "channel":
                 cid = elem.get("id")
                 disp_name = None
@@ -365,33 +346,12 @@ class EPGDatabase:
                 end = elem.get("stop")
                 if cid and title and start and end:
                     try:
-                        start_dt = datetime.datetime.strptime(start[:14], "%Y%m%d%H%M%S").replace(tzinfo=datetime.timezone.utc)
-                        end_dt = datetime.datetime.strptime(end[:14], "%Y%m%d%H%M%S").replace(tzinfo=datetime.timezone.utc)
-                        if end_dt < now or start_dt > upper:
-                            elem.clear()
-                            continue
-                        channel_shows.setdefault(cid, []).append({
-                            'title': title, 'start': start[:14], 'end': end[:14]
-                        })
+                        _ = datetime.datetime.strptime(start[:14], "%Y%m%d%H%M%S")
+                        _ = datetime.datetime.strptime(end[:14], "%Y%m%d%H%M%S")
+                        self.insert_programme(cid, title, start[:14], end[:14])
                     except Exception:
                         pass
                 elem.clear()
-        for cid, shows in channel_shows.items():
-            # Sort by start time
-            shows.sort(key=lambda s: s['start'])
-            # Filter: only keep "now" and "next"
-            now_next = []
-            n = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
-            for show in shows:
-                if show['start'] <= n <= show['end']:
-                    now_next.append(show)
-                elif show['start'] > n and len(now_next) < 2:
-                    now_next.append(show)
-                if len(now_next) >= 2:
-                    break
-            if not now_next and shows:
-                now_next = shows[:2]
-            self.insert_now_next(cid, now_next)
 
 class EPGImportDialog(wx.Dialog):
     def __init__(self, parent, total):
