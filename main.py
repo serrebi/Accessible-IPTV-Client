@@ -120,6 +120,28 @@ class TrayIcon(wx.adv.TaskBarIcon):
             self.on_exit()
 
 class IPTVClient(wx.Frame):
+    PLAYER_MENU_ATTRS = {
+        "VLC": "player_VLC",
+        "MPC": "player_MPC",
+        "MPC-BE": "player_MPCBE",
+        "Kodi": "player_Kodi",
+        "Winamp": "player_Winamp",
+        "Foobar2000": "player_Foobar2000",
+        "MPV": "player_MPV",
+        "SMPlayer": "player_SMPlayer",
+        "Totem": "player_Totem",
+        "QuickTime": "player_QuickTime",
+        "iTunes/Apple Music": "player_iTunes",
+        "PotPlayer": "player_PotPlayer",
+        "KMPlayer": "player_KMPlayer",
+        "AIMP": "player_AIMP",
+        "QMPlay2": "player_QMPlay2",
+        "GOM Player": "player_GOMPlayer",
+        "Audacious": "player_Audacious",
+        "Fauxdacious": "player_Fauxdacious",
+        "Custom": "player_Custom",
+    }
+
     def __init__(self):
         super().__init__(None, title="Accessible IPTV Client", size=(800, 600))
         self.config = load_config()
@@ -150,6 +172,19 @@ class IPTVClient(wx.Frame):
 
         self.Bind(wx.EVT_ICONIZE, self.on_minimize)
         self.Bind(wx.EVT_CLOSE, self.on_close)
+
+    def _sync_player_menu_from_config(self):
+        defplayer = self.config.get("media_player", "VLC")
+        self.default_player = defplayer
+        for key, attr in self.PLAYER_MENU_ATTRS.items():
+            if hasattr(self, attr):
+                getattr(self, attr).Check(key == defplayer)
+
+    def on_menu_open(self, event):
+        from options import load_config
+        self.config = load_config()
+        self._sync_player_menu_from_config()
+        event.Skip()
 
     def start_refresh_timer(self):
         if self.refresh_timer:
@@ -367,16 +402,15 @@ class IPTVClient(wx.Frame):
             self.Bind(wx.EVT_MENU, lambda evt, attr=key: self._select_player(attr), item)
         self.Bind(wx.EVT_MENU, self._select_custom_player, self.player_Custom)
         self.Bind(wx.EVT_MENU, self.on_toggle_min_to_tray, self.min_to_tray_item)
-        defplayer = self.config.get("media_player", "VLC")
-        if defplayer == "Custom":
-            self.player_Custom.Check()
-        else:
-            attr = f"player_{defplayer.replace('/','').replace(' ','')}"
-            if hasattr(self, attr):
-                getattr(self, attr).Check()
-            else:
-                self.player_VLC.Check()
+
+        self.Bind(wx.EVT_MENU_OPEN, self.on_menu_open)
+
+        self._sync_player_menu_from_config()
         self.min_to_tray_item.Check(self.minimize_to_tray)
+
+    # Rest of the file unchanged (all the rest of your logic as before)
+    # ... (all other methods from previous versions, unchanged) ...
+    # Paste in the entire
 
     def on_toggle_min_to_tray(self, event):
         self.minimize_to_tray = self.min_to_tray_item.IsChecked()
@@ -429,6 +463,7 @@ class IPTVClient(wx.Frame):
         self.default_player = player
         self.config["media_player"] = player
         save_config(self.config)
+        self._sync_player_menu_from_config()
 
     def _select_custom_player(self, _):
         dlg = CustomPlayerDialog(self, self.config.get("custom_player_path", ""))
@@ -442,6 +477,7 @@ class IPTVClient(wx.Frame):
                 save_config(self.config)
         dlg.Destroy()
         self.player_Custom.Check()
+        self._sync_player_menu_from_config()
 
     def on_channel_key(self, event):
         key = event.GetKeyCode()
