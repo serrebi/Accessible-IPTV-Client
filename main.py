@@ -530,7 +530,14 @@ class IPTVClient(wx.Frame):
                 self.channel_list.Append(ch.get("name", ""))
         if not txt:
             return
-        def epg_search():
+
+        # Use a unique search token to ignore outdated results
+        if not hasattr(self, "_search_token"):
+            self._search_token = 0
+        self._search_token += 1
+        my_token = self._search_token
+
+        def epg_search(token):
             try:
                 db = EPGDatabase(get_db_path(), readonly=True)
                 results = db.get_channels_with_show(txt)
@@ -538,14 +545,18 @@ class IPTVClient(wx.Frame):
             except Exception:
                 results = []
             def update_ui():
+                # Only update if this is still the latest search
+                if getattr(self, "_search_token", 0) != token:
+                    return
                 if txt != self.filter_box.GetValue().strip().lower():
                     return
+                # Add EPG results to the channel_list
                 for r in results:
                     label = f"{r['channel_name']} - {r['show_title']} ({self._fmt_time(r['start'])}–{self._fmt_time(r['end'])})"
                     self.displayed.append({"type": "epg", "data": r})
                     self.channel_list.Append(label)
             wx.CallAfter(update_ui)
-        threading.Thread(target=epg_search, daemon=True).start()
+        threading.Thread(target=lambda: epg_search(my_token), daemon=True).start()
 
     def _fmt_time(self, s):
         try:
