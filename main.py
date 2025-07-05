@@ -120,27 +120,28 @@ class TrayIcon(wx.adv.TaskBarIcon):
             self.on_exit()
 
 class IPTVClient(wx.Frame):
-    PLAYER_MENU_ATTRS = {
-        "VLC": "player_VLC",
-        "MPC": "player_MPC",
-        "MPC-BE": "player_MPCBE",
-        "Kodi": "player_Kodi",
-        "Winamp": "player_Winamp",
-        "Foobar2000": "player_Foobar2000",
-        "MPV": "player_MPV",
-        "SMPlayer": "player_SMPlayer",
-        "Totem": "player_Totem",
-        "QuickTime": "player_QuickTime",
-        "iTunes/Apple Music": "player_iTunes",
-        "PotPlayer": "player_PotPlayer",
-        "KMPlayer": "player_KMPlayer",
-        "AIMP": "player_AIMP",
-        "QMPlay2": "player_QMPlay2",
-        "GOM Player": "player_GOMPlayer",
-        "Audacious": "player_Audacious",
-        "Fauxdacious": "player_Fauxdacious",
-        "Custom": "player_Custom",
-    }
+    PLAYER_KEYS = [
+        ("VLC", "player_VLC"),
+        ("MPC", "player_MPC"),
+        ("MPC-BE", "player_MPCBE"),
+        ("Kodi", "player_Kodi"),
+        ("Winamp", "player_Winamp"),
+        ("Foobar2000", "player_Foobar2000"),
+        ("MPV", "player_MPV"),
+        ("SMPlayer", "player_SMPlayer"),
+        ("Totem", "player_Totem"),
+        ("QuickTime", "player_QuickTime"),
+        ("iTunes/Apple Music", "player_iTunes"),
+        ("PotPlayer", "player_PotPlayer"),
+        ("KMPlayer", "player_KMPlayer"),
+        ("AIMP", "player_AIMP"),
+        ("QMPlay2", "player_QMPlay2"),
+        ("GOM Player", "player_GOMPlayer"),
+        ("Audacious", "player_Audacious"),
+        ("Fauxdacious", "player_Fauxdacious"),
+        ("Custom", "player_Custom"),
+    ]
+    PLAYER_MENU_ATTRS = dict(PLAYER_KEYS)
 
     def __init__(self):
         super().__init__(None, title="Accessible IPTV Client", size=(800, 600))
@@ -191,7 +192,7 @@ class IPTVClient(wx.Frame):
             self.refresh_timer.Stop()
         self.refresh_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_timer_refresh, self.refresh_timer)
-        self.refresh_timer.Start(3 * 60 * 60 * 1000, wx.TIMER_CONTINUOUS)  # 3 hours
+        self.refresh_timer.Start(3 * 60 * 60 * 1000, wx.TIMER_CONTINUOUS)
 
     def on_timer_refresh(self, event):
         self.reload_all_sources_initial()
@@ -334,86 +335,121 @@ class IPTVClient(wx.Frame):
         vs_r.Add(self.url_display, 0, wx.EXPAND | wx.ALL, 5)
         hs.Add(vs_l, 1, wx.EXPAND)
         hs.Add(vs_r, 2, wx.EXPAND)
-        p.SetSizerAndFit(hs)
+
+        if platform.system() == "Linux":
+            self.menu_button = wx.Button(p, label="Menu")
+            self._player_radio_items = {}
+            def on_menu_btn(evt):
+                menu = wx.Menu()
+                menu.Append(1001, "Playlist Manager\tCtrl+M")
+                menu.Append(1002, "EPG Manager\tCtrl+E")
+                menu.Append(1003, "Import EPG to DB\tCtrl+I")
+                menu.AppendSeparator()
+                player_menu = wx.Menu()
+                for idx, (label, attr) in enumerate(self.PLAYER_KEYS):
+                    itemid = 2000 + idx
+                    item = player_menu.AppendRadioItem(itemid, label)
+                    self._player_radio_items[label] = item
+                    self.Bind(wx.EVT_MENU, lambda evt, pl=label: self._select_player(pl), id=itemid)
+                    if self.default_player == label:
+                        item.Check(True)
+                player_menu.AppendSeparator()
+                customid = 2999
+                customitem = player_menu.AppendRadioItem(customid, "Custom Player...")
+                self.Bind(wx.EVT_MENU, self._select_custom_player, id=customid)
+                if self.default_player == "Custom":
+                    customitem.Check(True)
+                menu.AppendSubMenu(player_menu, "Media Player to Use")
+                min_to_tray_id = 1101
+                min_item = menu.AppendCheckItem(min_to_tray_id, "Minimize to System Tray")
+                min_item.Check(self.minimize_to_tray)
+                self.Bind(wx.EVT_MENU, self.on_toggle_min_to_tray, id=min_to_tray_id)
+                menu.AppendSeparator()
+                menu.Append(1004, "Exit\tCtrl+Q")
+                self.Bind(wx.EVT_MENU, self.show_manager, id=1001)
+                self.Bind(wx.EVT_MENU, self.show_epg_manager, id=1002)
+                self.Bind(wx.EVT_MENU, self.import_epg, id=1003)
+                self.Bind(wx.EVT_MENU, lambda evt: self.Close(), id=1004)
+                self.menu_button.PopupMenu(menu)
+            self.menu_button.Bind(wx.EVT_BUTTON, on_menu_btn)
+            sizer_with_menu = wx.BoxSizer(wx.VERTICAL)
+            sizer_with_menu.Add(self.menu_button, 0, wx.EXPAND | wx.ALL, 5)
+            sizer_with_menu.Add(hs, 1, wx.EXPAND)
+            p.SetSizerAndFit(sizer_with_menu)
+        else:
+            p.SetSizerAndFit(hs)
+            mb = wx.MenuBar()
+            fm = wx.Menu()
+            m_mgr = fm.Append(wx.ID_ANY, "Playlist Manager\tCtrl+M")
+            m_epg = fm.Append(wx.ID_ANY, "EPG Manager\tCtrl+E")
+            m_imp = fm.Append(wx.ID_ANY, "Import EPG to DB\tCtrl+I")
+            fm.AppendSeparator()
+            m_exit = fm.Append(wx.ID_EXIT, "Exit\tCtrl+Q")
+            mb.Append(fm, "File")
+            om = wx.Menu()
+            player_menu = wx.Menu()
+            self.player_VLC = player_menu.AppendRadioItem(wx.ID_ANY, "VLC")
+            self.player_MPC = player_menu.AppendRadioItem(wx.ID_ANY, "MPC")
+            self.player_MPCBE = player_menu.AppendRadioItem(wx.ID_ANY, "MPC-BE")
+            self.player_Kodi = player_menu.AppendRadioItem(wx.ID_ANY, "Kodi")
+            self.player_Winamp = player_menu.AppendRadioItem(wx.ID_ANY, "Winamp")
+            self.player_Foobar2000 = player_menu.AppendRadioItem(wx.ID_ANY, "Foobar2000")
+            self.player_MPV = player_menu.AppendRadioItem(wx.ID_ANY, "MPV")
+            self.player_SMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "SMPlayer")
+            self.player_Totem = player_menu.AppendRadioItem(wx.ID_ANY, "Totem")
+            self.player_QuickTime = player_menu.AppendRadioItem(wx.ID_ANY, "QuickTime")
+            self.player_iTunes = player_menu.AppendRadioItem(wx.ID_ANY, "iTunes/Apple Music")
+            self.player_PotPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "PotPlayer")
+            self.player_KMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "KMPlayer")
+            self.player_AIMP = player_menu.AppendRadioItem(wx.ID_ANY, "AIMP")
+            self.player_QMPlay2 = player_menu.AppendRadioItem(wx.ID_ANY, "QMPlay2")
+            self.player_GOMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "GOM Player")
+            self.player_Audacious = player_menu.AppendRadioItem(wx.ID_ANY, "Audacious")
+            self.player_Fauxdacious = player_menu.AppendRadioItem(wx.ID_ANY, "Fauxdacious")
+            self.player_Custom = player_menu.AppendRadioItem(wx.ID_ANY, "Custom Player...")
+            om.AppendSubMenu(player_menu, "Media Player to Use")
+            self.min_to_tray_item = om.AppendCheckItem(wx.ID_ANY, "Minimize to System Tray")
+            om.AppendSeparator()
+            mb.Append(om, "Options")
+            self.SetMenuBar(mb)
+            self.Bind(wx.EVT_MENU, self.show_manager, m_mgr)
+            self.Bind(wx.EVT_MENU, self.show_epg_manager, m_epg)
+            self.Bind(wx.EVT_MENU, self.import_epg, m_imp)
+            self.Bind(wx.EVT_MENU, lambda _: self.Close(), m_exit)
+            for item, key in [
+                (self.player_VLC, "VLC"),
+                (self.player_MPC, "MPC"),
+                (self.player_MPCBE, "MPC-BE"),
+                (self.player_Kodi, "Kodi"),
+                (self.player_Winamp, "Winamp"),
+                (self.player_Foobar2000, "Foobar2000"),
+                (self.player_MPV, "MPV"),
+                (self.player_SMPlayer, "SMPlayer"),
+                (self.player_Totem, "Totem"),
+                (self.player_QuickTime, "QuickTime"),
+                (self.player_iTunes, "iTunes/Apple Music"),
+                (self.player_PotPlayer, "PotPlayer"),
+                (self.player_KMPlayer, "KMPlayer"),
+                (self.player_AIMP, "AIMP"),
+                (self.player_QMPlay2, "QMPlay2"),
+                (self.player_GOMPlayer, "GOM Player"),
+                (self.player_Audacious, "Audacious"),
+                (self.player_Fauxdacious, "Fauxdacious"),
+            ]:
+                self.Bind(wx.EVT_MENU, lambda evt, attr=key: self._select_player(attr), item)
+            self.Bind(wx.EVT_MENU, self._select_custom_player, self.player_Custom)
+            self.Bind(wx.EVT_MENU, self.on_toggle_min_to_tray, self.min_to_tray_item)
+            self.Bind(wx.EVT_MENU_OPEN, self.on_menu_open)
+            self._sync_player_menu_from_config()
+            self.min_to_tray_item.Check(self.minimize_to_tray)
+
         self.group_list.Bind(wx.EVT_LISTBOX, lambda _: self.on_group_select())
         self.filter_box.Bind(wx.EVT_TEXT_ENTER, lambda _: self.apply_filter())
         self.channel_list.Bind(wx.EVT_LISTBOX, lambda _: self.on_highlight())
         self.channel_list.Bind(wx.EVT_LISTBOX_DCLICK, lambda _: self.play_selected())
-        mb = wx.MenuBar()
-        fm = wx.Menu()
-        m_mgr = fm.Append(wx.ID_ANY, "Playlist Manager\tCtrl+M")
-        m_epg = fm.Append(wx.ID_ANY, "EPG Manager\tCtrl+E")
-        m_imp = fm.Append(wx.ID_ANY, "Import EPG to DB\tCtrl+I")
-        fm.AppendSeparator()
-        m_exit = fm.Append(wx.ID_EXIT, "Exit\tCtrl+Q")
-        mb.Append(fm, "File")
-        om = wx.Menu()
-        player_menu = wx.Menu()
-        self.player_VLC = player_menu.AppendRadioItem(wx.ID_ANY, "VLC")
-        self.player_MPC = player_menu.AppendRadioItem(wx.ID_ANY, "MPC")
-        self.player_MPCBE = player_menu.AppendRadioItem(wx.ID_ANY, "MPC-BE")
-        self.player_Kodi = player_menu.AppendRadioItem(wx.ID_ANY, "Kodi")
-        self.player_Winamp = player_menu.AppendRadioItem(wx.ID_ANY, "Winamp")
-        self.player_Foobar2000 = player_menu.AppendRadioItem(wx.ID_ANY, "Foobar2000")
-        self.player_MPV = player_menu.AppendRadioItem(wx.ID_ANY, "MPV")
-        self.player_SMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "SMPlayer")
-        self.player_Totem = player_menu.AppendRadioItem(wx.ID_ANY, "Totem")
-        self.player_QuickTime = player_menu.AppendRadioItem(wx.ID_ANY, "QuickTime")
-        self.player_iTunes = player_menu.AppendRadioItem(wx.ID_ANY, "iTunes/Apple Music")
-        self.player_PotPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "PotPlayer")
-        self.player_KMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "KMPlayer")
-        self.player_AIMP = player_menu.AppendRadioItem(wx.ID_ANY, "AIMP")
-        self.player_QMPlay2 = player_menu.AppendRadioItem(wx.ID_ANY, "QMPlay2")
-        self.player_GOMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "GOM Player")
-        self.player_Audacious = player_menu.AppendRadioItem(wx.ID_ANY, "Audacious")
-        self.player_Fauxdacious = player_menu.AppendRadioItem(wx.ID_ANY, "Fauxdacious")
-        self.player_Custom = player_menu.AppendRadioItem(wx.ID_ANY, "Custom Player...")
-        om.AppendSubMenu(player_menu, "Media Player to Use")
-
-        self.min_to_tray_item = om.AppendCheckItem(wx.ID_ANY, "Minimize to System Tray")
-        om.AppendSeparator()
-        mb.Append(om, "Options")
-
-        self.SetMenuBar(mb)
-        self.Bind(wx.EVT_MENU, self.show_manager, m_mgr)
-        self.Bind(wx.EVT_MENU, self.show_epg_manager, m_epg)
-        self.Bind(wx.EVT_MENU, self.import_epg, m_imp)
-        self.Bind(wx.EVT_MENU, lambda _: self.Close(), m_exit)
-        for item, key in [
-            (self.player_VLC, "VLC"),
-            (self.player_MPC, "MPC"),
-            (self.player_MPCBE, "MPC-BE"),
-            (self.player_Kodi, "Kodi"),
-            (self.player_Winamp, "Winamp"),
-            (self.player_Foobar2000, "Foobar2000"),
-            (self.player_MPV, "MPV"),
-            (self.player_SMPlayer, "SMPlayer"),
-            (self.player_Totem, "Totem"),
-            (self.player_QuickTime, "QuickTime"),
-            (self.player_iTunes, "iTunes/Apple Music"),
-            (self.player_PotPlayer, "PotPlayer"),
-            (self.player_KMPlayer, "KMPlayer"),
-            (self.player_AIMP, "AIMP"),
-            (self.player_QMPlay2, "QMPlay2"),
-            (self.player_GOMPlayer, "GOM Player"),
-            (self.player_Audacious, "Audacious"),
-            (self.player_Fauxdacious, "Fauxdacious"),
-        ]:
-            self.Bind(wx.EVT_MENU, lambda evt, attr=key: self._select_player(attr), item)
-        self.Bind(wx.EVT_MENU, self._select_custom_player, self.player_Custom)
-        self.Bind(wx.EVT_MENU, self.on_toggle_min_to_tray, self.min_to_tray_item)
-
-        self.Bind(wx.EVT_MENU_OPEN, self.on_menu_open)
-
-        self._sync_player_menu_from_config()
-        self.min_to_tray_item.Check(self.minimize_to_tray)
-
-    # Rest of the file unchanged (all the rest of your logic as before)
-    # ... (all other methods from previous versions, unchanged) ...
-    # Paste in the entire
 
     def on_toggle_min_to_tray(self, event):
-        self.minimize_to_tray = self.min_to_tray_item.IsChecked()
+        self.minimize_to_tray = not self.minimize_to_tray if platform.system() == "Linux" else self.min_to_tray_item.IsChecked()
         self.config["minimize_to_tray"] = self.minimize_to_tray
         save_config(self.config)
 
@@ -463,7 +499,11 @@ class IPTVClient(wx.Frame):
         self.default_player = player
         self.config["media_player"] = player
         save_config(self.config)
-        self._sync_player_menu_from_config()
+        if platform.system() == "Linux":
+            for label, item in getattr(self, '_player_radio_items', {}).items():
+                item.Check(label == player)
+        else:
+            self._sync_player_menu_from_config()
 
     def _select_custom_player(self, _):
         dlg = CustomPlayerDialog(self, self.config.get("custom_player_path", ""))
@@ -476,8 +516,12 @@ class IPTVClient(wx.Frame):
                 self.config["custom_player_path"] = path
                 save_config(self.config)
         dlg.Destroy()
-        self.player_Custom.Check()
-        self._sync_player_menu_from_config()
+        if platform.system() == "Linux":
+            for label, item in getattr(self, '_player_radio_items', {}).items():
+                item.Check(label == "Custom")
+        else:
+            self.player_Custom.Check()
+            self._sync_player_menu_from_config()
 
     def on_channel_key(self, event):
         key = event.GetKeyCode()
