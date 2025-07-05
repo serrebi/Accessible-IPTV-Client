@@ -555,6 +555,7 @@ class IPTVClient(wx.Frame):
                     label = f"{r['channel_name']} - {r['show_title']} ({self._fmt_time(r['start'])}–{self._fmt_time(r['end'])})"
                     self.displayed.append({"type": "epg", "data": r})
                     self.channel_list.Append(label)
+            # Always use wx.CallAfter for UI changes
             wx.CallAfter(update_ui)
         threading.Thread(target=lambda: epg_search(my_token), daemon=True).start()
 
