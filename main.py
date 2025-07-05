@@ -139,7 +139,19 @@ class IPTVClient(wx.Frame):
         ("GOM Player", "player_GOMPlayer"),
         ("Audacious", "player_Audacious"),
         ("Fauxdacious", "player_Fauxdacious"),
-        ("Custom", "player_Custom"),
+        ("Clementine", "player_Clementine"),
+        ("Strawberry", "player_Strawberry"),
+        ("Amarok", "player_Amarok"),
+        ("Rhythmbox", "player_Rhythmbox"),
+        ("Pragha", "player_Pragha"),
+        ("Lollypop", "player_Lollypop"),
+        ("Exaile", "player_Exaile"),
+        ("Quod Libet", "player_QuodLibet"),
+        ("Gmusicbrowser", "player_Gmusicbrowser"),
+        ("Xmms", "player_Xmms"),
+        ("Vocal", "player_Vocal"),
+        ("Haruna", "player_Haruna"),
+        ("Celluloid", "player_Celluloid"),
     ]
     PLAYER_MENU_ATTRS = dict(PLAYER_KEYS)
 
@@ -155,11 +167,9 @@ class IPTVClient(wx.Frame):
         self.default_player = self.config.get("media_player", "VLC")
         self.custom_player_path = self.config.get("custom_player_path", "")
         self.epg_importing = False
-
         self.epg_cache = {}
         self.epg_cache_lock = threading.Lock()
         self.refresh_timer = None
-
         self.minimize_to_tray = self.config.get("minimize_to_tray", False)
         self.tray_icon = None
 
@@ -170,7 +180,6 @@ class IPTVClient(wx.Frame):
         self.Show()
         self.start_epg_import_background()
         self.start_refresh_timer()
-
         self.Bind(wx.EVT_ICONIZE, self.on_minimize)
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
@@ -180,6 +189,9 @@ class IPTVClient(wx.Frame):
         for key, attr in self.PLAYER_MENU_ATTRS.items():
             if hasattr(self, attr):
                 getattr(self, attr).Check(key == defplayer)
+        if hasattr(self, "player_Custom"):
+            if self.default_player == "Custom":
+                self.player_Custom.Check()
 
     def on_menu_open(self, event):
         from options import load_config
@@ -353,7 +365,6 @@ class IPTVClient(wx.Frame):
                     self.Bind(wx.EVT_MENU, lambda evt, pl=label: self._select_player(pl), id=itemid)
                     if self.default_player == label:
                         item.Check(True)
-                player_menu.AppendSeparator()
                 customid = 2999
                 customitem = player_menu.AppendRadioItem(customid, "Custom Player...")
                 self.Bind(wx.EVT_MENU, self._select_custom_player, id=customid)
@@ -388,24 +399,11 @@ class IPTVClient(wx.Frame):
             mb.Append(fm, "File")
             om = wx.Menu()
             player_menu = wx.Menu()
-            self.player_VLC = player_menu.AppendRadioItem(wx.ID_ANY, "VLC")
-            self.player_MPC = player_menu.AppendRadioItem(wx.ID_ANY, "MPC")
-            self.player_MPCBE = player_menu.AppendRadioItem(wx.ID_ANY, "MPC-BE")
-            self.player_Kodi = player_menu.AppendRadioItem(wx.ID_ANY, "Kodi")
-            self.player_Winamp = player_menu.AppendRadioItem(wx.ID_ANY, "Winamp")
-            self.player_Foobar2000 = player_menu.AppendRadioItem(wx.ID_ANY, "Foobar2000")
-            self.player_MPV = player_menu.AppendRadioItem(wx.ID_ANY, "MPV")
-            self.player_SMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "SMPlayer")
-            self.player_Totem = player_menu.AppendRadioItem(wx.ID_ANY, "Totem")
-            self.player_QuickTime = player_menu.AppendRadioItem(wx.ID_ANY, "QuickTime")
-            self.player_iTunes = player_menu.AppendRadioItem(wx.ID_ANY, "iTunes/Apple Music")
-            self.player_PotPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "PotPlayer")
-            self.player_KMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "KMPlayer")
-            self.player_AIMP = player_menu.AppendRadioItem(wx.ID_ANY, "AIMP")
-            self.player_QMPlay2 = player_menu.AppendRadioItem(wx.ID_ANY, "QMPlay2")
-            self.player_GOMPlayer = player_menu.AppendRadioItem(wx.ID_ANY, "GOM Player")
-            self.player_Audacious = player_menu.AppendRadioItem(wx.ID_ANY, "Audacious")
-            self.player_Fauxdacious = player_menu.AppendRadioItem(wx.ID_ANY, "Fauxdacious")
+            self.player_menu_items = []
+            for label, attr in self.PLAYER_KEYS:
+                item = player_menu.AppendRadioItem(wx.ID_ANY, label)
+                setattr(self, attr, item)
+                self.player_menu_items.append((item, label))
             self.player_Custom = player_menu.AppendRadioItem(wx.ID_ANY, "Custom Player...")
             om.AppendSubMenu(player_menu, "Media Player to Use")
             self.min_to_tray_item = om.AppendCheckItem(wx.ID_ANY, "Minimize to System Tray")
@@ -416,26 +414,7 @@ class IPTVClient(wx.Frame):
             self.Bind(wx.EVT_MENU, self.show_epg_manager, m_epg)
             self.Bind(wx.EVT_MENU, self.import_epg, m_imp)
             self.Bind(wx.EVT_MENU, lambda _: self.Close(), m_exit)
-            for item, key in [
-                (self.player_VLC, "VLC"),
-                (self.player_MPC, "MPC"),
-                (self.player_MPCBE, "MPC-BE"),
-                (self.player_Kodi, "Kodi"),
-                (self.player_Winamp, "Winamp"),
-                (self.player_Foobar2000, "Foobar2000"),
-                (self.player_MPV, "MPV"),
-                (self.player_SMPlayer, "SMPlayer"),
-                (self.player_Totem, "Totem"),
-                (self.player_QuickTime, "QuickTime"),
-                (self.player_iTunes, "iTunes/Apple Music"),
-                (self.player_PotPlayer, "PotPlayer"),
-                (self.player_KMPlayer, "KMPlayer"),
-                (self.player_AIMP, "AIMP"),
-                (self.player_QMPlay2, "QMPlay2"),
-                (self.player_GOMPlayer, "GOM Player"),
-                (self.player_Audacious, "Audacious"),
-                (self.player_Fauxdacious, "Fauxdacious"),
-            ]:
+            for item, key in self.player_menu_items:
                 self.Bind(wx.EVT_MENU, lambda evt, attr=key: self._select_player(attr), item)
             self.Bind(wx.EVT_MENU, self._select_custom_player, self.player_Custom)
             self.Bind(wx.EVT_MENU, self.on_toggle_min_to_tray, self.min_to_tray_item)
@@ -743,7 +722,7 @@ class IPTVClient(wx.Frame):
                 r"C:\Program Files (x86)\Fauxdacious\fauxdacious.exe",
                 r"C:\Program Files (x86)\Fauxdacious\bin\fauxdacious.exe",
                 r"C:\Program Files\Fauxdacious\bin\fauxdacious.exe"
-            ]
+            ],
         }
         mac_paths = {
             "VLC": ["/Applications/VLC.app/Contents/MacOS/VLC"],
@@ -759,7 +738,7 @@ class IPTVClient(wx.Frame):
             "GOM Player": [],
             "Audacious": ["/Applications/Audacious.app/Contents/MacOS/Audacious"],
             "Fauxdacious": ["/Applications/Fauxdacious.app/Contents/MacOS/Fauxdacious"],
-            "MPC-BE": []
+            "MPC-BE": [],
         }
         linux_players = {
             "VLC": "vlc",
@@ -774,7 +753,20 @@ class IPTVClient(wx.Frame):
             "GOM Player": "gomplayer",
             "Audacious": "audacious",
             "Fauxdacious": "fauxdacious",
-            "MPC-BE": "mpc-be"
+            "MPC-BE": "mpc-be",
+            "Clementine": "clementine",
+            "Strawberry": "strawberry",
+            "Amarok": "amarok",
+            "Rhythmbox": "rhythmbox",
+            "Pragha": "pragha",
+            "Lollypop": "lollypop",
+            "Exaile": "exaile",
+            "Quod Libet": "quodlibet",
+            "Gmusicbrowser": "gmusicbrowser",
+            "Xmms": "xmms",
+            "Vocal": "vocal",
+            "Haruna": "haruna",
+            "Celluloid": "celluloid",
         }
 
         if player == "Custom":
