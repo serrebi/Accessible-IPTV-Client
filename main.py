@@ -524,10 +524,15 @@ class IPTVClient(wx.Frame):
         self.channel_list.Clear()
         source = (self.all_channels if self.current_group == "All Channels"
                   else self.channels_by_group.get(self.current_group, []))
+        # --- Limit results to 50 for accessibility ---
+        channel_count = 0
         for ch in source:
             if txt in ch.get("name", "").lower():
                 self.displayed.append({"type": "channel", "data": ch})
                 self.channel_list.Append(ch.get("name", ""))
+                channel_count += 1
+                if channel_count >= 50:
+                    break
         if not txt:
             return
 
@@ -540,7 +545,7 @@ class IPTVClient(wx.Frame):
         def epg_search(token):
             try:
                 db = EPGDatabase(get_db_path(), readonly=True)
-                results = db.get_channels_with_show(txt)
+                results = db.get_channels_with_show(txt, max_results=50)  # LIMIT TO 50
                 db.close()
             except Exception:
                 results = []
@@ -551,11 +556,14 @@ class IPTVClient(wx.Frame):
                 if txt != self.filter_box.GetValue().strip().lower():
                     return
                 # Add EPG results to the channel_list
+                epg_count = 0
                 for r in results:
+                    if epg_count >= 50:
+                        break
                     label = f"{r['channel_name']} - {r['show_title']} ({self._fmt_time(r['start'])}–{self._fmt_time(r['end'])})"
                     self.displayed.append({"type": "epg", "data": r})
                     self.channel_list.Append(label)
-            # Always use wx.CallAfter for UI changes
+                    epg_count += 1
             wx.CallAfter(update_ui)
         threading.Thread(target=lambda: epg_search(my_token), daemon=True).start()
 
