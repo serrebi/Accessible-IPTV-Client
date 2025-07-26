@@ -194,27 +194,47 @@ class EPGDatabase:
         # 4. Token-based fuzzy matching for group-preferred
         target_tokens = tokenize_channel_name(name)
         rows_all = c.execute("SELECT id, display_name, group_tag FROM channels").fetchall()
+        syns = group_synonyms()
         for ch_id, disp, grp in rows_all:
             epg_tokens = tokenize_channel_name(disp)
-            if group_tag and (grp == group_tag or (group_tag in group_synonyms() and grp in group_synonyms()[group_tag])):
-                overlap = target_tokens & epg_tokens
+            # Determine if this EPG channel belongs to the same region as the playlist channel.
+            # A match is considered same-region if group_tag equals grp or if either tag
+            # appears in the other's synonym list (bidirectionally).
+            same_region = False
+            if group_tag:
+                if grp == group_tag:
+                    same_region = True
+                else:
+                    # Check synonyms in both directions
+                    if grp in syns and group_tag in syns.get(grp, []):
+                        same_region = True
+                    elif group_tag in syns and grp in syns.get(group_tag, []):
+                        same_region = True
+            overlap = target_tokens & epg_tokens
+            if same_region:
+                # Require at least two overlapping tokens for same-region matches
                 if len(overlap) >= 2:
                     score = 80 + len(overlap)
                     candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
             else:
-                overlap = target_tokens & epg_tokens
-                if len(overlap) >= 3:
+                # For channels from other regions (or unknown), require at least two
+                # overlapping tokens.  This allows two-word channel names like
+                # "CBS Reality" or "Sky Crime" to match, while maintaining a lower
+                # base score (60 + overlap) than same-region matches.
+                if len(overlap) >= 2:
                     score = 60 + len(overlap)
                     if ch_id not in candidates or candidates[ch_id]['score'] < score:
                         candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
 
         # Fallback: Relaxed name fuzzy (ALL EPG channels, score 55+)
+        # Use a similarity threshold of 0.8 to avoid too many false positives.  Lower thresholds
+        # increase matches but may introduce incorrect matches.
         relaxed_target = re.sub(r'\s+', '', canonicalize_name(strip_backup_terms(name)))
         for ch_id, disp, grp in rows_all:
             cand = re.sub(r'\s+', '', canonicalize_name(strip_backup_terms(disp)))
             ratio = difflib.SequenceMatcher(None, relaxed_target, cand).ratio()
             if ratio >= 0.8:
-                score = int(55 + 40*ratio)
+                score = int(55 + 40 * ratio)
                 if ch_id not in candidates or candidates[ch_id]['score'] < score:
                     candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
 
