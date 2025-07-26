@@ -12,7 +12,7 @@ import difflib
 
 STRIP_TAGS = [
     'hd', 'sd', 'hevc', 'fhd', 'uhd', '4k', '8k', 'hdr', 'dash', 'hq', 'st',
-    'us', 'usa', 'ca', 'canada', 'car', 'uk', 'u.k.', 'u.k', 'uk.', 'u.s.', 'u.s', 'us.', 'au', 'aus', 'nz', 'ie', 'eir', 'ire', 'irl'
+    'us', 'usa', 'ca', 'canada', 'car', 'uk', 'u.k.', 'u.k', 'uk.', 'u.s.', 'u.s', 'us.', 'au', 'aus', 'nz'
 ]
 
 NOISE_WORDS = [
@@ -22,6 +22,7 @@ NOISE_WORDS = [
 ]
 
 def group_synonyms():
+    # All variants are lowercased, with punctuation, full/abbreviation/alternative names
     return {
         "us": [
             "us", "usa", "u.s.", "u.s", "us.", "united states", "united states of america", "america"
@@ -38,9 +39,7 @@ def group_synonyms():
         "nz": [
             "nz", "new zealand"
         ],
-        "ie": [
-            "ie", "eir", "ire", "irl", "ireland"
-        ],
+        # Extend here for more regions/countries as needed
     }
 
 def canonicalize_name(name: str) -> str:
@@ -165,18 +164,10 @@ class EPGDatabase:
         self.conn.commit()
 
     def get_matching_channel_ids(self, channel: Dict[str, str]) -> List[dict]:
-        def norm_group(tag: str) -> str:
-            tag = tag or ''
-            tag = tag.lower().strip()
-            for norm, variants in group_synonyms().items():
-                if tag == norm or tag in variants:
-                    return norm
-            return tag
-
         tvg_id = channel.get("tvg-id", "").strip()
         tvg_name = channel.get("tvg-name", "").strip()
         name = channel.get("name", "")
-        group_tag = norm_group(extract_group(channel.get("group", "")) if channel.get("group") else '')
+        group_tag = extract_group(channel.get("group", "")) if channel.get("group") else ''
 
         c = self.conn.cursor()
         candidates = {}
@@ -185,53 +176,47 @@ class EPGDatabase:
         if tvg_id:
             row = c.execute("SELECT id, group_tag, display_name FROM channels WHERE id = ?", (tvg_id,)).fetchone()
             if row:
-                epg_group = norm_group(row[1])
-                if not group_tag or not epg_group or group_tag == epg_group:
-                    candidates[row[0]] = {'id': row[0], 'group_tag': epg_group, 'score': 100, 'display_name': row[2]}
+                candidates[row[0]] = {'id': row[0], 'group_tag': row[1], 'score': 100, 'display_name': row[2]}
 
         # 2. Exact canonicalized tvg-name
         if tvg_name:
             norm_tvg_name = canonicalize_name(strip_backup_terms(tvg_name))
             rows = c.execute("SELECT id, group_tag, display_name FROM channels WHERE norm_name = ?", (norm_tvg_name,)).fetchall()
             for r in rows:
-                epg_group = norm_group(r[1])
-                if not group_tag or not epg_group or group_tag == epg_group:
-                    candidates[r[0]] = {'id': r[0], 'group_tag': epg_group, 'score': 95, 'display_name': r[2]}
+                candidates[r[0]] = {'id': r[0], 'group_tag': r[1], 'score': 95, 'display_name': r[2]}
 
         # 3. Exact canonicalized playlist name
         norm_name_pl = canonicalize_name(strip_backup_terms(name))
         rows = c.execute("SELECT id, group_tag, display_name FROM channels WHERE norm_name = ?", (norm_name_pl,)).fetchall()
         for r in rows:
-            epg_group = norm_group(r[1])
-            if not group_tag or not epg_group or group_tag == epg_group:
-                candidates[r[0]] = {'id': r[0], 'group_tag': epg_group, 'score': 90, 'display_name': r[2]}
+            candidates[r[0]] = {'id': r[0], 'group_tag': r[1], 'score': 90, 'display_name': r[2]}
 
-        # 4. Fuzzy (token overlap): allow if groups match or either group is blank
+        # 4. Token-based fuzzy matching for group-preferred
         target_tokens = tokenize_channel_name(name)
         rows_all = c.execute("SELECT id, display_name, group_tag FROM channels").fetchall()
         for ch_id, disp, grp in rows_all:
-            epg_group = norm_group(grp)
-            if group_tag and epg_group and group_tag != epg_group:
-                continue
             epg_tokens = tokenize_channel_name(disp)
-            overlap = target_tokens & epg_tokens
-            if len(overlap) >= 2:
-                score = 80 + len(overlap)
-                if ch_id not in candidates or candidates[ch_id]['score'] < score:
-                    candidates[ch_id] = {'id': ch_id, 'group_tag': epg_group, 'score': score, 'display_name': disp}
+            if group_tag and (grp == group_tag or (group_tag in group_synonyms() and grp in group_synonyms()[group_tag])):
+                overlap = target_tokens & epg_tokens
+                if len(overlap) >= 2:
+                    score = 80 + len(overlap)
+                    candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
+            else:
+                overlap = target_tokens & epg_tokens
+                if len(overlap) >= 3:
+                    score = 60 + len(overlap)
+                    if ch_id not in candidates or candidates[ch_id]['score'] < score:
+                        candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
 
-        # 5. Relaxed fuzzy fallback if either group is blank
+        # Fallback: Relaxed name fuzzy (ALL EPG channels, score 55+)
         relaxed_target = re.sub(r'\s+', '', canonicalize_name(strip_backup_terms(name)))
         for ch_id, disp, grp in rows_all:
-            epg_group = norm_group(grp)
-            if group_tag and epg_group and group_tag != epg_group:
-                continue
             cand = re.sub(r'\s+', '', canonicalize_name(strip_backup_terms(disp)))
             ratio = difflib.SequenceMatcher(None, relaxed_target, cand).ratio()
             if ratio >= 0.8:
                 score = int(55 + 40*ratio)
                 if ch_id not in candidates or candidates[ch_id]['score'] < score:
-                    candidates[ch_id] = {'id': ch_id, 'group_tag': epg_group, 'score': score, 'display_name': disp}
+                    candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
 
         return list(candidates.values()), group_tag
 

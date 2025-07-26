@@ -94,7 +94,11 @@ class TrayIcon(wx.adv.TaskBarIcon):
         self.parent = parent
         self.on_restore = on_restore
         self.on_exit = on_exit
+        # Bind double-click and single-click events.  Double-click is handled by
+        # EVT_TASKBAR_LEFT_DCLICK.  To allow restoring the window with a single
+        # left-click, also bind EVT_TASKBAR_LEFT_DOWN to the same handler.
         self.Bind(wx.adv.EVT_TASKBAR_LEFT_DCLICK, self.on_taskbar_activate)
+        self.Bind(wx.adv.EVT_TASKBAR_LEFT_DOWN, self.on_taskbar_activate)
         self.Bind(wx.EVT_MENU, self.on_menu_select)
         self.set_icon()
 
@@ -239,7 +243,9 @@ class IPTVClient(wx.Frame):
                     if key in seen_channel_keys:
                         continue
                     seen_channel_keys.add(key)
-                    grp = ch.get("group", "Uncategorized")
+                    # Use explicit default for empty or missing group titles. If the playlist entry
+                    # has a group key but its value is an empty string, treat it as uncategorized.
+                    grp = ch.get("group") or "Uncategorized"
                     self.channels_by_group.setdefault(grp, []).append(ch)
                     self.all_channels.append(ch)
             except Exception:
@@ -305,7 +311,9 @@ class IPTVClient(wx.Frame):
                         if key in seen_channel_keys:
                             continue
                         seen_channel_keys.add(key)
-                        grp = ch.get("group", "Uncategorized")
+                        # Normalize empty or missing group titles to "Uncategorized" so blank
+                        # strings do not end up as their own group name.
+                        grp = ch.get("group") or "Uncategorized"
                         channels_by_group.setdefault(grp, []).append(ch)
                         all_channels.append(ch)
                 except Exception:
@@ -524,15 +532,10 @@ class IPTVClient(wx.Frame):
         self.channel_list.Clear()
         source = (self.all_channels if self.current_group == "All Channels"
                   else self.channels_by_group.get(self.current_group, []))
-        # --- Limit results to 50 for accessibility ---
-        channel_count = 0
         for ch in source:
             if txt in ch.get("name", "").lower():
                 self.displayed.append({"type": "channel", "data": ch})
                 self.channel_list.Append(ch.get("name", ""))
-                channel_count += 1
-                if channel_count >= 50:
-                    break
         if not txt:
             return
 
@@ -545,7 +548,7 @@ class IPTVClient(wx.Frame):
         def epg_search(token):
             try:
                 db = EPGDatabase(get_db_path(), readonly=True)
-                results = db.get_channels_with_show(txt, max_results=50)  # LIMIT TO 50
+                results = db.get_channels_with_show(txt)
                 db.close()
             except Exception:
                 results = []
@@ -556,14 +559,10 @@ class IPTVClient(wx.Frame):
                 if txt != self.filter_box.GetValue().strip().lower():
                     return
                 # Add EPG results to the channel_list
-                epg_count = 0
                 for r in results:
-                    if epg_count >= 50:
-                        break
                     label = f"{r['channel_name']} - {r['show_title']} ({self._fmt_time(r['start'])}–{self._fmt_time(r['end'])})"
                     self.displayed.append({"type": "epg", "data": r})
                     self.channel_list.Append(label)
-                    epg_count += 1
             wx.CallAfter(update_ui)
         threading.Thread(target=lambda: epg_search(my_token), daemon=True).start()
 
@@ -601,7 +600,12 @@ class IPTVClient(wx.Frame):
                     if canonicalize_name(ch["name"]) == canonicalize_name(r["channel_name"]):
                         url = ch.get("url", "")
                         break
-                msg = f"Show: {r['show_title']} | Channel: {r['channel_name']} | Start: {self._fmt_time(r['start'])} | End: {self._fmt_time(r['end'])})"
+                # Present now/future show details without an unmatched closing parenthesis. Include
+                # separate fields for the show title, channel name, and start/end times.
+                msg = (
+                    f"Show: {r['show_title']} | Channel: {r['channel_name']} | "
+                    f"Start: {self._fmt_time(r['start'])} | End: {self._fmt_time(r['end'])}"
+                )
                 self.epg_display.SetValue(msg)
                 self.url_display.SetValue(url)
         else:
