@@ -594,4 +594,4 @@ class PlaylistManagerDialog(wx.Dialog):
         self.lb.SetSelection(new_idx)
 
     def GetResult(self):
-        return self.playlis
+        return self.playlist_sources

@@ -10,42 +10,93 @@ import tempfile
 
 CONFIG_FILE = "iptvclient.conf"
 
-def get_base_path():
-    # The config file stays with the app, but all other files go to temp
+def _is_writable_dir(path: str) -> bool:
+    try:
+        if not os.path.isdir(path):
+            return False
+        testfile = os.path.join(path, ".iptvclient_write_test.tmp")
+        with open(testfile, "w", encoding="utf-8") as f:
+            f.write("test")
+        os.remove(testfile)
+        return True
+    except Exception:
+        return False
+
+def get_app_dir():
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
+def get_cwd_dir():
+    try:
+        return os.getcwd()
+    except Exception:
+        return None
+
+def get_config_read_candidates():
+    # Strict priority: 1) CWD 2) App dir
+    candidates = []
+    cwd = get_cwd_dir()
+    if cwd:
+        candidates.append(os.path.join(cwd, CONFIG_FILE))
+    candidates.append(os.path.join(get_app_dir(), CONFIG_FILE))
+    return candidates
+
+def get_config_write_target():
+    # Write to CWD first if writable, else app dir if writable; else fallback to CWD/appdir path even if unwritable
+    cwd = get_cwd_dir()
+    if cwd and _is_writable_dir(cwd):
+        return os.path.join(cwd, CONFIG_FILE)
+    appdir = get_app_dir()
+    if _is_writable_dir(appdir):
+        return os.path.join(appdir, CONFIG_FILE)
+    return os.path.join(cwd or appdir, CONFIG_FILE)
+
 def get_config_path():
-    # Config stays with the app
-    return os.path.join(get_base_path(), CONFIG_FILE)
+    # Return first existing config by read priority; else preferred write target
+    for p in get_config_read_candidates():
+        if os.path.exists(p):
+            return p
+    return get_config_write_target()
 
 def load_config() -> Dict:
-    path = get_config_path()
     default = {"playlists": [], "epgs": [], "media_player": "VLC", "custom_player_path": "", "minimize_to_tray": False}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+    for p in get_config_read_candidates():
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
                 if isinstance(data, dict):
-                    for k in default:
-                        if k not in data:
-                            data[k] = default[k]
+                    for k, v in default.items():
+                        data.setdefault(k, v)
                     return data
-        except Exception as e:
-            wx.LogError(f"Failed to load config: {e}")
+            except Exception as e:
+                wx.LogError(f"Failed to load config from {p}: {e}")
+                break
     return default
 
 def save_config(cfg: Dict):
+    # Always save to preferred write target (CWD if writable)
+    path = get_config_write_target()
     try:
-        path = get_config_path()
-        with open(path, "w", encoding="utf-8") as f:
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.replace(tmp_path, path)
+        except Exception:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+            os.rename(tmp_path, path)
     except Exception as e:
-        wx.LogError(f"Failed to save config: {e}")
+        wx.LogError(f"Failed to save config to {path}: {e}")
 
 def get_cache_dir():
-    # Store cache in the system temp directory
     cache_dir = os.path.join(tempfile.gettempdir(), "iptv_cache")
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir
@@ -55,7 +106,6 @@ def get_cache_path_for_url(url):
     return os.path.join(get_cache_dir(), f"{h}.m3u")
 
 def get_db_path():
-    # Store EPG DB in the system temp directory
     return os.path.join(tempfile.gettempdir(), "epg.db")
 
 STRIP_TAGS = [
@@ -120,7 +170,6 @@ def extract_group(title: str) -> str:
     return ''
 
 def utc_to_local(dt):
-    # Ensure tz-aware dt; convert to local timezone
     if dt.tzinfo is None:
         try:
             dt = dt.replace(tzinfo=datetime.timezone.utc)
