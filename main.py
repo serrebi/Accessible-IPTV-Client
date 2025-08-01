@@ -6,7 +6,6 @@ import gzip
 import io
 import sqlite3
 import threading
-import hashlib
 from typing import Dict, List, Optional
 import wx
 import xml.etree.ElementTree as ET
@@ -15,6 +14,8 @@ import re
 import shutil
 import platform
 import time
+import signal
+import subprocess
 
 import wx.adv
 
@@ -94,9 +95,6 @@ class TrayIcon(wx.adv.TaskBarIcon):
         self.parent = parent
         self.on_restore = on_restore
         self.on_exit = on_exit
-        # Bind double-click and single-click events.  Double-click is handled by
-        # EVT_TASKBAR_LEFT_DCLICK.  To allow restoring the window with a single
-        # left-click, also bind EVT_TASKBAR_LEFT_DOWN to the same handler.
         self.Bind(wx.adv.EVT_TASKBAR_LEFT_DCLICK, self.on_taskbar_activate)
         self.Bind(wx.adv.EVT_TASKBAR_LEFT_DOWN, self.on_taskbar_activate)
         self.Bind(wx.EVT_MENU, self.on_menu_select)
@@ -174,7 +172,7 @@ class IPTVClient(wx.Frame):
         self.epg_cache = {}
         self.epg_cache_lock = threading.Lock()
         self.refresh_timer = None
-        self.minimize_to_tray = self.config.get("minimize_to_tray", False)
+        self.minimize_to_tray = bool(self.config.get("minimize_to_tray", False))
         self.tray_icon = None
 
         self._build_ui()
@@ -194,13 +192,18 @@ class IPTVClient(wx.Frame):
             if hasattr(self, attr):
                 getattr(self, attr).Check(key == defplayer)
         if hasattr(self, "player_Custom"):
-            if self.default_player == "Custom":
-                self.player_Custom.Check()
+            self.player_Custom.Check(defplayer == "Custom")
+        if hasattr(self, "_player_radio_items"):
+            for label, item in self._player_radio_items.items():
+                item.Check(label == defplayer)
 
     def on_menu_open(self, event):
         from options import load_config
         self.config = load_config()
         self._sync_player_menu_from_config()
+        if hasattr(self, "min_to_tray_item"):
+            self.minimize_to_tray = bool(self.config.get("minimize_to_tray", False))
+            self.min_to_tray_item.Check(self.minimize_to_tray)
         event.Skip()
 
     def start_refresh_timer(self):
@@ -243,8 +246,6 @@ class IPTVClient(wx.Frame):
                     if key in seen_channel_keys:
                         continue
                     seen_channel_keys.add(key)
-                    # Use explicit default for empty or missing group titles. If the playlist entry
-                    # has a group key but its value is an empty string, treat it as uncategorized.
                     grp = ch.get("group") or "Uncategorized"
                     self.channels_by_group.setdefault(grp, []).append(ch)
                     self.all_channels.append(ch)
@@ -273,9 +274,14 @@ class IPTVClient(wx.Frame):
                             if age < 15 * 60:
                                 download = False
                         if download:
-                            text = urllib.request.urlopen(
-                                urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
-                            ).read().decode("utf-8", "ignore")
+                            with urllib.request.urlopen(
+                                urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"}), timeout=60
+                            ) as resp:
+                                raw = resp.read()
+                                try:
+                                    text = raw.decode("utf-8")
+                                except UnicodeDecodeError:
+                                    text = raw.decode("latin-1", "ignore")
                             with open(cache_path, "w", encoding="utf-8") as f:
                                 f.write(text)
                         else:
@@ -293,7 +299,7 @@ class IPTVClient(wx.Frame):
             threads = []
             for idx, src in enumerate(playlist_sources):
                 if src.startswith(("http://", "https://")):
-                    t = threading.Thread(target=fetch_playlist, args=(idx, src))
+                    t = threading.Thread(target=fetch_playlist, args=(idx, src), daemon=True)
                     t.start()
                     threads.append(t)
                 else:
@@ -311,8 +317,6 @@ class IPTVClient(wx.Frame):
                         if key in seen_channel_keys:
                             continue
                         seen_channel_keys.add(key)
-                        # Normalize empty or missing group titles to "Uncategorized" so blank
-                        # strings do not end up as their own group name.
                         grp = ch.get("group") or "Uncategorized"
                         channels_by_group.setdefault(grp, []).append(ch)
                         all_channels.append(ch)
@@ -328,7 +332,10 @@ class IPTVClient(wx.Frame):
 
     def _cleanup_cache_and_channels(self, valid_caches):
         cache_dir = get_cache_dir()
-        files = [os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if f.endswith(".m3u")]
+        try:
+            files = [os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if f.endswith(".m3u")]
+        except Exception:
+            return
         for f in files:
             if f not in valid_caches:
                 try:
@@ -435,8 +442,24 @@ class IPTVClient(wx.Frame):
         self.channel_list.Bind(wx.EVT_LISTBOX, lambda _: self.on_highlight())
         self.channel_list.Bind(wx.EVT_LISTBOX_DCLICK, lambda _: self.play_selected())
 
+        entries = [
+            (wx.ACCEL_CTRL, ord('M'), 4001),
+            (wx.ACCEL_CTRL, ord('E'), 4002),
+            (wx.ACCEL_CTRL, ord('I'), 4003),
+            (wx.ACCEL_CTRL, ord('Q'), 4004),
+        ]
+        atable = wx.AcceleratorTable(entries)
+        self.SetAcceleratorTable(atable)
+        self.Bind(wx.EVT_MENU, self.show_manager, id=4001)
+        self.Bind(wx.EVT_MENU, self.show_epg_manager, id=4002)
+        self.Bind(wx.EVT_MENU, self.import_epg, id=4003)
+        self.Bind(wx.EVT_MENU, lambda evt: self.Close(), id=4004)
+
     def on_toggle_min_to_tray(self, event):
-        self.minimize_to_tray = not self.minimize_to_tray if platform.system() == "Linux" else self.min_to_tray_item.IsChecked()
+        if platform.system() == "Linux":
+            self.minimize_to_tray = not self.minimize_to_tray
+        else:
+            self.minimize_to_tray = self.min_to_tray_item.IsChecked()
         self.config["minimize_to_tray"] = self.minimize_to_tray
         save_config(self.config)
 
@@ -451,7 +474,10 @@ class IPTVClient(wx.Frame):
 
     def restore_from_tray(self):
         if self.tray_icon:
-            self.tray_icon.RemoveIcon()
+            try:
+                self.tray_icon.RemoveIcon()
+            except Exception:
+                pass
             self.tray_icon.Destroy()
             self.tray_icon = None
         self.Show()
@@ -460,7 +486,10 @@ class IPTVClient(wx.Frame):
 
     def exit_from_tray(self):
         if self.tray_icon:
-            self.tray_icon.RemoveIcon()
+            try:
+                self.tray_icon.RemoveIcon()
+            except Exception:
+                pass
             self.tray_icon.Destroy()
             self.tray_icon = None
         self.Destroy()
@@ -477,7 +506,10 @@ class IPTVClient(wx.Frame):
             event.Veto()
         else:
             if self.tray_icon:
-                self.tray_icon.RemoveIcon()
+                try:
+                    self.tray_icon.RemoveIcon()
+                except Exception:
+                    pass
                 self.tray_icon.Destroy()
                 self.tray_icon = None
             self.Destroy()
@@ -486,11 +518,7 @@ class IPTVClient(wx.Frame):
         self.default_player = player
         self.config["media_player"] = player
         save_config(self.config)
-        if platform.system() == "Linux":
-            for label, item in getattr(self, '_player_radio_items', {}).items():
-                item.Check(label == player)
-        else:
-            self._sync_player_menu_from_config()
+        self._sync_player_menu_from_config()
 
     def _select_custom_player(self, _):
         dlg = CustomPlayerDialog(self, self.config.get("custom_player_path", ""))
@@ -503,12 +531,7 @@ class IPTVClient(wx.Frame):
                 self.config["custom_player_path"] = path
                 save_config(self.config)
         dlg.Destroy()
-        if platform.system() == "Linux":
-            for label, item in getattr(self, '_player_radio_items', {}).items():
-                item.Check(label == "Custom")
-        else:
-            self.player_Custom.Check()
-            self._sync_player_menu_from_config()
+        self._sync_player_menu_from_config()
 
     def on_channel_key(self, event):
         key = event.GetKeyCode()
@@ -539,7 +562,6 @@ class IPTVClient(wx.Frame):
         if not txt:
             return
 
-        # Use a unique search token to ignore outdated results
         if not hasattr(self, "_search_token"):
             self._search_token = 0
         self._search_token += 1
@@ -553,12 +575,10 @@ class IPTVClient(wx.Frame):
             except Exception:
                 results = []
             def update_ui():
-                # Only update if this is still the latest search
                 if getattr(self, "_search_token", 0) != token:
                     return
                 if txt != self.filter_box.GetValue().strip().lower():
                     return
-                # Add EPG results to the channel_list
                 for r in results:
                     label = f"{r['channel_name']} - {r['show_title']} ({self._fmt_time(r['start'])}–{self._fmt_time(r['end'])})"
                     self.displayed.append({"type": "epg", "data": r})
@@ -574,7 +594,8 @@ class IPTVClient(wx.Frame):
             return s
 
     def on_group_select(self):
-        sel = self.group_list.GetStringSelection().split(" (", 1)[0]
+        sel_full = self.group_list.GetStringSelection()
+        sel = sel_full.split(" (", 1)[0] if sel_full else "All Channels"
         self.current_group = sel
         self.apply_filter()
 
@@ -600,8 +621,6 @@ class IPTVClient(wx.Frame):
                     if canonicalize_name(ch["name"]) == canonicalize_name(r["channel_name"]):
                         url = ch.get("url", "")
                         break
-                # Present now/future show details without an unmatched closing parenthesis. Include
-                # separate fields for the show title, channel name, and start/end times.
                 msg = (
                     f"Show: {r['show_title']} | Channel: {r['channel_name']} | "
                     f"Start: {self._fmt_time(r['start'])} | End: {self._fmt_time(r['end'])}"
@@ -626,15 +645,7 @@ class IPTVClient(wx.Frame):
         return msg
 
     def _fetch_and_cache_epg(self, channel, cname):
-        if self.epg_importing:
-            wx.CallAfter(self.epg_display.SetValue, "EPG importing…")
-            return
-        if not self.epg_sources:
-            wx.CallAfter(self.epg_display.SetValue, "No EPG data available.")
-            return
-        if not channel.get("tvg-id") and not channel.get("name"):
-            wx.CallAfter(self.epg_display.SetValue, "No EPG data available.")
-            return
+        # Ensure we don't block while import is running; but still try reading latest data
         try:
             db = EPGDatabase(get_db_path(), readonly=True)
             now_next = db.get_now_next(channel)
@@ -642,6 +653,13 @@ class IPTVClient(wx.Frame):
         except Exception:
             now_next = None
         if not now_next:
+            # Improve UX message depending on state
+            if self.epg_importing:
+                wx.CallAfter(self.epg_display.SetValue, "EPG importing…")
+            elif not self.epg_sources:
+                wx.CallAfter(self.epg_display.SetValue, "No EPG data available.")
+            else:
+                wx.CallAfter(self.epg_display.SetValue, "No program info found.")
             now_show, next_show = None, None
         else:
             now_show, next_show = now_next
@@ -655,6 +673,22 @@ class IPTVClient(wx.Frame):
             item = self.displayed[i]
             if item["type"] == "channel" and canonicalize_name(item["data"].get("name", "")) == canonicalize_name(channel.get("name", "")):
                 self.epg_display.SetValue(self._epg_msg_from_tuple(now_show, next_show))
+
+    def _spawn_windows(self, exe_path, url):
+        try:
+            subprocess.Popen([exe_path, url], close_fds=True)
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    def _spawn_posix(self, exe_path_or_cmd, url):
+        try:
+            subprocess.Popen([exe_path_or_cmd, url], close_fds=True)
+            return True, ""
+        except FileNotFoundError:
+            return False, f"Executable not found: {exe_path_or_cmd}"
+        except Exception as e:
+            return False, str(e)
 
     def play_selected(self):
         i = self.channel_list.GetSelection()
@@ -685,7 +719,8 @@ class IPTVClient(wx.Frame):
             ],
             "MPC": [
                 r"C:\Program Files\MPC-HC\mpc-hc64.exe",
-                r"C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe"
+                r"C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe",
+                r"C:\Program Files (x86)\MPC-HC\mpc-hc.exe",
             ],
             "MPC-BE": [
                 r"C:\Program Files\MPC-BE\mpc-be64.exe",
@@ -755,14 +790,9 @@ class IPTVClient(wx.Frame):
                 "/Applications/iTunes.app/Contents/MacOS/iTunes",
                 "/Applications/Music.app/Contents/MacOS/Music"
             ],
-            "PotPlayer": [],
-            "KMPlayer": [],
-            "AIMP": [],
             "QMPlay2": ["/Applications/QMPlay2.app/Contents/MacOS/QMPlay2"],
-            "GOM Player": [],
             "Audacious": ["/Applications/Audacious.app/Contents/MacOS/Audacious"],
             "Fauxdacious": ["/Applications/Fauxdacious.app/Contents/MacOS/Fauxdacious"],
-            "MPC-BE": [],
         }
         linux_players = {
             "VLC": "vlc",
@@ -798,16 +828,16 @@ class IPTVClient(wx.Frame):
             if not exe:
                 wx.MessageBox("No custom player set.", "Error", wx.OK | wx.ICON_ERROR)
                 return
-            if not os.path.exists(exe):
-                wx.MessageBox("Custom player path does not exist.", "Error", wx.OK | wx.ICON_ERROR)
-                return
-            try:
-                if sys.platform.startswith("win"):
-                    os.spawnl(os.P_NOWAIT, exe, os.path.basename(exe), url)
-                else:
-                    threading.Thread(target=lambda: os.system(f'"{exe}" "{url}" &'), daemon=True).start()
-            except Exception as e:
-                wx.MessageBox(f"Failed to start custom player: {e}", "Error", wx.OK | wx.ICON_ERROR)
+            if sys.platform.startswith("win"):
+                if not os.path.exists(exe):
+                    wx.MessageBox("Custom player path does not exist.", "Error", wx.OK | wx.ICON_ERROR)
+                    return
+                ok, err = self._spawn_windows(exe, url)
+            else:
+                found = exe if os.path.isabs(exe) else shutil.which(exe) or exe
+                ok, err = self._spawn_posix(found, url)
+            if not ok:
+                wx.MessageBox(f"Failed to start custom player: {err}", "Error", wx.OK | wx.ICON_ERROR)
             return
 
         if sys.platform.startswith("win"):
@@ -815,7 +845,6 @@ class IPTVClient(wx.Frame):
             found = ""
             for p in exe_list:
                 if "*" in p:
-                    folder = os.path.dirname(p)
                     try:
                         import glob
                         matches = glob.glob(p)
@@ -837,10 +866,9 @@ class IPTVClient(wx.Frame):
                     found = p
                     break
             if found:
-                try:
-                    os.spawnl(os.P_NOWAIT, found, os.path.basename(found), url)
-                except Exception as e:
-                    wx.MessageBox(f"Failed to start {player}: {e}", "Error", wx.OK | wx.ICON_ERROR)
+                ok, err = self._spawn_windows(found, url)
+                if not ok:
+                    wx.MessageBox(f"Failed to start {player}: {err}", "Error", wx.OK | wx.ICON_ERROR)
                 return
             wx.MessageBox(f"{player} not found.", "Error",
                           wx.OK | wx.ICON_ERROR)
@@ -848,10 +876,9 @@ class IPTVClient(wx.Frame):
             plist = mac_paths.get(player, [])
             for path in plist:
                 if os.path.exists(path):
-                    try:
-                        threading.Thread(target=lambda: os.system(f'"{path}" "{url}" &'), daemon=True).start()
-                    except Exception as e:
-                        wx.MessageBox(f"Failed to start {player}: {e}", "Error", wx.OK | wx.ICON_ERROR)
+                    ok, err = self._spawn_posix(path, url)
+                    if not ok:
+                        wx.MessageBox(f"Failed to start {player}: {err}", "Error", wx.OK | wx.ICON_ERROR)
                     return
             wx.MessageBox(f"{player} not found in /Applications.", "Error",
                           wx.OK | wx.ICON_ERROR)
@@ -859,10 +886,9 @@ class IPTVClient(wx.Frame):
             exe = linux_players.get(player, player.lower())
             found = shutil.which(exe)
             if found:
-                try:
-                    threading.Thread(target=lambda: os.system(f'"{found}" "{url}" &'), daemon=True).start()
-                except Exception as e:
-                    wx.MessageBox(f"Failed to start {player}: {e}", "Error", wx.OK | wx.ICON_ERROR)
+                ok, err = self._spawn_posix(found, url)
+                if not ok:
+                    wx.MessageBox(f"Failed to start {player}: {err}", "Error", wx.OK | wx.ICON_ERROR)
                 return
             wx.MessageBox(f"{player} not found in PATH.", "Error",
                           wx.OK | wx.ICON_ERROR)
@@ -883,19 +909,25 @@ class IPTVClient(wx.Frame):
         sources = list(self.epg_sources)
         if not sources:
             return
+        if self.epg_importing:
+            return
         self.epg_importing = True
 
         def do_import():
             try:
                 db = EPGDatabase(get_db_path(), for_threading=True)
                 db.import_epg_xml(sources)
-                wx.CallAfter(self.finish_import_background)
             except Exception:
+                pass
+            finally:
                 wx.CallAfter(self.finish_import_background)
         threading.Thread(target=do_import, daemon=True).start()
 
     def finish_import_background(self):
         self.epg_importing = False
+        # Clear EPG cache to ensure fresh DB content is used now that import finished
+        with self.epg_cache_lock:
+            self.epg_cache.clear()
         self.on_highlight()
 
     def show_manager(self, _):
@@ -914,6 +946,8 @@ class IPTVClient(wx.Frame):
             self.config["epgs"] = self.epg_sources
             save_config(self.config)
             self.reload_epg_sources()
+            # Trigger background import immediately after changing sources
+            self.start_epg_import_background()
         dlg.Destroy()
 
     def import_epg(self, _):
@@ -946,6 +980,9 @@ class IPTVClient(wx.Frame):
 
     def finish_import(self):
         self.epg_importing = False
+        # Clear EPG cache to ensure we lookup fresh data
+        with self.epg_cache_lock:
+            self.epg_cache.clear()
         self.on_highlight()
 
     def _parse_m3u_return(self, text):
@@ -953,32 +990,34 @@ class IPTVClient(wx.Frame):
         out = []
         meta = {}
         for line in lines:
-            if line.startswith("#EXTINF"):
-                meta = {"name": "", "group": "", "tvg-id": "", "tvg-name": ""}
-                if "group-title=" in line:
-                    match = re.search(r'group-title="([^"]+)"', line)
-                    if match:
-                        meta["group"] = match.group(1)
-                if "tvg-id=" in line:
-                    match = re.search(r'tvg-id="([^"]+)"', line)
-                    if match:
-                        meta["tvg-id"] = match.group(1)
-                if "tvg-name=" in line:
-                    match = re.search(r'tvg-name="([^"]+)"', line)
-                    if match:
-                        meta["tvg-name"] = match.group(1)
-                if "," in line:
-                    meta["name"] = line.split(",", 1)[1].strip()
-            elif line.startswith("#"):
+            s = line.strip()
+            if not s:
                 continue
-            elif line.strip():
-                url = line.strip()
-                row = dict(meta)
+            if s.upper().startswith("#EXTINF"):
+                meta = {"name": "", "group": "", "tvg-id": "", "tvg-name": ""}
+                if "," in s:
+                    meta["name"] = s.split(",", 1)[1].strip()
+                # Parse attribute segment robustly
+                attrs_part = s.split(":", 1)[1] if ":" in s else ""
+                attr_segment = attrs_part.split(",", 1)[0]
+                for key, dst in (("group-title", "group"), ("tvg-id", "tvg-id"), ("tvg-name", "tvg-name")):
+                    m = re.search(r'%s=(?:"([^"]*)"|\'([^\']*)\'|([^,]*))' % re.escape(key), attr_segment, flags=re.I)
+                    if m:
+                        val = m.group(1) or m.group(2) or m.group(3) or ""
+                        meta[dst] = val.strip()
+            elif s.startswith("#"):
+                continue
+            else:
+                url = s
+                row = dict(meta) if meta else {"name": "", "group": "", "tvg-id": "", "tvg-name": ""}
                 row["url"] = url
                 out.append(row)
+                meta = {}
         return out
 
 if __name__ == '__main__':
+    if hasattr(signal, "SIGINT"):
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
     app = wx.App(False)
     IPTVClient()
     app.MainLoop()

@@ -22,7 +22,7 @@ def get_config_path():
 
 def load_config() -> Dict:
     path = get_config_path()
-    default = {"playlists": [], "epgs": [], "media_player": "VLC", "custom_player_path": ""}
+    default = {"playlists": [], "epgs": [], "media_player": "VLC", "custom_player_path": "", "minimize_to_tray": False}
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -120,8 +120,12 @@ def extract_group(title: str) -> str:
     return ''
 
 def utc_to_local(dt):
+    # Ensure tz-aware dt; convert to local timezone
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
+        try:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        except Exception:
+            dt = dt
     return dt.astimezone()
 
 class CustomPlayerDialog(wx.Dialog):

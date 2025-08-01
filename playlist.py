@@ -154,8 +154,13 @@ class EPGDatabase:
         c = self.conn.cursor()
         c.execute("INSERT OR IGNORE INTO programmes (channel_id, title, start, end) VALUES (?, ?, ?, ?)", (channel_id, title, start, end))
 
-    def prune_old_programmes(self, days: int = 4):
-        cutoff = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=days)).strftime("%Y%m%d%H%M%S")
+    def prune_old_programmes(self, days: int = 7):
+        # Use UTC consistently; fallback if datetime.UTC missing (older Python)
+        try:
+            utcnow = datetime.datetime.now(datetime.UTC)
+        except AttributeError:
+            utcnow = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+        cutoff = (utcnow - datetime.timedelta(days=days)).strftime("%Y%m%d%H%M%S")
         c = self.conn.cursor()
         c.execute("DELETE FROM programmes WHERE end < ?", (cutoff,))
         self.conn.commit()
@@ -197,38 +202,27 @@ class EPGDatabase:
         syns = group_synonyms()
         for ch_id, disp, grp in rows_all:
             epg_tokens = tokenize_channel_name(disp)
-            # Determine if this EPG channel belongs to the same region as the playlist channel.
-            # A match is considered same-region if group_tag equals grp or if either tag
-            # appears in the other's synonym list (bidirectionally).
             same_region = False
             if group_tag:
                 if grp == group_tag:
                     same_region = True
                 else:
-                    # Check synonyms in both directions
                     if grp in syns and group_tag in syns.get(grp, []):
                         same_region = True
                     elif group_tag in syns and grp in syns.get(group_tag, []):
                         same_region = True
             overlap = target_tokens & epg_tokens
             if same_region:
-                # Require at least two overlapping tokens for same-region matches
                 if len(overlap) >= 2:
                     score = 80 + len(overlap)
                     candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
             else:
-                # For channels from other regions (or unknown), require at least two
-                # overlapping tokens.  This allows two-word channel names like
-                # "CBS Reality" or "Sky Crime" to match, while maintaining a lower
-                # base score (60 + overlap) than same-region matches.
                 if len(overlap) >= 2:
                     score = 60 + len(overlap)
                     if ch_id not in candidates or candidates[ch_id]['score'] < score:
                         candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
 
         # Fallback: Relaxed name fuzzy (ALL EPG channels, score 55+)
-        # Use a similarity threshold of 0.8 to avoid too many false positives.  Lower thresholds
-        # increase matches but may introduce incorrect matches.
         relaxed_target = re.sub(r'\s+', '', canonicalize_name(strip_backup_terms(name)))
         for ch_id, disp, grp in rows_all:
             cand = re.sub(r'\s+', '', canonicalize_name(strip_backup_terms(disp)))
@@ -240,11 +234,17 @@ class EPGDatabase:
 
         return list(candidates.values()), group_tag
 
+    def _utcnow(self):
+        try:
+            return datetime.datetime.now(datetime.UTC)
+        except AttributeError:
+            return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+
     def get_now_next(self, channel: Dict[str, str]) -> Optional[tuple]:
         matches, group_tag = self.get_matching_channel_ids(channel)
         if not matches:
             return None
-        now = datetime.datetime.now(datetime.UTC)
+        now = self._utcnow()
         now_str = now.strftime("%Y%m%d%H%M%S")
         c = self.conn.cursor()
         current_shows = []
@@ -259,10 +259,15 @@ class EPGDatabase:
                 (ch_id, now_str, now_str)).fetchone()
             if row:
                 title, start, end = row
+                try:
+                    st_dt = datetime.datetime.strptime(start, "%Y%m%d%H%M%S")
+                    en_dt = datetime.datetime.strptime(end, "%Y%m%d%H%M%S")
+                except Exception:
+                    continue
                 current_shows.append({
                     "title": title,
-                    "start": datetime.datetime.strptime(start, "%Y%m%d%H%M%S"),
-                    "end": datetime.datetime.strptime(end, "%Y%m%d%H%M%S"),
+                    "start": st_dt,
+                    "end": en_dt,
                     "channel_id": ch_id,
                     "group_tag": grp,
                     "group_priority": group_priority,
@@ -273,10 +278,15 @@ class EPGDatabase:
                 (ch_id, now_str)).fetchone()
             if row2:
                 title2, start2, end2 = row2
+                try:
+                    st2_dt = datetime.datetime.strptime(start2, "%Y%m%d%H%M%S")
+                    en2_dt = datetime.datetime.strptime(end2, "%Y%m%d%H%M%S")
+                except Exception:
+                    continue
                 next_shows.append({
                     "title": title2,
-                    "start": datetime.datetime.strptime(start2, "%Y%m%d%H%M%S"),
-                    "end": datetime.datetime.strptime(end2, "%Y%m%d%H%M%S"),
+                    "start": st2_dt,
+                    "end": en2_dt,
                     "channel_id": ch_id,
                     "group_tag": grp,
                     "group_priority": group_priority,
@@ -293,7 +303,7 @@ class EPGDatabase:
         return (now_show, next_show)
 
     def get_channels_with_show(self, filter_text: str, max_results: int = 100):
-        now = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d%H%M%S")
+        now = self._utcnow().strftime("%Y%m%d%H%M%S")
         c = self.conn.cursor()
         rows = c.execute("""
             SELECT p.channel_id, p.title, p.start, p.end, ch.display_name
@@ -355,26 +365,32 @@ class EPGDatabase:
             except Exception as e:
                 wx.LogError(f"EPG import failed for {src}: {e}")
             if progress_callback:
-                progress_callback(idx + 1, total)
+                try:
+                    progress_callback(idx + 1, total)
+                except Exception:
+                    pass
         thread_db.commit()
-        thread_db.prune_old_programmes(4)
+        thread_db.prune_old_programmes(7)
         thread_db.close()
 
     def _stream_parse_epg(self, filelike):
+        # Efficient iterative parsing with memory cleanup that works with xml.etree
         context = ET.iterparse(filelike, events=("end",))
+        # We track parent tags using a stack of elements to aid memory cleanup
         for event, elem in context:
             if elem.tag == "channel":
                 cid = elem.get("id")
                 disp_name = None
                 for dn in elem.findall("display-name"):
-                    disp_name = dn.text or ""
-                    break
+                    disp_name = (dn.text or "").strip()
+                    if disp_name:
+                        break
                 if cid and disp_name:
                     self.insert_channel(cid, disp_name)
                 elem.clear()
             elif elem.tag == "programme":
                 cid = elem.get("channel")
-                title = elem.findtext("title", "")
+                title = (elem.findtext("title", "") or "").strip()
                 start = elem.get("start")
                 end = elem.get("stop")
                 if cid and title and start and end:
@@ -385,11 +401,12 @@ class EPGDatabase:
                     except Exception:
                         pass
                 elem.clear()
+        # No lxml-only getprevious/getparent calls are used to ensure compatibility
 
 class EPGImportDialog(wx.Dialog):
     def __init__(self, parent, total):
         super().__init__(parent, title="Importing EPG", size=(400, 120))
-        self.progress = wx.Gauge(self, range=total)
+        self.progress = wx.Gauge(self, range=max(1, total))
         self.label = wx.StaticText(self, label="Importing EPG data...")
         sizer = wx.BoxSizer(wx.VERTICAL)
         sizer.Add(self.label, 0, wx.ALL | wx.EXPAND, 10)
@@ -399,9 +416,9 @@ class EPGImportDialog(wx.Dialog):
         self.CenterOnParent()
 
     def set_progress(self, value, total):
-        self.progress.SetRange(total)
-        self.progress.SetValue(value)
-        self.label.SetLabel(f"Imported {value}/{total} sources")
+        self.progress.SetRange(max(1, total))
+        self.progress.SetValue(min(value, total))
+        self.label.SetLabel(f"Imported {min(value, total)}/{total} sources")
 
 class EPGManagerDialog(wx.Dialog):
     def __init__(self, parent, epg_sources):
@@ -577,4 +594,4 @@ class PlaylistManagerDialog(wx.Dialog):
         self.lb.SetSelection(new_idx)
 
     def GetResult(self):
-        return self.playlist_sources
+        return self.playlis
