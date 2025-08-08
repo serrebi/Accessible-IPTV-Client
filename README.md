@@ -1,66 +1,43 @@
 # Accessible IPTV Client
 
-An accessible IPTV client VibeCoded using wxPython. Just made this for my own use.
+A keyboard-first IPTV client I vibe coded  with ChatGPT. It is using wxPython. I made it for myself. It’s fast, simple, and works with screen readers.
 
-## Features
+**Platforms:** Windows and Linux (tested).  
+**macOS:** should work, but I didn’t test it.
 
-- Fully accessible with all major screen readers on Windows (NVDA, JAWS, etc).
-- Supports m3u and m3u_plus playlists.
-- Playlist Manager: add, remove, and manage playlists. All playlists are stored in `iptvclient.conf` in the same folder as the executable.
-- Supports external media players on windows, Mac, and Linux
-- Category/Group navigation: browse channels by group.
-- Channel search and filter field.
-- Keyboard navigation for everything. Mouse not required.
-- Remembers channel and playlist selection after refresh.
-- Settings and playlists are always saved in the app’s folder.
-- Fast and responsive.
+---
 
-## Requirements
+## What it does
 
-- Windows 10 or 11
-- Python 3.8+
-- wxPython
-- VLC or any supported player
-- a playlist
+- Works with screen readers (NVDA, JAWS, Narrator, Orca).
+- Reads M3U and M3U Plus.
+- Lets you add and remove playlists.
+- Groups channels by category.
+- Search box for channels.
+- Full keyboard control. Mouse is optional.
+- Remembers your last playlist and channel.
+- Saves everything to the app’s folder:
+  - `iptvclient.conf` for options and playlists.
+  - `epg.sqlite` for the TV guide (XMLTV).
+- Opens streams in your external media player.
 
+---
 
-## Installation
+## What you need
 
-```sh
-pip install wxpython
-```
-download the .py or clone. CD,  and run
-```sh
-python3 ./iptvclient.py
-Download and install VLC or other players if needed.
+- **Python 3.8+**
+- **wxPython** (`pip install wxpython`)
+- **One or more media players** (VLC, MPC-HC, MPV, etc.)
+- **At least one playlist URL or file**
+- (Optional) **XMLTV EPG** URL or file (`.xml` or `.xml.gz`)
 
-## Building the Executable
-Clone this repo, or download the zip. Then
+---
 
-```sh
-pip install pyinstaller
-pyinstaller --noconsole --onefile main.py
-Your `.exe` will be in the `dist` folder.
+## Quick start
 
-## Usage
+### Windows (PowerShell or CMD)
 
-- Run the app.
-- Use menus to add or remove playlists (local files or URLs).
-- Set your preferred media player in the Options > Media Player submenu.
-- Browse channels and groups using the keyboard. Press Enter to play.
-- All settings save automatically in `iptvclient.conf`.
+1) Install Python:
 
-## Known Limitations
-
-- Tentative  EPG/TV Guide. It is what it is for now. If you want to help or fork, feel free. EPG is loaded on startup and then it is checked in the background and kept in a sqLite database in the directory where the script, or executable is. Supports XMLTV, and EPG GZ
-- No recording or catchup support.
-- App opens streams in external player windows, because that's all I need it to do.
-
-## Tips
-
-- Player paths are auto-detected from default install locations, so make sure they are installed first.
--  You are restricted by what the player you choose supports. VLC and Media player classic support a wide variety of formats.
-
-## Support
-
-I wrote this for myself so there isn't really support. Sorry! Would still love to know if something isn't working, though.
+```bat
+winget install -e --id Python.Python.3.12
