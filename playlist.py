@@ -150,14 +150,12 @@ def group_synonyms():
 def canonicalize_name(name: str) -> str:
     name = (name or "").strip().lower()
     tags = STRIP_TAGS
-    # remove tags at ends repeatedly
     pattern = r'^(?:' + '|'.join(tags) + r')\b[\s\-:]*|[\s\-:]*\b(?:' + '|'.join(tags) + r')$'
     while True:
         newname = re.sub(pattern, '', name, flags=re.I).strip()
         if newname == name:
             break
         name = newname
-    # remove any remaining tag words anywhere
     name = re.sub(r'\b(?:' + '|'.join(tags) + r')\b', '', name, flags=re.I)
     name = re.sub(r'\s+', ' ', name)
     return name.strip()
@@ -179,13 +177,11 @@ def extract_group(title: str) -> str:
         for v in variants:
             if re.search(r'\b' + re.escape(v) + r'\b', title):
                 return norm_tag
-    # look for leading country code (e.g., "us: something")
     m = re.match(r'([a-z]{2,3})\b', title)
     if m:
         code = m.group(1)
         if code in group_synonyms():
             return code
-    # look for "(us)" style
     m = re.search(r'\(([a-z]{2,3})\)', title)
     if m:
         code = m.group(1)
@@ -230,7 +226,6 @@ ZONE_SYNONYMS = {
 def _mk(*xs):
     return {x.lower() for x in xs if x}
 
-# minimal market hints used for Canadian groups and others; US locals resolved by callsigns/cities
 AFFILIATE_MARKETS: Dict[str, Dict[str, Dict[str, Set[str]]]] = {
     "ca": {
         "cbc": {
@@ -287,9 +282,9 @@ AFFILIATE_MARKETS: Dict[str, Dict[str, Dict[str, Set[str]]]] = {
         "tsn": {
             "tsn1-west": _mk("tsn1", "west", "bc", "ab", "pacific", "mountain"),
             "tsn2-central": _mk("tsn2", "central"),
-            "tsn3-prairies": _mk("tsn3", "prairies", "mb", "sk"),
-            "tsn4-ontario": _mk("tsn4", "ontario", "on", "toronto"),
-            "tsn5-east": _mk("tsn5", "east", "ottawa", "montreal", "qc", "atlantic"),
+            "tsn3-prairies": _mk("prairies", "mb", "sk"),
+            "tsn4-ontario": _mk("ontario", "on", "toronto"),
+            "tsn5-east": _mk("east", "ottawa", "montreal", "qc", "atlantic"),
         },
         "sportsnet": {
             "pacific": _mk("pacific", "bc", "vancouver"),
@@ -311,6 +306,7 @@ AFFILIATE_MARKETS: Dict[str, Dict[str, Dict[str, Set[str]]]] = {
                 "tyne tees": _mk("tyne tees"), "meridian": _mk("meridian"), "central": _mk("central"),
                 "border": _mk("border"), "stv": _mk("stv"), "utv": _mk("utv", "ulster", "northern ireland")},
         "sky crime": {},
+        "sky mix": {},
     },
     "de": {"ard": {}, "wdr": {}, "ndr": {}, "mdr": {}, "br": {}, "hr": {}, "rbb": {}, "swr": {}},
     "au": {"abc": {}, "seven": {}, "nine": {}, "ten": {}, "sbs": {}},
@@ -320,7 +316,7 @@ AFFILIATE_MARKETS: Dict[str, Dict[str, Dict[str, Set[str]]]] = {
 AFFILIATE_BRANDS: Set[str] = {
     "cbc", "ctv", "ctv2", "citytv", "global", "tva", "noovo", "tsn", "sportsnet",
     "abc", "nbc", "cbs", "fox", "pbs", "cw", "mynetwork", "telemundo", "univision",
-    "bbc one", "bbc two", "itv", "channel 4", "channel 5", "sky crime",
+    "bbc one", "bbc two", "itv", "channel 4", "channel 5", "sky crime", "sky mix",
     "ard", "wdr", "ndr", "mdr", "br", "hr", "rbb", "swr",
     "seven", "nine", "ten", "sbs", "tvnz 1", "tvnz 2", "three",
 }
@@ -388,15 +384,13 @@ def _detect_zone(text: str) -> str:
                 return zone
     return ''
 
-# Robust callsign extractor (catches KSTW, KSTW-DT, KSTWHD, WABC-TV, etc.)
 _CALLSIGN_CORE_RX = re.compile(r'\b([A-Z]{3,5})(?:\s*-\s*(?:TV|DT|DT\d|HD))?\b', re.I)
-_CALLSIGN_PREFIXES = ('K','W','C')  # US K/W, Canada C*
+_CALLSIGN_PREFIXES = ('K','W','C')
 def extract_callsigns(text: str) -> Set[str]:
     out = set()
     if not text:
         return out
     s = re.sub(r'[\[\]\(\)]', ' ', str(text).upper())
-    # Split on any non-alnum to be very forgiving
     for token in re.findall(r'[A-Z0-9\-]{3,8}', s):
         parts = re.split(r'[^A-Z0-9]+', token)
         for p in parts:
@@ -463,8 +457,13 @@ def _reverse_brand_lookup(text: str) -> str:
     if "rbb" in t: return "rbb"
     if "swr" in t: return "swr"
     if "sky crime" in t: return "sky crime"
+    if "sky mix" in t or re.search(r'\bsky\s*mix\b', t): return "sky mix"
     if re.search(r'\bbr\b', t): return "br"
     if re.search(r'\bhr\b', t): return "hr"
+    if re.search(r'\bhbo\b', t):
+        return "hbo"
+    if re.search(r'\bhbo\s*(family|latino|signature|comedy|2|plus|x|zone|hits)\b', t):
+        return "hbo"
     return ""
 
 def _normalize_str(s: str) -> str:
@@ -482,13 +481,11 @@ _US_STATE_NAMES = {
 }
 
 def _market_tokens_for(country: str, brand: str, text: str) -> Tuple[Set[str], Set[str], Set[str]]:
-    # Returns (markets, provinces, cities)
     markets = set()
     provinces = set()
     cities = set()
     s = _normalize_str(text)
 
-    # pick up 2–3 letter tokens that look like provinces/states
     for tok in re.findall(r'\b[a-z]{2,3}\b', s):
         t = tok.lower()
         if country == "ca" and t in {"bc","ab","sk","mb","on","qc","ns","nl","nb","pe","yt","nt","nu"}:
@@ -501,7 +498,6 @@ def _market_tokens_for(country: str, brand: str, text: str) -> Tuple[Set[str], S
         elif country == "uk" and t in {"ni"}:
             provinces.add("ni")
 
-    # spelled-out US state names (e.g., "Tacoma Washington")
     if country == "us":
         for full, abbr in _US_STATE_NAMES.items():
             if re.search(r'\b' + re.escape(full) + r'\b', s):
@@ -517,7 +513,6 @@ def _market_tokens_for(country: str, brand: str, text: str) -> Tuple[Set[str], S
                     if '-' in mk:
                         cities.add(mk.split('-')[0])
 
-    # US locals: ALWAYS consider callsigns and city tokens regardless of detected brand
     if country == "us":
         calls = extract_callsigns(text)
         if calls:
@@ -572,20 +567,21 @@ def _parse_xmltv_to_utc_str(s: str) -> Optional[str]:
         return None
     y, mo, d, h, mi, sec, off = m.groups()
     try:
-        base = datetime.datetime(int(y), int(mo), int(d), int(h), int(mi), int(sec), tzinfo=datetime.timezone.utc)
+        y = int(y); mo = int(mo); d = int(d); h = int(h); mi = int(mi); sec = int(sec)
     except Exception:
         return None
+    base = datetime.datetime(y, mo, d, h, mi, sec)
     if off and off.upper() != 'Z':
         sign = 1 if off[0] == '+' else -1
         try:
             oh = int(off[1:3]); om = int(off[3:5])
         except Exception:
             oh = om = 0
-        delta = datetime.timedelta(hours=oh, minutes=om)
-        utc_dt = base - sign * delta  # local -> UTC
+        tz = datetime.timezone(sign * datetime.timedelta(hours=oh, minutes=om))
+        dt = base.replace(tzinfo=tz).astimezone(datetime.timezone.utc)
     else:
-        utc_dt = base
-    return utc_dt.strftime("%Y%m%d%H%M%S")
+        dt = base.replace(tzinfo=datetime.timezone.utc)
+    return dt.strftime("%Y%m%d%H%M%S")
 
 # =========================
 # Region helpers
@@ -649,8 +645,6 @@ class EPGDatabase:
         c.execute("CREATE INDEX IF NOT EXISTS idx_programmes_title ON programmes (title)")
         self.conn.commit()
 
-    # ----- Inserts -----
-
     def insert_channel(self, channel_id: str, display_name: str):
         name_region = extract_group(display_name)
         id_region = _detect_region_from_id(channel_id or "")
@@ -677,10 +671,7 @@ class EPGDatabase:
     def commit(self):
         self.conn.commit()
 
-    # ----- Helpers -----
-
     def _has_any_schedule_from_now(self, ch_id: str) -> bool:
-        """True if channel has any programme ending in the future."""
         now = self._utcnow().strftime("%Y%m%d%H%M%S")
         c = self.conn.cursor()
         row = c.execute("SELECT 1 FROM programmes WHERE channel_id = ? AND end >= ? LIMIT 1", (ch_id, now)).fetchone()
@@ -702,11 +693,7 @@ class EPGDatabase:
 
         norm_name_pl = canonicalize_name(strip_noise_words(name))
         rows = c.execute("SELECT id, group_tag, display_name FROM channels WHERE norm_name = ?", (norm_name_pl)).fetchall() if False else []
-        # ^ intentionally disabled: overly aggressive, causes false positives across feeds
-
         return candidates
-
-    # ----- Matching Core -----
 
     def get_matching_channel_ids(self, channel: Dict[str, str]) -> List[dict]:
         tvg_id = (channel.get("tvg-id") or "").strip()
@@ -729,19 +716,15 @@ class EPGDatabase:
 
         pl_markets, pl_provinces, _ = _market_tokens_for(playlist_region or "", playlist_brand_family, " ".join([tvg_name, name]))
 
-        # Build scored candidates
         for ch_id, disp, grp in rows_all:
             epg_text_norm = canonicalize_name(strip_noise_words(disp)).lower()
             epg_brand_family = _reverse_brand_lookup(epg_text_norm)
             epg_calls = extract_callsigns(" ".join([disp, ch_id]))
 
-            # Decide if candidate is worth scoring:
             families_align = (playlist_brand_family and epg_brand_family and playlist_brand_family == epg_brand_family)
             cs_delta, cs_reason = callsign_overlap_score(pl_calls, epg_calls)
 
-            # Accept if families align OR callsign overlap is strong (covers cases like "KSTW" without "CW" in EPG)
             if not (families_align or cs_delta >= 60 or (not playlist_brand_family and epg_calls and pl_calls and cs_delta >= 60)):
-                # For US locals, also accept if region tokens (city/state) match strongly even if family is missing
                 strong_us_local = False
                 if playlist_region == "us":
                     epg_markets_tmp, epg_provs_tmp, _ = _market_tokens_for("us", epg_brand_family, disp)
@@ -753,23 +736,18 @@ class EPGDatabase:
             score = 0
             why = []
 
-            # Strong base for exact callsign
             if cs_delta:
                 score += cs_delta
                 why.append(cs_reason)
 
-            # Brand family alignment still helps, but lower than callsign
             if families_align:
                 score += 40
                 why.append('+brand-family')
-
-                # strict key match (rare but helpful)
                 epg_brand_key = _brand_key(disp)
                 if playlist_brand_key and epg_brand_key and playlist_brand_key == epg_brand_key:
                     score += 10
                     why.append('+brand-key')
 
-            # Region alignment / bias
             if playlist_region:
                 if grp == playlist_region:
                     score += 18
@@ -780,8 +758,10 @@ class EPGDatabase:
                 else:
                     score -= 40
                     why.append('-other-region')
+                if playlist_brand_family == "hbo" and families_align:
+                    score -= 20
+                    why.append('-hbo-wrong-region')
 
-            # Zone alignment (east/west/pacific/etc.)
             epg_zone = _detect_zone(disp)
             if playlist_zone and epg_zone:
                 if playlist_zone == epg_zone:
@@ -791,7 +771,6 @@ class EPGDatabase:
                     score -= 15
                     why.append('-zone')
 
-            # Timeshift handling
             epg_ts = _detect_timeshift(disp)
             ts_offset = 0
             if playlist_ts and epg_ts == playlist_ts:
@@ -805,7 +784,6 @@ class EPGDatabase:
                 score -= 18
                 why.append('-timeshift-mismatch')
 
-            # Market/Province cues (city/state & callsigns included)
             epg_markets, epg_provs, _ = _market_tokens_for(grp or playlist_region or "", epg_brand_family, disp)
             if pl_markets and epg_markets and (pl_markets & epg_markets):
                 score += 35
@@ -817,7 +795,6 @@ class EPGDatabase:
                 score -= 30
                 why.append('-market-mismatch')
 
-            # Token overlap tie-breaker
             epg_tokens = tokenize_channel_name(disp)
             if target_tokens and epg_tokens:
                 overlap = len(target_tokens & epg_tokens)
@@ -825,20 +802,49 @@ class EPGDatabase:
                     score += min(10, overlap * 2)
                     why.append(f'+tok{overlap}')
 
-            # Hard penalties to avoid generic wrong feeds when we have a callsign
+                if playlist_brand_family == "hbo" and epg_brand_family == "hbo":
+                    epg_norm = epg_text_norm
+                    pl_norm = brand_text
+
+                    variant_keywords = {
+                        "family":"family",
+                        "latino":"latino",
+                        "signature":"signature",
+                        "comedy":"comedy",
+                        "plus":"plus",
+                        "2":"2", "hbo 2":"2", "hbo2":"2",
+                        "x":"x", "zone":"zone", "hits":"hits"
+                    }
+                    pl_has_variant = None
+                    for vk in variant_keywords:
+                        if re.search(r'\b' + re.escape(vk) + r'\b', pl_norm):
+                            pl_has_variant = variant_keywords[vk]
+                            break
+
+                    if not pl_has_variant:
+                        if re.search(r'\bhbo\s*1\b', epg_norm) or "hbo1" in epg_norm.replace(' ', ''):
+                            score += 14
+                            why.append('+hbo-prefers-1')
+                        if re.search(r'\bhbo\s*(family|latino|signature|comedy|2|plus|x|zone|hits)\b', epg_norm):
+                            score -= 8
+                            why.append('-hbo-nonbase-for-generic')
+                    else:
+                        if re.search(r'\b' + re.escape(pl_has_variant) + r'\b', epg_norm):
+                            score += 16
+                            why.append('+hbo-variant-match')
+                        else:
+                            score -= 16
+                            why.append('-hbo-variant-mismatch')
+
             if playlist_region == "us" and playlist_brand_family in {"abc","nbc","cbs","fox","pbs","cw","mynetwork","telemundo","univision"}:
                 if pl_calls and not (pl_calls & epg_calls):
-                    # CW is particularly messy with national feeds; be harsher
                     score -= (80 if playlist_brand_family == "cw" else 55)
                     why.append('-callsign-mismatch')
-                # penalize generic "CW" feeds with no callsign if our playlist clearly mentions a callsign or a city
                 if playlist_brand_family == "cw" and not epg_calls:
-                    # If EPG display-name looks national/east/west
                     if re.search(r'\bnational\b', epg_text_norm) or re.search(r'\b(east|west|pacific|mountain|central)\b', epg_text_norm):
                         score -= 40
                         why.append('-generic-cw')
 
-            # Schedule health: do NOT pick channels with no current/future programmes
             has_sched = self._has_any_schedule_from_now(ch_id)
             if not has_sched:
                 score -= 120
@@ -855,7 +861,6 @@ class EPGDatabase:
                     'ts_offset': ts_offset
                 }
 
-        # Optional debug
         if MATCH_DEBUG:
             print(f"[EPG-MATCH] For '{name}' (region={playlist_region or '??'} zone={playlist_zone or 'none'} brandFamily={playlist_brand_family or 'none'} key={playlist_brand_key or 'none'} ts=+{playlist_ts or 0}h):")
             print(f"  PL calls={sorted(pl_calls)} markets={sorted(pl_markets)} provs={sorted(pl_provinces)}")
@@ -865,7 +870,6 @@ class EPGDatabase:
                 epg_calls_dbg = extract_callsigns(" ".join([v['display_name'], v['id']]))
                 print(f"  {v['score']:>4}  {v['id']}  grp={v.get('group_tag') or ''}  zone={ez or ''}  ts=+{ets}h  calls={sorted(epg_calls_dbg)} why={v.get('why')} :: {v.get('display_name')}")
 
-        # Return list of candidate dicts plus detected playlist_region for tie-breaking elsewhere
         return list(candidates.values()), playlist_region
 
     def _utcnow(self):
@@ -873,8 +877,6 @@ class EPGDatabase:
             return datetime.datetime.now(datetime.UTC)
         except AttributeError:
             return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
-
-    # ----- Now/Next Query with Timeshift Awareness -----
 
     def get_now_next(self, channel: Dict[str, str]) -> Optional[tuple]:
         matches, playlist_region = self.get_matching_channel_ids(channel)
@@ -889,7 +891,6 @@ class EPGDatabase:
         current_shows = []
         next_shows = []
 
-        # Only try the top N candidates to reduce noise
         for match in matches[:12]:
             ch_id = match['id']
             grp = match['group_tag']
@@ -899,7 +900,6 @@ class EPGDatabase:
             query_now = now - datetime.timedelta(hours=ts_offset) if ts_offset > 0 else now
             qnow_str = query_now.strftime("%Y%m%d%H%M%S")
 
-            # NOW
             row = c.execute(
                 "SELECT title, start, end FROM programmes WHERE channel_id = ? AND start <= ? AND end > ? ORDER BY start DESC LIMIT 1",
                 (ch_id, qnow_str, qnow_str)).fetchone()
@@ -920,7 +920,6 @@ class EPGDatabase:
                     "score": match.get("score", 0)
                 })
 
-            # NEXT
             row2 = c.execute(
                 "SELECT title, start, end FROM programmes WHERE channel_id = ? AND start > ? ORDER BY start ASC LIMIT 1",
                 (ch_id, qnow_str)).fetchone()
@@ -944,15 +943,12 @@ class EPGDatabase:
         def pick_best(showlist, is_now):
             if not showlist:
                 return None
-            # Prefer same-region, then higher score, then earliest start for NEXT / soonest end for NOW
             key_fn = (lambda s: (not s["group_priority"], -s["score"], s["end"])) if is_now else (lambda s: (not s["group_priority"], -s["score"], s["start"]))
             return sorted(showlist, key=key_fn)[0]
 
         now_show = pick_best(current_shows, True)
         next_show = pick_best(next_shows, False)
         return (now_show, next_show)
-
-    # ----- Query helpers -----
 
     def get_channels_with_show(self, filter_text: str, max_results: int = 100):
         now = self._utcnow().strftime("%Y%m%d%H%M%S")
@@ -991,10 +987,7 @@ class EPGDatabase:
     def close(self):
         self.conn.close()
 
-    # ----- EPG Import (streaming) -----
-
     def import_epg_xml(self, xml_sources: List[str], progress_callback=None):
-        # Use a separate connection per thread for safety
         thread_db = EPGDatabase(self.db_path, for_threading=True)
         total = len(xml_sources)
         for idx, src in enumerate(xml_sources):
@@ -1017,68 +1010,71 @@ class EPGDatabase:
                     else:
                         with open(src, "r", encoding="utf-8", errors="ignore") as f:
                             thread_db._stream_parse_epg(f)
-            except Exception as e:
-                try:
-                    wx.LogError(f"EPG import failed for {src}: {e}")
-                except Exception:
-                    pass
-            if progress_callback:
-                try:
-                    progress_callback(idx + 1, total)
-                except Exception:
-                    pass
-        thread_db.commit()
-        thread_db.prune_old_programmes(7)
-        thread_db.close()
-
-    def _stream_parse_epg(self, filelike):
-        context = ET.iterparse(filelike, events=("end",))
-        for event, elem in context:
-            if elem.tag == "channel":
-                cid = elem.get("id")
-                disp_name = None
-                for dn in elem.findall("display-name"):
-                    disp_name = (dn.text or "").strip()
-                    if disp_name:
-                        break
-                if cid and disp_name:
-                    self.insert_channel(cid, disp_name)
-                elem.clear()
-            elif elem.tag == "programme":
-                cid = elem.get("channel")
-                title = (elem.findtext("title", "") or "").strip()
-                start = elem.get("start")
-                end = elem.get("stop")
-                if cid and title and start and end:
+            except Exception:
+                continue
+            finally:
+                if progress_callback:
                     try:
-                        s_utc = _parse_xmltv_to_utc_str(start)
-                        e_utc = _parse_xmltv_to_utc_str(end)
-                        if s_utc and e_utc and s_utc < e_utc:
-                            self.insert_programme(cid, title, s_utc, e_utc)
+                        progress_callback(idx + 1, total)
                     except Exception:
                         pass
-                elem.clear()
+        try:
+            thread_db.commit()
+        except Exception:
+            pass
+        thread_db.close()
 
-# =========================
-# Simple UI dialogs (for main.py compatibility)
-# =========================
+    def _stream_parse_epg(self, f):
+        context = ET.iterparse(f, events=("start", "end"))
+        _, root = next(context)
+        cur_channel = None
+        for event, elem in context:
+            tag = elem.tag.lower()
+            if event == "start":
+                if tag.endswith("channel"):
+                    cur_channel = elem.get("id") or elem.get("ID") or ""
+                continue
+            if tag.endswith("display-name"):
+                txt = (elem.text or "").strip()
+                if cur_channel:
+                    self.insert_channel(cur_channel, txt)
+            elif tag.endswith("programme"):
+                ch_id = elem.get("channel") or elem.get("CHANNEL") or ""
+                if not ch_id:
+                    root.clear()
+                    continue
+                title_el = elem.find("title")
+                title_txt = (title_el.text or "").strip() if title_el is not None else ""
+                start = elem.get("start") or ""
+                end = elem.get("end") or ""
+                st_utc = _parse_xmltv_to_utc_str(start)
+                en_utc = _parse_xmltv_to_utc_str(end)
+                if st_utc and en_utc:
+                    self.insert_programme(ch_id, title_txt, st_utc, en_utc)
+            root.clear()
 
 class EPGImportDialog(wx.Dialog):
-    def __init__(self, parent, total):
-        super().__init__(parent, title="Importing EPG", size=(400, 120))
-        self.progress = wx.Gauge(self, range=max(1, total))
-        self.label = wx.StaticText(self, label="Importing EPG data...")
-        sizer = wx.BoxSizer(wx.VERTICAL)
-        sizer.Add(self.label, 0, wx.ALL | wx.EXPAND, 10)
-        sizer.Add(self.progress, 0, wx.ALL | wx.EXPAND, 10)
-        self.SetSizer(sizer)
-        self.Layout()
+    def __init__(self, parent, total_sources: int):
+        super().__init__(parent, title="Importing EPG…", size=(400, 120))
+        self.total = total_sources
+        self.current = 0
+        self._build_ui()
         self.CenterOnParent()
+        self.Layout()
+
+    def _build_ui(self):
+        p = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+        self.gauge = wx.Gauge(p, range=max(1, self.total))
+        s.Add(self.gauge, 1, wx.EXPAND | wx.ALL, 10)
+        p.SetSizer(s)
 
     def set_progress(self, value, total):
-        self.progress.SetRange(max(1, total))
-        self.progress.SetValue(min(value, total))
-        self.label.SetLabel(f"Imported {min(value, total)}/{total} sources")
+        try:
+            self.gauge.SetRange(max(1, total))
+            self.gauge.SetValue(min(value, total))
+        except Exception:
+            pass
 
 class EPGManagerDialog(wx.Dialog):
     def __init__(self, parent, epg_sources):
