@@ -23,7 +23,7 @@ STRIP_TAGS = [
 NOISE_WORDS = [
     'backup', 'alt', 'feed', 'main', 'extra', 'mirror', 'test', 'temp',
     '1', '2', '3', '4', '5', '6', '7', '8', '9', '0',
-    'sd', 'hd', 'fhd', 'uhd', '4k', '8k', 'plus', 'max', 'live', 'network'
+    'sd', 'hd', 'fhd', 'uhd', '4k', '8k', 'plus', 'live', 'network'
 ]
 
 def group_synonyms():
@@ -226,6 +226,57 @@ ZONE_SYNONYMS = {
 def _mk(*xs):
     return {x.lower() for x in xs if x}
 
+# ==== HBO Variant Helpers ====
+
+# Recognized HBO variants
+_HBO_VARIANTS = ("base", "1", "2", "family", "latino", "signature", "comedy", "hits", "zone", "plus")
+
+def _extract_hbo_variant(raw_text: str) -> str:
+    """
+    Return which HBO subbrand is referenced in text.
+    'base' means plain HBO (or HBO East/West without a number).
+    """
+    if not raw_text:
+        return ""
+    s = raw_text.lower()
+    # Look for explicit sub-brands first
+    if re.search(r'\bfamily\b', s): return "family"
+    if re.search(r'\blatino\b', s): return "latino"
+    if re.search(r'\bsignature\b', s): return "signature"
+    if re.search(r'\bcomedy\b', s): return "comedy"
+    if re.search(r'\bhits\b', s): return "hits"
+    if re.search(r'\bzone\b', s): return "zone"
+    if re.search(r'\bplus\b', s): return "plus"
+
+    # Numeric variants
+    if re.search(r'\bhbo[\s\-]*1\b', s) or re.search(r'\b1\b', s):
+        return "1"
+    if re.search(r'\bhbo[\s\-]*2\b', s) or re.search(r'\b2\b', s):
+        return "2"
+
+    # Default: if 'hbo' mentioned, assume base
+    if re.search(r'\bhbo\b', s):
+        return "base"
+    return ""
+
+def _normalize_hbo_variant(country_code: str, variant: str) -> str:
+    """
+    Region-aware normalization:
+    - US: treat HBO1 as base (same channel). '1' => 'base'
+    - CA: keep '1' distinct (Canada HBO1 should match to Canada HBO1, not base).
+    """
+    v = (variant or "").strip().lower()
+    cc = (country_code or "").strip().lower()
+    if not v:
+        return ""
+    if cc == "us":
+        if v == "1":
+            return "base"
+    return v
+
+def _is_hbo_family(text: str) -> bool:
+    return bool(text and re.search(r'\bhbo\b', text.lower()))
+
 AFFILIATE_MARKETS: Dict[str, Dict[str, Dict[str, Set[str]]]] = {
     "ca": {
         "cbc": {
@@ -297,8 +348,13 @@ AFFILIATE_MARKETS: Dict[str, Dict[str, Dict[str, Set[str]]]] = {
         },
         "tva": {"montreal-qc": _mk("montreal", "montréal", "qc"), "quebeccity-qc": _mk("quebec city", "québec")},
         "noovo": {"montreal-qc": _mk("montreal", "montréal", "qc")},
+        # Optional named brand to let region grouping exist for HBO in CA if present
+        "hbo": {},
     },
-    "us": {"abc": {}, "nbc": {}, "cbs": {}, "fox": {}, "pbs": {}, "cw": {}, "mynetwork": {}, "telemundo": {}, "univision": {}},
+    "us": {
+        "abc": {}, "nbc": {}, "cbs": {}, "fox": {}, "pbs": {}, "cw": {}, "mynetwork": {}, "telemundo": {}, "univision": {},
+        "hbo": {},  # Allow region tagging if EPG uses it
+    },
     "uk": {
         "bbc one": {"london": _mk("london"), "wales": _mk("wales", "cymru"), "scotland": _mk("scotland", "stv"), "northern ireland": _mk("northern ireland", "ni")},
         "bbc two": {"wales": _mk("wales"), "scotland": _mk("scotland"), "northern ireland": _mk("northern ireland")},
@@ -307,6 +363,7 @@ AFFILIATE_MARKETS: Dict[str, Dict[str, Dict[str, Set[str]]]] = {
                 "border": _mk("border"), "stv": _mk("stv"), "utv": _mk("utv", "ulster", "northern ireland")},
         "sky crime": {},
         "sky mix": {},
+        "sky max": {},
     },
     "de": {"ard": {}, "wdr": {}, "ndr": {}, "mdr": {}, "br": {}, "hr": {}, "rbb": {}, "swr": {}},
     "au": {"abc": {}, "seven": {}, "nine": {}, "ten": {}, "sbs": {}},
@@ -316,9 +373,10 @@ AFFILIATE_MARKETS: Dict[str, Dict[str, Dict[str, Set[str]]]] = {
 AFFILIATE_BRANDS: Set[str] = {
     "cbc", "ctv", "ctv2", "citytv", "global", "tva", "noovo", "tsn", "sportsnet",
     "abc", "nbc", "cbs", "fox", "pbs", "cw", "mynetwork", "telemundo", "univision",
-    "bbc one", "bbc two", "itv", "channel 4", "channel 5", "sky crime", "sky mix",
+    "bbc one", "bbc two", "itv", "channel 4", "channel 5", "sky crime", "sky mix", "sky max",
     "ard", "wdr", "ndr", "mdr", "br", "hr", "rbb", "swr",
     "seven", "nine", "ten", "sbs", "tvnz 1", "tvnz 2", "three",
+    "hbo",
 }
 
 def _reverse_country_lookup():
@@ -458,11 +516,11 @@ def _reverse_brand_lookup(text: str) -> str:
     if "swr" in t: return "swr"
     if "sky crime" in t: return "sky crime"
     if "sky mix" in t or re.search(r'\bsky\s*mix\b', t): return "sky mix"
+    if "sky max" in t or re.search(r'\bsky\s*max\b', t): return "sky max"
     if re.search(r'\bbr\b', t): return "br"
     if re.search(r'\bhr\b', t): return "hr"
     if re.search(r'\bhbo\b', t):
-        return "hbo"
-    if re.search(r'\bhbo\s*(family|latino|signature|comedy|2|plus|x|zone|hits)\b', t):
+        # Any HBO or subbrand maps to 'hbo' family
         return "hbo"
     return ""
 
@@ -571,56 +629,30 @@ def _parse_xmltv_to_utc_str(s: str) -> Optional[str]:
     except Exception:
         return None
     base = datetime.datetime(y, mo, d, h, mi, sec)
-    if off and off.upper() != 'Z':
-        sign = 1 if off[0] == '+' else -1
+    if off:
         try:
-            oh = int(off[1:3]); om = int(off[3:5])
+            sign = 1 if off[0] == '+' else -1
+            offset_hours = int(off[1:3])
+            offset_minutes = int(off[3:5])
+            base -= datetime.timedelta(hours=sign*offset_hours, minutes=sign*offset_minutes)
         except Exception:
-            oh = om = 0
-        tz = datetime.timezone(sign * datetime.timedelta(hours=oh, minutes=om))
-        dt = base.replace(tzinfo=tz).astimezone(datetime.timezone.utc)
-    else:
-        dt = base.replace(tzinfo=datetime.timezone.utc)
-    return dt.strftime("%Y%m%d%H%M%S")
+            pass
+    return base.strftime("%Y%m%d%H%M%S")
 
 # =========================
-# Region helpers
-# =========================
-
-def _derive_playlist_region(channel: Dict[str, str]) -> str:
-    tvg_country = (channel.get("tvg-country") or "").strip()
-    if tvg_country:
-        code = _norm_country(tvg_country)
-        if code:
-            return code
-    for key in ("group", "tvg-name", "name"):
-        val = channel.get(key, "")
-        code = extract_group(val)
-        if code:
-            return code
-    code = _detect_region_from_id(channel.get("tvg-id", ""))
-    if code:
-        return code
-    return ''
-
-# =========================
-# Database + Matching Engine
+# EPG Database
 # =========================
 
 class EPGDatabase:
-    def __init__(self, db_path: str, for_threading=False, readonly=False):
+    def __init__(self, db_path: str, readonly: bool = False, for_threading: bool = False):
         self.db_path = db_path
-        self.for_threading = for_threading
-        uri = False
-        if readonly:
-            uri = True
-            db_path = "file:{}?mode=ro".format(db_path)
-        self.conn = sqlite3.connect(db_path, timeout=10, check_same_thread=not for_threading, uri=uri)
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        if not readonly:
-            self.create_tables()
+        if for_threading:
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        else:
+            self.conn = sqlite3.connect(self.db_path)
+        self._create_tables()
 
-    def create_tables(self):
+    def _create_tables(self):
         c = self.conn.cursor()
         c.execute("""
             CREATE TABLE IF NOT EXISTS channels (
@@ -708,6 +740,10 @@ class EPGDatabase:
         playlist_brand_family = _reverse_brand_lookup(brand_text)
         pl_calls = extract_callsigns(" ".join([tvg_name, name, channel.get("group",""), tvg_id]))
 
+        # HBO variant extraction (playlist side)
+        pl_hbo_variant_raw = _extract_hbo_variant(" ".join([tvg_name, name, channel.get("group",""), tvg_id])) if playlist_brand_family == "hbo" else ""
+        pl_hbo_variant = _normalize_hbo_variant(playlist_region, pl_hbo_variant_raw)
+
         c = self.conn.cursor()
         candidates = self._collect_candidates_by_id_and_name(c, tvg_id, tvg_name, name)
 
@@ -724,6 +760,8 @@ class EPGDatabase:
             families_align = (playlist_brand_family and epg_brand_family and playlist_brand_family == epg_brand_family)
             cs_delta, cs_reason = callsign_overlap_score(pl_calls, epg_calls)
 
+            # Let strong local market mapping through even if brands don't match (for US locals),
+            # otherwise require family align or strong callsign match
             if not (families_align or cs_delta >= 60 or (not playlist_brand_family and epg_calls and pl_calls and cs_delta >= 60)):
                 strong_us_local = False
                 if playlist_region == "us":
@@ -758,7 +796,8 @@ class EPGDatabase:
                 else:
                     score -= 40
                     why.append('-other-region')
-                if playlist_brand_family == "hbo" and families_align:
+                # Keep region penalty for HBO too if region mismatches
+                if playlist_brand_family == "hbo" and families_align and grp and playlist_region and grp != playlist_region:
                     score -= 20
                     why.append('-hbo-wrong-region')
 
@@ -771,104 +810,60 @@ class EPGDatabase:
                     score -= 15
                     why.append('-zone')
 
-            epg_ts = _detect_timeshift(disp)
-            ts_offset = 0
-            if playlist_ts and epg_ts == playlist_ts:
-                score += 12
-                why.append('+timeshift')
-            elif playlist_ts and epg_ts == 0:
-                ts_offset = playlist_ts
-                score += 6
-                why.append('+timeshift-fallback')
-            elif playlist_ts and epg_ts != playlist_ts:
-                score -= 18
-                why.append('-timeshift-mismatch')
+            epg_ts = _detect_timeshift(" ".join([disp, ch_id]))
+            ts_delta = 0
+            if playlist_ts and epg_ts:
+                ts_delta = abs(playlist_ts - epg_ts)
+                if ts_delta == 0:
+                    score += 5
+                    why.append('+timeshift-match')
+                elif ts_delta <= 2:
+                    score += 3
+                    why.append('+timeshift-close')
+                else:
+                    score -= 5 * ts_delta
+                    why.append('-timeshift-far')
 
-            epg_markets, epg_provs, _ = _market_tokens_for(grp or playlist_region or "", epg_brand_family, disp)
-            if pl_markets and epg_markets and (pl_markets & epg_markets):
-                score += 35
-                why.append('+market-exact')
-            elif pl_provinces and epg_provs and (pl_provinces & epg_provs):
-                score += 18
-                why.append('+market-province')
-            elif pl_markets and epg_markets and not (pl_markets & epg_markets):
-                score -= 30
-                why.append('-market-mismatch')
+            # ---- HBO variant-aware boosting ----
+            if playlist_brand_family == "hbo" and epg_brand_family == "hbo":
+                epg_hbo_variant_raw = _extract_hbo_variant(" ".join([disp, ch_id]))
+                epg_hbo_variant = _normalize_hbo_variant(grp, epg_hbo_variant_raw)
 
-            epg_tokens = tokenize_channel_name(disp)
-            if target_tokens and epg_tokens:
-                overlap = len(target_tokens & epg_tokens)
-                if overlap:
-                    score += min(10, overlap * 2)
-                    why.append(f'+tok{overlap}')
-
-                if playlist_brand_family == "hbo" and epg_brand_family == "hbo":
-                    epg_norm = epg_text_norm
-                    pl_norm = brand_text
-
-                    variant_keywords = {
-                        "family":"family",
-                        "latino":"latino",
-                        "signature":"signature",
-                        "comedy":"comedy",
-                        "plus":"plus",
-                        "2":"2", "hbo 2":"2", "hbo2":"2",
-                        "x":"x", "zone":"zone", "hits":"hits"
-                    }
-                    pl_has_variant = None
-                    for vk in variant_keywords:
-                        if re.search(r'\b' + re.escape(vk) + r'\b', pl_norm):
-                            pl_has_variant = variant_keywords[vk]
-                            break
-
-                    if not pl_has_variant:
-                        if re.search(r'\bhbo\s*1\b', epg_norm) or "hbo1" in epg_norm.replace(' ', ''):
-                            score += 14
-                            why.append('+hbo-prefers-1')
-                        if re.search(r'\bhbo\s*(family|latino|signature|comedy|2|plus|x|zone|hits)\b', epg_norm):
-                            score -= 8
-                            why.append('-hbo-nonbase-for-generic')
+                # Treat US 'HBO1' as base; in CA keep '1' distinct
+                if pl_hbo_variant or epg_hbo_variant:
+                    if _normalize_hbo_variant(playlist_region, pl_hbo_variant or "base") == _normalize_hbo_variant(grp, epg_hbo_variant or "base"):
+                        score += 40
+                        why.append(f'+hbo-variant({pl_hbo_variant or "base"})')
                     else:
-                        if re.search(r'\b' + re.escape(pl_has_variant) + r'\b', epg_norm):
-                            score += 16
-                            why.append('+hbo-variant-match')
+                        # If playlist is generic/base and EPG is either base or 1 in US, still give a smaller boost
+                        if playlist_region == "us":
+                            if (pl_hbo_variant in {"", "base", "1"} and epg_hbo_variant in {"base", "1"}) or (epg_hbo_variant in {"", "base"} and pl_hbo_variant in {"base", "1"}):
+                                score += 18
+                                why.append('+hbo-us-base/1')
+                            else:
+                                score -= 10
+                                why.append('-hbo-variant-mismatch')
                         else:
-                            score -= 16
-                            why.append('-hbo-variant-mismatch')
+                            # In Canada, 1 must match 1 explicitly
+                            score -= 12
+                            why.append('-hbo-variant-mismatch-ca')
 
-            if playlist_region == "us" and playlist_brand_family in {"abc","nbc","cbs","fox","pbs","cw","mynetwork","telemundo","univision"}:
-                if pl_calls and not (pl_calls & epg_calls):
-                    score -= (80 if playlist_brand_family == "cw" else 55)
-                    why.append('-callsign-mismatch')
-                if playlist_brand_family == "cw" and not epg_calls:
-                    if re.search(r'\bnational\b', epg_text_norm) or re.search(r'\b(east|west|pacific|mountain|central)\b', epg_text_norm):
-                        score -= 40
-                        why.append('-generic-cw')
+            # Token overlap
+            epg_tokens = tokenize_channel_name(disp)
+            token_overlap = len(target_tokens & epg_tokens)
+            score += min(20, token_overlap * 4)
+            if token_overlap:
+                why.append(f'+tokens({token_overlap})')
 
-            has_sched = self._has_any_schedule_from_now(ch_id)
-            if not has_sched:
-                score -= 120
-                why.append('-no-schedule')
-
-            prior = candidates.get(ch_id)
-            if not prior or prior['score'] < score:
+            if score > 0:
                 candidates[ch_id] = {
                     'id': ch_id,
                     'group_tag': grp,
                     'score': score,
                     'display_name': disp,
-                    'why': ' '.join(why),
-                    'ts_offset': ts_offset
+                    'why': " ".join(why),
+                    'ts_offset': epg_ts if families_align else 0
                 }
-
-        if MATCH_DEBUG:
-            print(f"[EPG-MATCH] For '{name}' (region={playlist_region or '??'} zone={playlist_zone or 'none'} brandFamily={playlist_brand_family or 'none'} key={playlist_brand_key or 'none'} ts=+{playlist_ts or 0}h):")
-            print(f"  PL calls={sorted(pl_calls)} markets={sorted(pl_markets)} provs={sorted(pl_provinces)}")
-            for v in sorted(candidates.values(), key=lambda x: -x['score'])[:25]:
-                ez = _detect_zone(v['display_name'])
-                ets = _detect_timeshift(v['display_name'])
-                epg_calls_dbg = extract_callsigns(" ".join([v['display_name'], v['id']]))
-                print(f"  {v['score']:>4}  {v['id']}  grp={v.get('group_tag') or ''}  zone={ez or ''}  ts=+{ets}h  calls={sorted(epg_calls_dbg)} why={v.get('why')} :: {v.get('display_name')}")
 
         return list(candidates.values()), playlist_region
 
@@ -995,63 +990,63 @@ class EPGDatabase:
                 if src.startswith("http"):
                     req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
                     with urllib.request.urlopen(req, timeout=60) as resp:
-                        raw = resp.read()
-                        if src.endswith(".gz") or resp.info().get("Content-Encoding") == "gzip":
-                            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
-                                f = io.TextIOWrapper(gz, encoding="utf-8", errors="ignore")
-                                thread_db._stream_parse_epg(f)
+                        if src.endswith(".gz"):
+                            with gzip.GzipFile(fileobj=io.BytesIO(resp.read())) as gz:
+                                content = gz.read().decode("utf-8", "ignore")
                         else:
-                            f = io.StringIO(raw.decode("utf-8", "ignore"))
-                            thread_db._stream_parse_epg(f)
+                            content = resp.read().decode("utf-8", "ignore")
                 else:
                     if src.endswith(".gz"):
                         with gzip.open(src, "rt", encoding="utf-8", errors="ignore") as f:
-                            thread_db._stream_parse_epg(f)
+                            content = f.read()
                     else:
                         with open(src, "r", encoding="utf-8", errors="ignore") as f:
-                            thread_db._stream_parse_epg(f)
-            except Exception:
-                continue
-            finally:
-                if progress_callback:
-                    try:
-                        progress_callback(idx + 1, total)
-                    except Exception:
-                        pass
-        try:
-            thread_db.commit()
-        except Exception:
-            pass
+                            content = f.read()
+                # Parse
+                root = ET.fromstring(content)
+                for ch in root.findall("./channel"):
+                    ch_id = ch.get("id") or ""
+                    disp = ""
+                    dn = ch.find("display-name")
+                    if dn is not None:
+                        disp = (dn.text or "").strip()
+                    thread_db.insert_channel(ch_id, disp)
+                for prg in root.findall("./programme"):
+                    ch_id = prg.get("channel") or ""
+                    title = prg.find("title")
+                    title_txt = (title.text or "").strip() if title is not None else ""
+                    start = prg.get("start") or ""
+                    end = prg.get("end") or ""
+                    st_utc = _parse_xmltv_to_utc_str(start)
+                    en_utc = _parse_xmltv_to_utc_str(end)
+                    if st_utc and en_utc:
+                        thread_db.insert_programme(ch_id, title_txt, st_utc, en_utc)
+                root.clear()
+            except Exception as e:
+                try:
+                    wx.LogError(f"Failed to import EPG source {src}: {e}")
+                except Exception:
+                    pass
+            if progress_callback:
+                try:
+                    progress_callback(idx+1, total)
+                except Exception:
+                    pass
+        thread_db.commit()
         thread_db.close()
 
-    def _stream_parse_epg(self, f):
-        context = ET.iterparse(f, events=("start", "end"))
-        _, root = next(context)
-        cur_channel = None
-        for event, elem in context:
-            tag = elem.tag.lower()
-            if event == "start":
-                if tag.endswith("channel"):
-                    cur_channel = elem.get("id") or elem.get("ID") or ""
-                continue
-            if tag.endswith("display-name"):
-                txt = (elem.text or "").strip()
-                if cur_channel:
-                    self.insert_channel(cur_channel, txt)
-            elif tag.endswith("programme"):
-                ch_id = elem.get("channel") or elem.get("CHANNEL") or ""
-                if not ch_id:
-                    root.clear()
-                    continue
-                title_el = elem.find("title")
-                title_txt = (title_el.text or "").strip() if title_el is not None else ""
-                start = elem.get("start") or ""
-                end = elem.get("end") or ""
-                st_utc = _parse_xmltv_to_utc_str(start)
-                en_utc = _parse_xmltv_to_utc_str(end)
-                if st_utc and en_utc:
-                    self.insert_programme(ch_id, title_txt, st_utc, en_utc)
-            root.clear()
+def _derive_playlist_region(channel: Dict[str, str]) -> str:
+    # Try tvg-id, name, and group fields
+    for field in ("tvg-id", "name", "group"):
+        val = (channel.get(field) or "").strip().lower()
+        if not val:
+            continue
+        parts = re.split(r'[.\-_:|/()\[\]\s]+', val)
+        for tok in parts:
+            code = _norm_country(tok)
+            if code:
+                return code
+    return ''
 
 class EPGImportDialog(wx.Dialog):
     def __init__(self, parent, total_sources: int):
@@ -1112,15 +1107,14 @@ class EPGManagerDialog(wx.Dialog):
         self.remove_btn.Bind(wx.EVT_BUTTON, self.OnRemove)
 
     def OnAddFile(self, _):
-        with wx.FileDialog(self, "Choose XMLTV file", wildcard="XMLTV files (*.xml;*.xml.gz)|*.xml;*.xml.gz|All files (*.*)|*.*",
-                           style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
+        with wx.FileDialog(self, "Choose EPG XML file", wildcard="XML files (*.xml)|*.xml|GZip XML (*.gz)|*.gz|All files (*.*)|*.*") as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 path = dlg.GetPath()
                 self.epg_sources.append(path)
                 self.lb.Append(path)
 
     def OnAddURL(self, _):
-        with wx.TextEntryDialog(self, "Enter EPG URL:", "Add EPG URL") as dlg:
+        with wx.TextEntryDialog(self, "Enter EPG XML URL") as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 url = dlg.GetValue().strip()
                 if url:
@@ -1133,7 +1127,7 @@ class EPGManagerDialog(wx.Dialog):
             self.epg_sources.pop(i)
             self.lb.Delete(i)
 
-    def GetSources(self) -> List[str]:
+    def GetSources(self):
         return self.epg_sources
 
 class PlaylistManagerDialog(wx.Dialog):
@@ -1172,15 +1166,14 @@ class PlaylistManagerDialog(wx.Dialog):
         self.remove_btn.Bind(wx.EVT_BUTTON, self.OnRemove)
 
     def OnAddFile(self, _):
-        with wx.FileDialog(self, "Choose M3U file", wildcard="M3U files (*.m3u;*.m3u8)|*.m3u;*.m3u8|All files (*.*)|*.*",
-                           style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
+        with wx.FileDialog(self, "Choose M3U file", wildcard="M3U files (*.m3u;*.m3u8)|*.m3u;*.m3u8|All files (*.*)|*.*") as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 path = dlg.GetPath()
                 self.playlist_sources.append(path)
                 self.lb.Append(path)
 
     def OnAddURL(self, _):
-        with wx.TextEntryDialog(self, "Enter Playlist URL:", "Add Playlist URL") as dlg:
+        with wx.TextEntryDialog(self, "Enter M3U URL") as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 url = dlg.GetValue().strip()
                 if url:
@@ -1193,5 +1186,5 @@ class PlaylistManagerDialog(wx.Dialog):
             self.playlist_sources.pop(i)
             self.lb.Delete(i)
 
-    def GetSources(self) -> List[str]:
+    def GetSources(self):
         return self.playlist_sources
