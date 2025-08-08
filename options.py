@@ -34,7 +34,6 @@ def get_cwd_dir():
         return None
 
 def get_config_read_candidates():
-    # Strict priority: 1) CWD 2) App dir
     candidates = []
     cwd = get_cwd_dir()
     if cwd:
@@ -43,7 +42,6 @@ def get_config_read_candidates():
     return candidates
 
 def get_config_write_target():
-    # Write to CWD first if writable, else app dir if writable; else fallback to CWD/appdir path even if unwritable
     cwd = get_cwd_dir()
     if cwd and _is_writable_dir(cwd):
         return os.path.join(cwd, CONFIG_FILE)
@@ -51,13 +49,6 @@ def get_config_write_target():
     if _is_writable_dir(appdir):
         return os.path.join(appdir, CONFIG_FILE)
     return os.path.join(cwd or appdir, CONFIG_FILE)
-
-def get_config_path():
-    # Return first existing config by read priority; else preferred write target
-    for p in get_config_read_candidates():
-        if os.path.exists(p):
-            return p
-    return get_config_write_target()
 
 def load_config() -> Dict:
     default = {"playlists": [], "epgs": [], "media_player": "VLC", "custom_player_path": "", "minimize_to_tray": False}
@@ -76,7 +67,6 @@ def load_config() -> Dict:
     return default
 
 def save_config(cfg: Dict):
-    # Always save to preferred write target (CWD if writable)
     path = get_config_write_target()
     try:
         tmp_path = path + ".tmp"
@@ -108,29 +98,156 @@ def get_cache_path_for_url(url):
 def get_db_path():
     return os.path.join(tempfile.gettempdir(), "epg.db")
 
+# Strip from names when canonicalizing (NOT used to detect country)
 STRIP_TAGS = [
     'hd', 'sd', 'hevc', 'fhd', 'uhd', '4k', '8k', 'hdr', 'dash', 'hq', 'st',
-    'us', 'usa', 'ca', 'canada', 'car', 'uk', 'u.k.', 'u.k', 'uk.', 'u.s.', 'u.s', 'us.', 'au', 'aus', 'nz'
+    'us', 'usa', 'ca', 'canada', 'car', 'uk', 'u.k.', 'u.k', 'uk.', 'u.s.', 'u.s', 'us.',
+    'au', 'aus', 'nz', 'eu'
 ]
 
 def group_synonyms():
+    # Canonical country code -> variants
     return {
-        "us": [
-            "us", "usa", "u.s.", "u.s", "us.", "united states", "united states of america", "america"
-        ],
-        "uk": [
-            "uk", "u.k.", "u.k", "uk.", "gb", "great britain", "britain", "united kingdom", "england", "scotland", "wales"
-        ],
-        "ca": [
-            "ca", "canada", "car", "ca:", "can"
-        ],
-        "au": [
-            "au", "aus", "australia"
-        ],
-        "nz": [
-            "nz", "new zealand"
-        ],
+        # North America
+        "us": ["us", "usa", "u.s.", "u.s", "us.", "united states", "united states of america", "america"],
+        "ca": ["ca", "can", "canada", "car"],
+        "mx": ["mx", "mex", "mexico", "méxico"],
+
+        # UK + Ireland
+        "uk": ["uk", "u.k.", "gb", "gbr", "great britain", "britain", "united kingdom", "england", "scotland", "wales", "northern ireland"],
+        "ie": ["ie", "irl", "ireland", "eire", "éire"],
+
+        # DACH
+        "de": ["de", "ger", "deu", "germany", "deutschland"],
+        "at": ["at", "aut", "austria", "österreich", "oesterreich"],
+        "ch": ["ch", "che", "switzerland", "schweiz", "suisse", "svizzera"],
+
+        # Benelux
+        "nl": ["nl", "nld", "netherlands", "holland", "nederland"],
+        "be": ["be", "bel", "belgium", "belgie", "belgië", "belgique"],
+        "lu": ["lu", "lux", "luxembourg", "letzebuerg", "lëtzebuerg"],
+
+        # Nordics
+        "se": ["se", "swe", "sweden", "svenska", "sverige"],
+        "no": ["no", "nor", "norway", "norge", "noreg"],
+        "dk": ["dk", "dnk", "denmark", "danmark"],
+        "fi": ["fi", "fin", "finland", "suomi"],
+        "is": ["is", "isl", "iceland", "ísland"],
+
+        # Southern Europe
+        "fr": ["fr", "fra", "france", "français", "française"],
+        "it": ["it", "ita", "italy", "italia"],
+        "es": ["es", "esp", "spain", "españa", "espana", "español"],
+        "pt": ["pt", "prt", "portugal", "português"],
+        "gr": ["gr", "grc", "greece", "ελλάδα", "ellada"],
+        "mt": ["mt", "mlt", "malta"],
+        "cy": ["cy", "cyp", "cyprus"],
+
+        # Central/Eastern Europe
+        "pl": ["pl", "pol", "poland", "polska"],
+        "cz": ["cz", "cze", "czech", "czechia", "cesko", "česko"],
+        "sk": ["sk", "svk", "slovakia", "slovensko"],
+        "hu": ["hu", "hun", "hungary", "magyar"],
+        "si": ["si", "svn", "slovenia", "slovenija"],
+        "hr": ["hr", "hrv", "croatia", "hrvatska"],
+        "rs": ["rs", "srb", "serbia", "srbija"],
+        "ba": ["ba", "bih", "bosnia", "bosnia and herzegovina", "bosna", "hercegovina"],
+        "mk": ["mk", "mkd", "north macedonia", "macedonia"],
+        "ro": ["ro", "rou", "romania", "românia"],
+        "bg": ["bg", "bgr", "bulgaria", "българия", "balgariya"],
+        "ua": ["ua", "ukr", "ukraine", "ukraina"],
+        "by": ["by", "blr", "belarus"],
+        "ru": ["ru", "rus", "russia", "россия", "rossiya"],
+        "ee": ["ee", "est", "estonia", "eesti"],
+        "lv": ["lv", "lva", "latvia", "latvija"],
+        "lt": ["lt", "ltu", "lithuania", "lietuva"],
+
+        # Balkans + nearby
+        "al": ["al", "alb", "albania", "shqipëri", "shqiperia"],
+        "me": ["me", "mne", "montenegro", "crna gora"],
+        "xk": ["xk", "kosovo"],
+
+        # MENA (subset)
+        "tr": ["tr", "tur", "turkey", "türkiye", "turkiye"],
+        "ma": ["ma", "mar", "morocco", "maroc"],
+        "dz": ["dz", "dza", "algeria", "algérie"],
+        "tn": ["tn", "tun", "tunisia", "tunisie"],
+        "eg": ["eg", "egypt", "misr"],
+        "il": ["il", "isr", "israel"],
+        "sa": ["sa", "sau", "saudi", "saudi arabia"],
+        "ae": ["ae", "are", "uae", "united arab emirates"],
+        "qa": ["qa", "qat", "qatar"],
+        "kw": ["kw", "kwt", "kuwait"],
+
+        # Asia (subset)
+        "in": ["in", "ind", "india", "bharat"],
+        "pk": ["pk", "pak", "pakistan"],
+        "bd": ["bd", "bgd", "bangladesh"],
+        "lk": ["lk", "lka", "sri lanka"],
+        "np": ["np", "npl", "nepal"],
+        "cn": ["cn", "chn", "china"],
+        "hk": ["hk", "hkg", "hong kong"],
+        "tw": ["tw", "twn", "taiwan"],
+        "jp": ["jp", "jpn", "japan", "日本"],
+        "kr": ["kr", "kor", "korea", "south korea"],
+        "sg": ["sg", "sgp", "singapore"],
+        "my": ["my", "mys", "malaysia"],
+        "th": ["th", "tha", "thailand"],
+        "vn": ["vn", "vnm", "vietnam"],
+        "ph": ["ph", "phl", "philippines"],
+        "id": ["id", "idn", "indonesia"],
+
+        # Oceania
+        "au": ["au", "aus", "australia"],
+        "nz": ["nz", "nzl", "new zealand", "aotearoa"],
+
+        # Latin America (subset)
+        "br": ["br", "bra", "brazil", "brasil"],
+        "ar": ["ar", "arg", "argentina"],
+        "cl": ["cl", "chl", "chile"],
+        "co": ["co", "col", "colombia"],
+        "pe": ["pe", "per", "peru", "perú"],
+        "uy": ["uy", "ury", "uruguay"],
+        "py": ["py", "pry", "paraguay"],
+        "bo": ["bo", "bol", "bolivia"],
+        "ec": ["ec", "ecu", "ecuador"],
+        "ve": ["ve", "ven", "venezuela"],
+        "cr": ["cr", "cri", "costa rica"],
+        "pr": ["pr", "pri", "puerto rico"],
+
+        # Africa (subset)
+        "ng": ["ng", "nga", "nigeria"],
+        "za": ["za", "zaf", "south africa"],
+        "ke": ["ke", "ken", "kenya"],
+        "gh": ["gh", "gha", "ghana"],
+        "et": ["et", "eth", "ethiopia"],
+        "tz": ["tz", "tza", "tanzania"],
+        "ug": ["ug", "uga", "uganda"],
+        "ci": ["ci", "civ", "côte d’ivoire", "ivory coast"],
+        "sn": ["sn", "sen", "senegal"],
     }
+
+def _build_reverse_country_lookup():
+    lookup = {}
+    for code, variants in group_synonyms().items():
+        for v in variants:
+            lookup[v.lower()] = code
+    lookup["gb"] = "uk"
+    lookup["gbr"] = "uk"
+    return lookup
+
+_COUNTRY_LOOKUP = _build_reverse_country_lookup()
+
+def _normalize_country_token(tok: str) -> str:
+    if not tok:
+        return ''
+    t = tok.strip().lower()
+    if t in _COUNTRY_LOOKUP:
+        return _COUNTRY_LOOKUP[t]
+    t2 = t.replace('.', '')
+    if t2 in _COUNTRY_LOOKUP:
+        return _COUNTRY_LOOKUP[t2]
+    return ''
 
 def canonicalize_name(name: str) -> str:
     name = name.strip().lower()
@@ -154,20 +271,33 @@ def relaxed_name(name: str) -> str:
     n = re.sub(r'\s+', ' ', n)
     return n.strip()
 
-def extract_group(title: str) -> str:
-    if not title:
+def _search_country_in_text(text: str) -> str:
+    if not text:
         return ''
-    title = title.lower()
-    for norm_tag, variants in group_synonyms().items():
-        for v in variants:
-            if re.search(r'\b' + re.escape(v) + r'\b', title):
-                return norm_tag
-    m = re.match(r'([a-z]{2,3})', title)
+    s = text.lower()
+    for m in re.findall(r'[\(\[\{]([^\)\]\}]{2,24})[\)\]\}]', s):
+        for token in re.findall(r'[a-zA-ZÀ-ÿ\.]+', m):
+            code = _normalize_country_token(token)
+            if code:
+                return code
+    for token in re.split(r'[\|\-\/:,–—]+', s):
+        token = token.strip()
+        code = _normalize_country_token(token)
+        if code:
+            return code
+    for word in re.findall(r'[a-zA-ZÀ-ÿ\.]+', s):
+        code = _normalize_country_token(word)
+        if code:
+            return code
+    m = re.match(r'^\s*([a-zA-Z\.]{2,4})\b', s)
     if m:
-        code = m.group(1)
-        if code in group_synonyms():
+        code = _normalize_country_token(m.group(1))
+        if code:
             return code
     return ''
+
+def extract_group(title: str) -> str:
+    return _search_country_in_text(title or "")
 
 def utc_to_local(dt):
     if dt.tzinfo is None:

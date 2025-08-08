@@ -1,56 +1,163 @@
+# playlist.py
+import os
+import re
+import io
+import wx
+import gzip
 import sqlite3
 import urllib.request
-import gzip
-import io
-import threading
 import xml.etree.ElementTree as ET
 import datetime
-import re
-import wx
-from typing import Dict, List, Optional
-import difflib
+from typing import Dict, List, Optional, Tuple, Set
+
+# =========================
+# Normalization & Tokenizing
+# =========================
 
 STRIP_TAGS = [
     'hd', 'sd', 'hevc', 'fhd', 'uhd', '4k', '8k', 'hdr', 'dash', 'hq', 'st',
-    'us', 'usa', 'ca', 'canada', 'car', 'uk', 'u.k.', 'u.k', 'uk.', 'u.s.', 'u.s', 'us.', 'au', 'aus', 'nz'
+    'us', 'usa', 'ca', 'canada', 'car', 'uk', 'u.k.', 'u.k', 'uk.', 'u.s.', 'u.s', 'us.',
+    'au', 'aus', 'nz'
 ]
 
 NOISE_WORDS = [
     'backup', 'alt', 'feed', 'main', 'extra', 'mirror', 'test', 'temp',
     '1', '2', '3', '4', '5', '6', '7', '8', '9', '0',
-    'sd', 'hd', 'fhd', 'uhd', '4k', '8k'
+    'sd', 'hd', 'fhd', 'uhd', '4k', '8k', 'plus', 'max', 'live', 'network'
 ]
 
 def group_synonyms():
-    # All variants are lowercased, with punctuation, full/abbreviation/alternative names
     return {
-        "us": [
-            "us", "usa", "u.s.", "u.s", "us.", "united states", "united states of america", "america"
-        ],
-        "uk": [
-            "uk", "u.k.", "u.k", "uk.", "gb", "great britain", "britain", "united kingdom", "england", "scotland", "wales"
-        ],
-        "ca": [
-            "ca", "canada", "car", "ca:", "can"
-        ],
-        "au": [
-            "au", "aus", "australia"
-        ],
-        "nz": [
-            "nz", "new zealand"
-        ],
-        # Extend here for more regions/countries as needed
+        # North America
+        "us": ["us", "usa", "u.s.", "u.s", "us.", "united states", "united states of america", "america"],
+        "ca": ["ca", "can", "canada", "car"],
+        "mx": ["mx", "mex", "mexico", "méxico"],
+
+        # UK + Ireland
+        "uk": ["uk", "u.k.", "gb", "gbr", "great britain", "britain", "united kingdom", "england", "scotland", "wales", "northern ireland"],
+        "ie": ["ie", "irl", "ireland", "eire", "éire"],
+
+        # DACH
+        "de": ["de", "ger", "deu", "germany", "deutschland"],
+        "at": ["at", "aut", "austria", "österreich", "oesterreich"],
+        "ch": ["ch", "che", "switzerland", "schweiz", "suisse", "svizzera"],
+
+        # Benelux
+        "nl": ["nl", "nld", "netherlands", "holland", "nederland"],
+        "be": ["be", "bel", "belgium", "belgie", "belgië", "belgique"],
+        "lu": ["lu", "lux", "luxembourg", "letzebuerg", "lëtzebuerg"],
+
+        # Nordics
+        "se": ["se", "swe", "sweden", "svenska", "sverige"],
+        "no": ["no", "nor", "norway", "norge", "noreg"],
+        "dk": ["dk", "dnk", "denmark", "danmark"],
+        "fi": ["fi", "fin", "finland", "suomi"],
+        "is": ["is", "isl", "iceland", "ísland"],
+
+        # Southern Europe
+        "fr": ["fr", "fra", "france", "français", "française"],
+        "it": ["it", "ita", "italy", "italia"],
+        "es": ["es", "esp", "spain", "españa", "espana", "español"],
+        "pt": ["pt", "prt", "portugal", "português"],
+        "gr": ["gr", "grc", "greece", "ελλάδα", "ellada"],
+        "mt": ["mt", "mlt", "malta"],
+        "cy": ["cy", "cyp", "cyprus"],
+
+        # Central/Eastern Europe
+        "pl": ["pl", "pol", "poland", "polska"],
+        "cz": ["cz", "cze", "czech", "czechia", "cesko", "česko"],
+        "sk": ["sk", "svk", "slovakia", "slovensko"],
+        "hu": ["hu", "hun", "hungary", "magyar"],
+        "si": ["si", "svn", "slovenia", "slovenija"],
+        "hr": ["hr", "hrv", "croatia", "hrvatska"],
+        "rs": ["rs", "srb", "serbia", "srbija"],
+        "ba": ["ba", "bih", "bosnia", "bosnia and herzegovina", "bosna", "hercegovina"],
+        "mk": ["mk", "mkd", "north macedonia", "macedonia"],
+        "ro": ["ro", "rou", "romania", "românia"],
+        "bg": ["bg", "bgr", "bulgaria", "българия", "balgariya"],
+        "ua": ["ua", "ukr", "ukraine", "ukraina"],
+        "by": ["by", "blr", "belarus"],
+        "ru": ["ru", "rus", "russia", "россия", "rossiya"],
+        "ee": ["ee", "est", "estonia", "eesti"],
+        "lv": ["lv", "lva", "latvia", "latvija"],
+        "lt": ["lt", "ltu", "lithuania", "lietuva"],
+
+        # Balkans + nearby
+        "al": ["al", "alb", "albania", "shqipëri", "shqiperia"],
+        "me": ["me", "mne", "montenegro", "crna gora"],
+        "xk": ["xk", "kosovo"],
+
+        # MENA (subset)
+        "tr": ["tr", "tur", "turkey", "türkiye", "turkiye"],
+        "ma": ["ma", "mar", "morocco", "maroc"],
+        "dz": ["dz", "dza", "algeria", "algérie"],
+        "tn": ["tn", "tun", "tunisia", "tunisie"],
+        "eg": ["eg", "egypt", "misr"],
+        "il": ["il", "isr", "israel"],
+        "sa": ["sa", "sau", "saudi", "saudi arabia"],
+        "ae": ["ae", "are", "uae", "united arab emirates"],
+        "qa": ["qa", "qat", "qatar"],
+        "kw": ["kw", "kwt", "kuwait"],
+
+        # Asia (subset)
+        "in": ["in", "ind", "india", "bharat"],
+        "pk": ["pk", "pak", "pakistan"],
+        "bd": ["bd", "bgd", "bangladesh"],
+        "lk": ["lk", "lka", "sri lanka"],
+        "np": ["np", "npl", "nepal"],
+        "cn": ["cn", "chn", "china"],
+        "hk": ["hk", "hkg", "hong kong"],
+        "tw": ["tw", "twn", "taiwan"],
+        "jp": ["jp", "jpn", "japan", "日本"],
+        "kr": ["kr", "kor", "korea", "south korea"],
+        "sg": ["sg", "sgp", "singapore"],
+        "my": ["my", "mys", "malaysia"],
+        "th": ["th", "tha", "thailand"],
+        "vn": ["vn", "vnm", "vietnam"],
+        "ph": ["ph", "phl", "philippines"],
+        "id": ["id", "idn", "indonesia"],
+
+        # Oceania
+        "au": ["au", "aus", "australia"],
+        "nz": ["nz", "nzl", "new zealand", "aotearoa"],
+
+        # Latin America (subset)
+        "br": ["br", "bra", "brazil", "brasil"],
+        "ar": ["ar", "arg", "argentina"],
+        "cl": ["cl", "chl", "chile"],
+        "co": ["co", "col", "colombia"],
+        "pe": ["pe", "per", "peru", "perú"],
+        "uy": ["uy", "ury", "uruguay"],
+        "py": ["py", "pry", "paraguay"],
+        "bo": ["bo", "bol", "bolivia"],
+        "ec": ["ec", "ecu", "ecuador"],
+        "ve": ["ve", "ven", "venezuela"],
+        "cr": ["cr", "cri", "costa rica"],
+        "pr": ["pr", "pri", "puerto rico"],
+
+        # Africa (subset)
+        "ng": ["ng", "nga", "nigeria"],
+        "za": ["za", "zaf", "south africa"],
+        "ke": ["ke", "ken", "kenya"],
+        "gh": ["gh", "gha", "ghana"],
+        "et": ["et", "eth", "ethiopia"],
+        "tz": ["tz", "tza", "tanzania"],
+        "ug": ["ug", "uga", "uganda"],
+        "ci": ["ci", "civ", "côte d’ivoire", "ivory coast"],
+        "sn": ["sn", "sen", "senegal"],
     }
 
 def canonicalize_name(name: str) -> str:
-    name = name.strip().lower()
+    name = (name or "").strip().lower()
     tags = STRIP_TAGS
+    # remove tags at ends repeatedly
     pattern = r'^(?:' + '|'.join(tags) + r')\b[\s\-:]*|[\s\-:]*\b(?:' + '|'.join(tags) + r')$'
     while True:
         newname = re.sub(pattern, '', name, flags=re.I).strip()
         if newname == name:
             break
         name = newname
+    # remove any remaining tag words anywhere
     name = re.sub(r'\b(?:' + '|'.join(tags) + r')\b', '', name, flags=re.I)
     name = re.sub(r'\s+', ' ', name)
     return name.strip()
@@ -72,11 +179,13 @@ def extract_group(title: str) -> str:
         for v in variants:
             if re.search(r'\b' + re.escape(v) + r'\b', title):
                 return norm_tag
+    # look for leading country code (e.g., "us: something")
     m = re.match(r'([a-z]{2,3})\b', title)
     if m:
         code = m.group(1)
         if code in group_synonyms():
             return code
+    # look for "(us)" style
     m = re.search(r'\(([a-z]{2,3})\)', title)
     if m:
         code = m.group(1)
@@ -97,11 +206,410 @@ def tokenize_channel_name(name: str) -> set:
     bad = set(STRIP_TAGS + NOISE_WORDS + [
         'channel', 'tv', 'the', 'and', 'for', 'with', 'on', 'in', 'f'
     ])
-    tokens = set([w for w in all_words if w not in bad])
+    tokens = set([w for w in all_words if w not in bad and not w.isdigit()])
     return tokens
 
 def strip_backup_terms(name: str) -> str:
     return strip_noise_words(name)
+
+# =========================
+# Matching helpers
+# =========================
+
+MATCH_DEBUG = bool(os.environ.get("EPG_MATCH_DEBUG"))
+
+ZONE_SYNONYMS = {
+    "east": {"east", "e", "eastern"},
+    "west": {"west", "w", "western"},
+    "central": {"central", "c", "ct", "ctr"},
+    "mountain": {"mountain", "mtn"},
+    "pacific": {"pacific", "p", "pt", "pst", "pdt", "pac"},
+    "atlantic": {"atlantic", "atl"},
+}
+
+def _mk(*xs):
+    return {x.lower() for x in xs if x}
+
+# minimal market hints used for Canadian groups and others; US locals resolved by callsigns/cities
+AFFILIATE_MARKETS: Dict[str, Dict[str, Dict[str, Set[str]]]] = {
+    "ca": {
+        "cbc": {
+            "vancouver-bc": _mk("vancouver", "bc", "british columbia"),
+            "calgary-ab": _mk("calgary", "ab"),
+            "edmonton-ab": _mk("edmonton", "ab"),
+            "saskatoon-sk": _mk("saskatoon", "sk"),
+            "regina-sk": _mk("regina", "sk"),
+            "winnipeg-mb": _mk("winnipeg", "mb"),
+            "ottawa-on": _mk("ottawa", "on"),
+            "toronto-on": _mk("toronto", "on"),
+            "montreal-qc": _mk("montreal", "montréal", "qc"),
+            "halifax-ns": _mk("halifax", "ns"),
+            "stjohns-nl": _mk("st johns", "st. johns", "nl"),
+        },
+        "ctv": {
+            "vancouver-bc": _mk("vancouver", "bc"),
+            "calgary-ab": _mk("calgary", "ab"),
+            "edmonton-ab": _mk("edmonton", "ab"),
+            "saskatoon-sk": _mk("saskatoon", "sk"),
+            "regina-sk": _mk("regina", "sk"),
+            "winnipeg-mb": _mk("winnipeg", "mb"),
+            "ottawa-on": _mk("ottawa", "on"),
+            "toronto-on": _mk("toronto", "on"),
+            "london-on": _mk("london", "on"),
+            "montreal-qc": _mk("montreal", "montréal", "qc"),
+            "halifax-ns": _mk("halifax", "ns"),
+        },
+        "ctv2": {
+            "vancouver-bc": _mk("vancouver", "bc"),
+            "ottawa-on": _mk("ottawa", "on"),
+            "london-on": _mk("london", "on"),
+            "windsor-on": _mk("windsor", "on"),
+        },
+        "citytv": {
+            "vancouver-bc": _mk("vancouver", "bc"),
+            "calgary-ab": _mk("calgary", "ab"),
+            "edmonton-ab": _mk("edmonton", "ab"),
+            "winnipeg-mb": _mk("winnipeg", "mb"),
+            "toronto-on": _mk("toronto", "on"),
+            "montreal-qc": _mk("montreal", "montréal", "qc"),
+        },
+        "global": {
+            "vancouver-bc": _mk("vancouver", "bc", "british columbia", "global bc"),
+            "calgary-ab": _mk("calgary", "ab"),
+            "edmonton-ab": _mk("edmonton", "ab"),
+            "saskatoon-sk": _mk("saskatoon", "sk"),
+            "regina-sk": _mk("regina", "sk"),
+            "winnipeg-mb": _mk("winnipeg", "mb"),
+            "toronto-on": _mk("toronto", "on"),
+            "montreal-qc": _mk("montreal", "montréal", "qc"),
+            "halifax-ns": _mk("halifax", "ns"),
+        },
+        "tsn": {
+            "tsn1-west": _mk("tsn1", "west", "bc", "ab", "pacific", "mountain"),
+            "tsn2-central": _mk("tsn2", "central"),
+            "tsn3-prairies": _mk("tsn3", "prairies", "mb", "sk"),
+            "tsn4-ontario": _mk("tsn4", "ontario", "on", "toronto"),
+            "tsn5-east": _mk("tsn5", "east", "ottawa", "montreal", "qc", "atlantic"),
+        },
+        "sportsnet": {
+            "pacific": _mk("pacific", "bc", "vancouver"),
+            "west": _mk("west", "ab", "calgary", "edmonton"),
+            "prairies": _mk("prairies", "sk", "mb"),
+            "ontario": _mk("ontario", "on", "toronto"),
+            "east": _mk("east", "qc", "montreal", "atlantic"),
+            "one": _mk("sn1", "sportsnet one", "one"),
+            "360": _mk("sportsnet 360", "sn360", "360"),
+        },
+        "tva": {"montreal-qc": _mk("montreal", "montréal", "qc"), "quebeccity-qc": _mk("quebec city", "québec")},
+        "noovo": {"montreal-qc": _mk("montreal", "montréal", "qc")},
+    },
+    "us": {"abc": {}, "nbc": {}, "cbs": {}, "fox": {}, "pbs": {}, "cw": {}, "mynetwork": {}, "telemundo": {}, "univision": {}},
+    "uk": {
+        "bbc one": {"london": _mk("london"), "wales": _mk("wales", "cymru"), "scotland": _mk("scotland", "stv"), "northern ireland": _mk("northern ireland", "ni")},
+        "bbc two": {"wales": _mk("wales"), "scotland": _mk("scotland"), "northern ireland": _mk("northern ireland")},
+        "itv": {"london": _mk("london"), "wales": _mk("wales"), "yorkshire": _mk("yorkshire"), "granada": _mk("granada"),
+                "tyne tees": _mk("tyne tees"), "meridian": _mk("meridian"), "central": _mk("central"),
+                "border": _mk("border"), "stv": _mk("stv"), "utv": _mk("utv", "ulster", "northern ireland")},
+        "sky crime": {},
+    },
+    "de": {"ard": {}, "wdr": {}, "ndr": {}, "mdr": {}, "br": {}, "hr": {}, "rbb": {}, "swr": {}},
+    "au": {"abc": {}, "seven": {}, "nine": {}, "ten": {}, "sbs": {}},
+    "nz": {"tvnz 1": {}, "tvnz 2": {}, "three": {}},
+}
+
+AFFILIATE_BRANDS: Set[str] = {
+    "cbc", "ctv", "ctv2", "citytv", "global", "tva", "noovo", "tsn", "sportsnet",
+    "abc", "nbc", "cbs", "fox", "pbs", "cw", "mynetwork", "telemundo", "univision",
+    "bbc one", "bbc two", "itv", "channel 4", "channel 5", "sky crime",
+    "ard", "wdr", "ndr", "mdr", "br", "hr", "rbb", "swr",
+    "seven", "nine", "ten", "sbs", "tvnz 1", "tvnz 2", "three",
+}
+
+def _reverse_country_lookup():
+    rev = {}
+    for code, variants in group_synonyms().items():
+        rev[code] = code
+        for v in variants:
+            rev[v.lower()] = code
+        rev["gb"] = "uk"
+        rev["gbr"] = "uk"
+    return rev
+
+_COUNTRY_LOOKUP = _reverse_country_lookup()
+
+def _norm_country(tok: str) -> str:
+    if not tok:
+        return ''
+    t = tok.strip().lower().replace('.', '')
+    return _COUNTRY_LOOKUP.get(t, '')
+
+def _detect_region_from_id(ch_id: str) -> str:
+    if not ch_id:
+        return ''
+    s = ch_id.lower()
+    parts = re.split(r'[.\-_:|/]+', s)
+    for token in (list(reversed(parts)) + parts):
+        code = _norm_country(token)
+        if code:
+            return code
+    m = re.search(r'([a-z]{2,3})$', s)
+    if m:
+        code = _norm_country(m.group(1))
+        if code:
+            return code
+    return ''
+
+_TS_REGEXES = [
+    re.compile(r'(?<!\w)\+(\d{1,2})\s*(?:h|hr|hour|hours)?(?!\w)', re.I),
+    re.compile(r'\bplus\s*(\d{1,2})\b', re.I),
+]
+def _detect_timeshift(text: str) -> int:
+    if not text:
+        return 0
+    s = str(text)
+    for rx in _TS_REGEXES:
+        m = rx.search(s)
+        if m:
+            try:
+                v = int(m.group(1))
+                if 0 < v <= 24:
+                    return v
+            except Exception:
+                pass
+    return 0
+
+def _detect_zone(text: str) -> str:
+    if not text:
+        return ''
+    s = text.lower()
+    for zone, toks in ZONE_SYNONYMS.items():
+        for t in toks:
+            if re.search(r'\b' + re.escape(t) + r'\b', s):
+                return zone
+    return ''
+
+# Robust callsign extractor (catches KSTW, KSTW-DT, KSTWHD, WABC-TV, etc.)
+_CALLSIGN_CORE_RX = re.compile(r'\b([A-Z]{3,5})(?:\s*-\s*(?:TV|DT|DT\d|HD))?\b', re.I)
+_CALLSIGN_PREFIXES = ('K','W','C')  # US K/W, Canada C*
+def extract_callsigns(text: str) -> Set[str]:
+    out = set()
+    if not text:
+        return out
+    s = re.sub(r'[\[\]\(\)]', ' ', str(text).upper())
+    # Split on any non-alnum to be very forgiving
+    for token in re.findall(r'[A-Z0-9\-]{3,8}', s):
+        parts = re.split(r'[^A-Z0-9]+', token)
+        for p in parts:
+            if not p:
+                continue
+            m = _CALLSIGN_CORE_RX.match(p)
+            core = None
+            if m:
+                core = m.group(1)
+            else:
+                m2 = re.match(r'^([A-Z]{3,5})(?:DT\d?|DT|TV|HD)?$', p)
+                if m2:
+                    core = m2.group(1)
+            if core and core[0] in _CALLSIGN_PREFIXES:
+                if core not in {"NEWS","SPORT","LIVE","PLUS","MAX"} and len(core) >= 3:
+                    out.add(core)
+    return out
+
+def callsign_overlap_score(pl_calls: Set[str], epg_calls: Set[str]) -> Tuple[int, str]:
+    if not pl_calls or not epg_calls:
+        return 0, ''
+    if pl_calls & epg_calls:
+        return 100, '+callsign-exact'
+    for a in pl_calls:
+        for b in epg_calls:
+            if a == b:
+                return 100, '+callsign-exact'
+            if a in b or b in a:
+                return 70, '+callsign-core'
+    return 0, ''
+
+def _brand_key(name: str) -> str:
+    n = canonicalize_name(strip_noise_words(name or ""))
+    for toks in ZONE_SYNONYMS.values():
+        n = re.sub(r'\b(' + '|'.join(re.escape(t) for t in toks) + r')\b', ' ', n, flags=re.I)
+    n = re.sub(r'(?<!\w)\+\d{1,2}(?!\w)', ' ', n)
+    n = re.sub(r'[^a-z0-9]+', '', n.lower())
+    return n
+
+def _reverse_brand_lookup(text: str) -> str:
+    t = (text or "").lower()
+    if "bbc one" in t: return "bbc one"
+    if "bbc two" in t: return "bbc two"
+    if "itv" in t: return "itv"
+    if "citytv" in t or re.search(r'\bcity\b', t): return "citytv"
+    if "ctv2" in t: return "ctv2"
+    if re.search(r'\bctv\b', t): return "ctv"
+    if re.search(r'\bcbc\b', t): return "cbc"
+    if "global" in t: return "global"
+    if re.search(r'\btsn\b', t): return "tsn"
+    if "sportsnet" in t or "sn1" in t or re.search(r'\bsn\b', t): return "sportsnet"
+    if re.search(r'\babc\b', t): return "abc"
+    if re.search(r'\bnbc\b', t): return "nbc"
+    if re.search(r'\bcbs\b', t): return "cbs"
+    if re.search(r'\bfox\b', t) and "fox news" not in t: return "fox"
+    if re.search(r'\bpbs\b', t): return "pbs"
+    if re.search(r'\bcw\b', t): return "cw"
+    if "my network" in t or re.search(r'\bmyn\b', t): return "mynetwork"
+    if "telemundo" in t: return "telemundo"
+    if "univision" in t: return "univision"
+    if "wdr" in t: return "wdr"
+    if "ndr" in t: return "ndr"
+    if "mdr" in t: return "mdr"
+    if "rbb" in t: return "rbb"
+    if "swr" in t: return "swr"
+    if "sky crime" in t: return "sky crime"
+    if re.search(r'\bbr\b', t): return "br"
+    if re.search(r'\bhr\b', t): return "hr"
+    return ""
+
+def _normalize_str(s: str) -> str:
+    return re.sub(r'\s+', ' ', (s or '').strip().lower())
+
+_US_STATE_NAMES = {
+    "alabama":"al","alaska":"ak","arizona":"az","arkansas":"ar","california":"ca","colorado":"co","connecticut":"ct",
+    "delaware":"de","florida":"fl","georgia":"ga","hawaii":"hi","idaho":"id","illinois":"il","indiana":"in","iowa":"ia",
+    "kansas":"ks","kentucky":"ky","louisiana":"la","maine":"me","maryland":"md","massachusetts":"ma","michigan":"mi",
+    "minnesota":"mn","mississippi":"ms","missouri":"mo","montana":"mt","nebraska":"ne","nevada":"nv","new hampshire":"nh",
+    "new jersey":"nj","new mexico":"nm","new york":"ny","north carolina":"nc","north dakota":"nd","ohio":"oh","oklahoma":"ok",
+    "oregon":"or","pennsylvania":"pa","rhode island":"ri","south carolina":"sc","south dakota":"sd","tennessee":"tn",
+    "texas":"tx","utah":"ut","vermont":"vt","virginia":"va","washington":"wa","west virginia":"wv","wisconsin":"wi","wyoming":"wy",
+    "district of columbia":"dc","washington, dc":"dc","washington dc":"dc"
+}
+
+def _market_tokens_for(country: str, brand: str, text: str) -> Tuple[Set[str], Set[str], Set[str]]:
+    # Returns (markets, provinces, cities)
+    markets = set()
+    provinces = set()
+    cities = set()
+    s = _normalize_str(text)
+
+    # pick up 2–3 letter tokens that look like provinces/states
+    for tok in re.findall(r'\b[a-z]{2,3}\b', s):
+        t = tok.lower()
+        if country == "ca" and t in {"bc","ab","sk","mb","on","qc","ns","nl","nb","pe","yt","nt","nu"}:
+            provinces.add(t)
+        elif country == "us" and t in {
+            "ny","nj","pa","ma","ct","ri","nh","vt","me","dc","va","md","de","nc","sc","ga","fl","al","ms","la","tx","ok","nm","az","ca","or","wa","nv","ut","co","wy","mt","id",
+            "nd","sd","ne","ks","mn","ia","mo","il","in","oh","mi","wi","tn","ky","wv","ar"
+        }:
+            provinces.add(t)
+        elif country == "uk" and t in {"ni"}:
+            provinces.add("ni")
+
+    # spelled-out US state names (e.g., "Tacoma Washington")
+    if country == "us":
+        for full, abbr in _US_STATE_NAMES.items():
+            if re.search(r'\b' + re.escape(full) + r'\b', s):
+                provinces.add(abbr)
+
+    brand_l = (brand or "").lower()
+    markets_map = AFFILIATE_MARKETS.get(country, {}).get(brand_l, {})
+    if markets_map:
+        for mk, syns in markets_map.items():
+            for syn in syns:
+                if re.search(r'\b' + re.escape(syn) + r'\b', s):
+                    markets.add(mk)
+                    if '-' in mk:
+                        cities.add(mk.split('-')[0])
+
+    # US locals: ALWAYS consider callsigns and city tokens regardless of detected brand
+    if country == "us":
+        calls = extract_callsigns(text)
+        if calls:
+            markets |= {c.lower() for c in calls}
+        MAJOR_US_CITIES = {
+            "new york","los angeles","chicago","philadelphia","dallas","san francisco","washington","houston",
+            "atlanta","boston","phoenix","seattle","tacoma","detroit","tampa","minneapolis","miami","denver","orlando",
+            "cleveland","sacramento","st louis","portland","pittsburgh","raleigh","charlotte","baltimore",
+            "indianapolis","san diego","nashville","salt lake","san antonio","kansas city","columbus","milwaukee",
+            "cincinnati","austin","las vegas","new orleans","memphis","oklahoma city","albuquerque","boise","anchorage",
+            "birmingham","buffalo","charleston","dayton","el paso","fresno","greensboro","hartford","jacksonville",
+            "knoxville","louisville","madison","norfolk","omaha","providence","richmond","rochester","san jose","st paul",
+            "toledo","tulsa","wichita","spokane","eugene","bakersfield","grand rapids"
+        }
+        for city in MAJOR_US_CITIES:
+            if re.search(r'\b' + re.escape(city) + r'\b', s):
+                markets.add(city.replace(' ', ''))
+                cities.add(city)
+
+    if country == "uk" and (brand_l in {"bbc one","bbc two","itv"} or brand_l == ""):
+        UK_REGIONS = {
+            "london","wales","scotland","northern ireland","yorkshire","granada","tyne tees","meridian","central","border","stv","utv","ulster","england"
+        }
+        for reg in UK_REGIONS:
+            if re.search(r'\b' + re.escape(reg) + r'\b', s):
+                markets.add(reg.replace(' ', '-'))
+
+    if country == "de":
+        DE_LAND = {
+            "bayern","berlin","brandenburg","hessen","nordrhein","westfalen","nrw","niedersachsen","schleswig","holstein",
+            "hamburg","sachsen","anhalt","thüringen","thueringen","baden","württemberg","rheinland","pfalz","mecklenburg","vorpommern"
+        }
+        for reg in DE_LAND:
+            if re.search(r'\b' + re.escape(reg) + r'\b', s):
+                markets.add(reg.replace(' ', '-'))
+
+    return markets, provinces, cities
+
+# =========================
+# XMLTV time parsing to UTC
+# =========================
+
+_XMLTV_TS_RX = re.compile(
+    r'^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\s*([+\-]\d{4})|Z)?'
+)
+
+def _parse_xmltv_to_utc_str(s: str) -> Optional[str]:
+    if not s:
+        return None
+    m = _XMLTV_TS_RX.match(s.strip())
+    if not m:
+        return None
+    y, mo, d, h, mi, sec, off = m.groups()
+    try:
+        base = datetime.datetime(int(y), int(mo), int(d), int(h), int(mi), int(sec), tzinfo=datetime.timezone.utc)
+    except Exception:
+        return None
+    if off and off.upper() != 'Z':
+        sign = 1 if off[0] == '+' else -1
+        try:
+            oh = int(off[1:3]); om = int(off[3:5])
+        except Exception:
+            oh = om = 0
+        delta = datetime.timedelta(hours=oh, minutes=om)
+        utc_dt = base - sign * delta  # local -> UTC
+    else:
+        utc_dt = base
+    return utc_dt.strftime("%Y%m%d%H%M%S")
+
+# =========================
+# Region helpers
+# =========================
+
+def _derive_playlist_region(channel: Dict[str, str]) -> str:
+    tvg_country = (channel.get("tvg-country") or "").strip()
+    if tvg_country:
+        code = _norm_country(tvg_country)
+        if code:
+            return code
+    for key in ("group", "tvg-name", "name"):
+        val = channel.get(key, "")
+        code = extract_group(val)
+        if code:
+            return code
+    code = _detect_region_from_id(channel.get("tvg-id", ""))
+    if code:
+        return code
+    return ''
+
+# =========================
+# Database + Matching Engine
+# =========================
 
 class EPGDatabase:
     def __init__(self, db_path: str, for_threading=False, readonly=False):
@@ -141,25 +649,26 @@ class EPGDatabase:
         c.execute("CREATE INDEX IF NOT EXISTS idx_programmes_title ON programmes (title)")
         self.conn.commit()
 
+    # ----- Inserts -----
+
     def insert_channel(self, channel_id: str, display_name: str):
-        norm = canonicalize_name(strip_backup_terms(display_name))
-        group_tag = extract_group(display_name)
+        name_region = extract_group(display_name)
+        id_region = _detect_region_from_id(channel_id or "")
+        group_tag = name_region or id_region or ''
+        norm = canonicalize_name(strip_noise_words(display_name))
         c = self.conn.cursor()
         c.execute(
             "INSERT OR REPLACE INTO channels (id, display_name, norm_name, group_tag) VALUES (?, ?, ?, ?)",
             (channel_id, display_name, norm, group_tag)
         )
 
-    def insert_programme(self, channel_id: str, title: str, start: str, end: str):
+    def insert_programme(self, channel_id: str, title: str, start_utc: str, end_utc: str):
         c = self.conn.cursor()
-        c.execute("INSERT OR IGNORE INTO programmes (channel_id, title, start, end) VALUES (?, ?, ?, ?)", (channel_id, title, start, end))
+        c.execute("INSERT OR IGNORE INTO programmes (channel_id, title, start, end) VALUES (?, ?, ?, ?)",
+                  (channel_id, title, start_utc, end_utc))
 
     def prune_old_programmes(self, days: int = 7):
-        # Use UTC consistently; fallback if datetime.UTC missing (older Python)
-        try:
-            utcnow = datetime.datetime.now(datetime.UTC)
-        except AttributeError:
-            utcnow = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+        utcnow = self._utcnow()
         cutoff = (utcnow - datetime.timedelta(days=days)).strftime("%Y%m%d%H%M%S")
         c = self.conn.cursor()
         c.execute("DELETE FROM programmes WHERE end < ?", (cutoff,))
@@ -168,71 +677,196 @@ class EPGDatabase:
     def commit(self):
         self.conn.commit()
 
-    def get_matching_channel_ids(self, channel: Dict[str, str]) -> List[dict]:
-        tvg_id = channel.get("tvg-id", "").strip()
-        tvg_name = channel.get("tvg-name", "").strip()
-        name = channel.get("name", "")
-        group_tag = extract_group(channel.get("group", "")) if channel.get("group") else ''
+    # ----- Helpers -----
 
+    def _has_any_schedule_from_now(self, ch_id: str) -> bool:
+        """True if channel has any programme ending in the future."""
+        now = self._utcnow().strftime("%Y%m%d%H%M%S")
         c = self.conn.cursor()
+        row = c.execute("SELECT 1 FROM programmes WHERE channel_id = ? AND end >= ? LIMIT 1", (ch_id, now)).fetchone()
+        return bool(row)
+
+    def _collect_candidates_by_id_and_name(self, c, tvg_id: str, tvg_name: str, name: str):
         candidates = {}
 
-        # 1. Exact ID
         if tvg_id:
             row = c.execute("SELECT id, group_tag, display_name FROM channels WHERE id = ?", (tvg_id,)).fetchone()
             if row:
-                candidates[row[0]] = {'id': row[0], 'group_tag': row[1], 'score': 100, 'display_name': row[2]}
+                candidates[row[0]] = {'id': row[0], 'group_tag': row[1], 'score': 100, 'display_name': row[2], 'why': 'exact-id', 'ts_offset': 0}
 
-        # 2. Exact canonicalized tvg-name
         if tvg_name:
-            norm_tvg_name = canonicalize_name(strip_backup_terms(tvg_name))
+            norm_tvg_name = canonicalize_name(strip_noise_words(tvg_name))
             rows = c.execute("SELECT id, group_tag, display_name FROM channels WHERE norm_name = ?", (norm_tvg_name,)).fetchall()
             for r in rows:
-                candidates[r[0]] = {'id': r[0], 'group_tag': r[1], 'score': 95, 'display_name': r[2]}
+                candidates[r[0]] = {'id': r[0], 'group_tag': r[1], 'score': 96, 'display_name': r[2], 'why': 'exact-tvg-name', 'ts_offset': 0}
 
-        # 3. Exact canonicalized playlist name
-        norm_name_pl = canonicalize_name(strip_backup_terms(name))
-        rows = c.execute("SELECT id, group_tag, display_name FROM channels WHERE norm_name = ?", (norm_name_pl,)).fetchall()
-        for r in rows:
-            candidates[r[0]] = {'id': r[0], 'group_tag': r[1], 'score': 90, 'display_name': r[2]}
+        norm_name_pl = canonicalize_name(strip_noise_words(name))
+        rows = c.execute("SELECT id, group_tag, display_name FROM channels WHERE norm_name = ?", (norm_name_pl)).fetchall() if False else []
+        # ^ intentionally disabled: overly aggressive, causes false positives across feeds
 
-        # 4. Token-based fuzzy matching for group-preferred
+        return candidates
+
+    # ----- Matching Core -----
+
+    def get_matching_channel_ids(self, channel: Dict[str, str]) -> List[dict]:
+        tvg_id = (channel.get("tvg-id") or "").strip()
+        tvg_name = (channel.get("tvg-name") or "").strip()
+        name = (channel.get("name") or "").strip()
+
+        playlist_region = _derive_playlist_region(channel)
+        playlist_zone = _detect_zone(" ".join([channel.get("group",""), tvg_name, name]))
+        playlist_brand_key = _brand_key(name)
+        playlist_ts = _detect_timeshift(" ".join([tvg_name, name]))
+        brand_text = canonicalize_name(strip_noise_words(name)).lower()
+        playlist_brand_family = _reverse_brand_lookup(brand_text)
+        pl_calls = extract_callsigns(" ".join([tvg_name, name, channel.get("group",""), tvg_id]))
+
+        c = self.conn.cursor()
+        candidates = self._collect_candidates_by_id_and_name(c, tvg_id, tvg_name, name)
+
         target_tokens = tokenize_channel_name(name)
         rows_all = c.execute("SELECT id, display_name, group_tag FROM channels").fetchall()
-        syns = group_synonyms()
+
+        pl_markets, pl_provinces, _ = _market_tokens_for(playlist_region or "", playlist_brand_family, " ".join([tvg_name, name]))
+
+        # Build scored candidates
         for ch_id, disp, grp in rows_all:
-            epg_tokens = tokenize_channel_name(disp)
-            same_region = False
-            if group_tag:
-                if grp == group_tag:
-                    same_region = True
+            epg_text_norm = canonicalize_name(strip_noise_words(disp)).lower()
+            epg_brand_family = _reverse_brand_lookup(epg_text_norm)
+            epg_calls = extract_callsigns(" ".join([disp, ch_id]))
+
+            # Decide if candidate is worth scoring:
+            families_align = (playlist_brand_family and epg_brand_family and playlist_brand_family == epg_brand_family)
+            cs_delta, cs_reason = callsign_overlap_score(pl_calls, epg_calls)
+
+            # Accept if families align OR callsign overlap is strong (covers cases like "KSTW" without "CW" in EPG)
+            if not (families_align or cs_delta >= 60 or (not playlist_brand_family and epg_calls and pl_calls and cs_delta >= 60)):
+                # For US locals, also accept if region tokens (city/state) match strongly even if family is missing
+                strong_us_local = False
+                if playlist_region == "us":
+                    epg_markets_tmp, epg_provs_tmp, _ = _market_tokens_for("us", epg_brand_family, disp)
+                    if (pl_markets & epg_markets_tmp) or (pl_provinces & epg_provs_tmp):
+                        strong_us_local = True
+                if not strong_us_local:
+                    continue
+
+            score = 0
+            why = []
+
+            # Strong base for exact callsign
+            if cs_delta:
+                score += cs_delta
+                why.append(cs_reason)
+
+            # Brand family alignment still helps, but lower than callsign
+            if families_align:
+                score += 40
+                why.append('+brand-family')
+
+                # strict key match (rare but helpful)
+                epg_brand_key = _brand_key(disp)
+                if playlist_brand_key and epg_brand_key and playlist_brand_key == epg_brand_key:
+                    score += 10
+                    why.append('+brand-key')
+
+            # Region alignment / bias
+            if playlist_region:
+                if grp == playlist_region:
+                    score += 18
+                    why.append('+same-region')
+                elif grp == '':
+                    score += 6
+                    why.append('+unknown-region')
                 else:
-                    if grp in syns and group_tag in syns.get(grp, []):
-                        same_region = True
-                    elif group_tag in syns and grp in syns.get(group_tag, []):
-                        same_region = True
-            overlap = target_tokens & epg_tokens
-            if same_region:
-                if len(overlap) >= 2:
-                    score = 80 + len(overlap)
-                    candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
-            else:
-                if len(overlap) >= 2:
-                    score = 60 + len(overlap)
-                    if ch_id not in candidates or candidates[ch_id]['score'] < score:
-                        candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
+                    score -= 40
+                    why.append('-other-region')
 
-        # Fallback: Relaxed name fuzzy (ALL EPG channels, score 55+)
-        relaxed_target = re.sub(r'\s+', '', canonicalize_name(strip_backup_terms(name)))
-        for ch_id, disp, grp in rows_all:
-            cand = re.sub(r'\s+', '', canonicalize_name(strip_backup_terms(disp)))
-            ratio = difflib.SequenceMatcher(None, relaxed_target, cand).ratio()
-            if ratio >= 0.8:
-                score = int(55 + 40 * ratio)
-                if ch_id not in candidates or candidates[ch_id]['score'] < score:
-                    candidates[ch_id] = {'id': ch_id, 'group_tag': grp, 'score': score, 'display_name': disp}
+            # Zone alignment (east/west/pacific/etc.)
+            epg_zone = _detect_zone(disp)
+            if playlist_zone and epg_zone:
+                if playlist_zone == epg_zone:
+                    score += 8
+                    why.append('+zone')
+                else:
+                    score -= 15
+                    why.append('-zone')
 
-        return list(candidates.values()), group_tag
+            # Timeshift handling
+            epg_ts = _detect_timeshift(disp)
+            ts_offset = 0
+            if playlist_ts and epg_ts == playlist_ts:
+                score += 12
+                why.append('+timeshift')
+            elif playlist_ts and epg_ts == 0:
+                ts_offset = playlist_ts
+                score += 6
+                why.append('+timeshift-fallback')
+            elif playlist_ts and epg_ts != playlist_ts:
+                score -= 18
+                why.append('-timeshift-mismatch')
+
+            # Market/Province cues (city/state & callsigns included)
+            epg_markets, epg_provs, _ = _market_tokens_for(grp or playlist_region or "", epg_brand_family, disp)
+            if pl_markets and epg_markets and (pl_markets & epg_markets):
+                score += 35
+                why.append('+market-exact')
+            elif pl_provinces and epg_provs and (pl_provinces & epg_provs):
+                score += 18
+                why.append('+market-province')
+            elif pl_markets and epg_markets and not (pl_markets & epg_markets):
+                score -= 30
+                why.append('-market-mismatch')
+
+            # Token overlap tie-breaker
+            epg_tokens = tokenize_channel_name(disp)
+            if target_tokens and epg_tokens:
+                overlap = len(target_tokens & epg_tokens)
+                if overlap:
+                    score += min(10, overlap * 2)
+                    why.append(f'+tok{overlap}')
+
+            # Hard penalties to avoid generic wrong feeds when we have a callsign
+            if playlist_region == "us" and playlist_brand_family in {"abc","nbc","cbs","fox","pbs","cw","mynetwork","telemundo","univision"}:
+                if pl_calls and not (pl_calls & epg_calls):
+                    # CW is particularly messy with national feeds; be harsher
+                    score -= (80 if playlist_brand_family == "cw" else 55)
+                    why.append('-callsign-mismatch')
+                # penalize generic "CW" feeds with no callsign if our playlist clearly mentions a callsign or a city
+                if playlist_brand_family == "cw" and not epg_calls:
+                    # If EPG display-name looks national/east/west
+                    if re.search(r'\bnational\b', epg_text_norm) or re.search(r'\b(east|west|pacific|mountain|central)\b', epg_text_norm):
+                        score -= 40
+                        why.append('-generic-cw')
+
+            # Schedule health: do NOT pick channels with no current/future programmes
+            has_sched = self._has_any_schedule_from_now(ch_id)
+            if not has_sched:
+                score -= 120
+                why.append('-no-schedule')
+
+            prior = candidates.get(ch_id)
+            if not prior or prior['score'] < score:
+                candidates[ch_id] = {
+                    'id': ch_id,
+                    'group_tag': grp,
+                    'score': score,
+                    'display_name': disp,
+                    'why': ' '.join(why),
+                    'ts_offset': ts_offset
+                }
+
+        # Optional debug
+        if MATCH_DEBUG:
+            print(f"[EPG-MATCH] For '{name}' (region={playlist_region or '??'} zone={playlist_zone or 'none'} brandFamily={playlist_brand_family or 'none'} key={playlist_brand_key or 'none'} ts=+{playlist_ts or 0}h):")
+            print(f"  PL calls={sorted(pl_calls)} markets={sorted(pl_markets)} provs={sorted(pl_provinces)}")
+            for v in sorted(candidates.values(), key=lambda x: -x['score'])[:25]:
+                ez = _detect_zone(v['display_name'])
+                ets = _detect_timeshift(v['display_name'])
+                epg_calls_dbg = extract_callsigns(" ".join([v['display_name'], v['id']]))
+                print(f"  {v['score']:>4}  {v['id']}  grp={v.get('group_tag') or ''}  zone={ez or ''}  ts=+{ets}h  calls={sorted(epg_calls_dbg)} why={v.get('why')} :: {v.get('display_name')}")
+
+        # Return list of candidate dicts plus detected playlist_region for tie-breaking elsewhere
+        return list(candidates.values()), playlist_region
 
     def _utcnow(self):
         try:
@@ -240,30 +874,42 @@ class EPGDatabase:
         except AttributeError:
             return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
 
+    # ----- Now/Next Query with Timeshift Awareness -----
+
     def get_now_next(self, channel: Dict[str, str]) -> Optional[tuple]:
-        matches, group_tag = self.get_matching_channel_ids(channel)
+        matches, playlist_region = self.get_matching_channel_ids(channel)
         if not matches:
             return None
+        matches = sorted(matches, key=lambda m: -m.get('score', 0))
+
+        c = self.conn.cursor()
         now = self._utcnow()
         now_str = now.strftime("%Y%m%d%H%M%S")
-        c = self.conn.cursor()
+
         current_shows = []
         next_shows = []
 
-        for match in matches:
+        # Only try the top N candidates to reduce noise
+        for match in matches[:12]:
             ch_id = match['id']
             grp = match['group_tag']
-            group_priority = (grp == group_tag)
+            ts_offset = int(match.get('ts_offset', 0))
+            group_priority = bool(playlist_region and grp and playlist_region == grp)
+
+            query_now = now - datetime.timedelta(hours=ts_offset) if ts_offset > 0 else now
+            qnow_str = query_now.strftime("%Y%m%d%H%M%S")
+
+            # NOW
             row = c.execute(
                 "SELECT title, start, end FROM programmes WHERE channel_id = ? AND start <= ? AND end > ? ORDER BY start DESC LIMIT 1",
-                (ch_id, now_str, now_str)).fetchone()
+                (ch_id, qnow_str, qnow_str)).fetchone()
             if row:
                 title, start, end = row
-                try:
-                    st_dt = datetime.datetime.strptime(start, "%Y%m%d%H%M%S")
-                    en_dt = datetime.datetime.strptime(end, "%Y%m%d%H%M%S")
-                except Exception:
-                    continue
+                st_dt = datetime.datetime.strptime(start, "%Y%m%d%H%M%S")
+                en_dt = datetime.datetime.strptime(end, "%Y%m%d%H%M%S")
+                if ts_offset > 0:
+                    st_dt += datetime.timedelta(hours=ts_offset)
+                    en_dt += datetime.timedelta(hours=ts_offset)
                 current_shows.append({
                     "title": title,
                     "start": st_dt,
@@ -273,16 +919,18 @@ class EPGDatabase:
                     "group_priority": group_priority,
                     "score": match.get("score", 0)
                 })
+
+            # NEXT
             row2 = c.execute(
                 "SELECT title, start, end FROM programmes WHERE channel_id = ? AND start > ? ORDER BY start ASC LIMIT 1",
-                (ch_id, now_str)).fetchone()
+                (ch_id, qnow_str)).fetchone()
             if row2:
                 title2, start2, end2 = row2
-                try:
-                    st2_dt = datetime.datetime.strptime(start2, "%Y%m%d%H%M%S")
-                    en2_dt = datetime.datetime.strptime(end2, "%Y%m%d%H%M%S")
-                except Exception:
-                    continue
+                st2_dt = datetime.datetime.strptime(start2, "%Y%m%d%H%M%S")
+                en2_dt = datetime.datetime.strptime(end2, "%Y%m%d%H%M%S")
+                if ts_offset > 0:
+                    st2_dt += datetime.timedelta(hours=ts_offset)
+                    en2_dt += datetime.timedelta(hours=ts_offset)
                 next_shows.append({
                     "title": title2,
                     "start": st2_dt,
@@ -292,15 +940,19 @@ class EPGDatabase:
                     "group_priority": group_priority,
                     "score": match.get("score", 0)
                 })
+
         def pick_best(showlist, is_now):
             if not showlist:
                 return None
-            showlist = sorted(showlist, key=lambda s: (not s["group_priority"], -s["score"], s["end" if is_now else "start"]))
-            return showlist[0]
+            # Prefer same-region, then higher score, then earliest start for NEXT / soonest end for NOW
+            key_fn = (lambda s: (not s["group_priority"], -s["score"], s["end"])) if is_now else (lambda s: (not s["group_priority"], -s["score"], s["start"]))
+            return sorted(showlist, key=key_fn)[0]
 
         now_show = pick_best(current_shows, True)
         next_show = pick_best(next_shows, False)
         return (now_show, next_show)
+
+    # ----- Query helpers -----
 
     def get_channels_with_show(self, filter_text: str, max_results: int = 100):
         now = self._utcnow().strftime("%Y%m%d%H%M%S")
@@ -339,7 +991,10 @@ class EPGDatabase:
     def close(self):
         self.conn.close()
 
+    # ----- EPG Import (streaming) -----
+
     def import_epg_xml(self, xml_sources: List[str], progress_callback=None):
+        # Use a separate connection per thread for safety
         thread_db = EPGDatabase(self.db_path, for_threading=True)
         total = len(xml_sources)
         for idx, src in enumerate(xml_sources):
@@ -363,7 +1018,10 @@ class EPGDatabase:
                         with open(src, "r", encoding="utf-8", errors="ignore") as f:
                             thread_db._stream_parse_epg(f)
             except Exception as e:
-                wx.LogError(f"EPG import failed for {src}: {e}")
+                try:
+                    wx.LogError(f"EPG import failed for {src}: {e}")
+                except Exception:
+                    pass
             if progress_callback:
                 try:
                     progress_callback(idx + 1, total)
@@ -374,9 +1032,7 @@ class EPGDatabase:
         thread_db.close()
 
     def _stream_parse_epg(self, filelike):
-        # Efficient iterative parsing with memory cleanup that works with xml.etree
         context = ET.iterparse(filelike, events=("end",))
-        # We track parent tags using a stack of elements to aid memory cleanup
         for event, elem in context:
             if elem.tag == "channel":
                 cid = elem.get("id")
@@ -395,13 +1051,17 @@ class EPGDatabase:
                 end = elem.get("stop")
                 if cid and title and start and end:
                     try:
-                        _ = datetime.datetime.strptime(start[:14], "%Y%m%d%H%M%S")
-                        _ = datetime.datetime.strptime(end[:14], "%Y%m%d%H%M%S")
-                        self.insert_programme(cid, title, start[:14], end[:14])
+                        s_utc = _parse_xmltv_to_utc_str(start)
+                        e_utc = _parse_xmltv_to_utc_str(end)
+                        if s_utc and e_utc and s_utc < e_utc:
+                            self.insert_programme(cid, title, s_utc, e_utc)
                     except Exception:
                         pass
                 elem.clear()
-        # No lxml-only getprevious/getparent calls are used to ensure compatibility
+
+# =========================
+# Simple UI dialogs (for main.py compatibility)
+# =========================
 
 class EPGImportDialog(wx.Dialog):
     def __init__(self, parent, total):
@@ -427,7 +1087,6 @@ class EPGManagerDialog(wx.Dialog):
         self._build_ui()
         self.CenterOnParent()
         self.Layout()
-        wx.CallAfter(self.add_url_btn.SetFocus)
 
     def _build_ui(self):
         panel = wx.Panel(self)
@@ -457,42 +1116,28 @@ class EPGManagerDialog(wx.Dialog):
         self.remove_btn.Bind(wx.EVT_BUTTON, self.OnRemove)
 
     def OnAddFile(self, _):
-        with wx.FileDialog(self, "Add XMLTV File",
-                           wildcard="XMLTV Files (*.xml;*.gz)|*.xml;*.gz",
+        with wx.FileDialog(self, "Choose XMLTV file", wildcard="XMLTV files (*.xml;*.xml.gz)|*.xml;*.xml.gz|All files (*.*)|*.*",
                            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 path = dlg.GetPath()
-                if path and path not in self.epg_sources:
-                    self.epg_sources.append(path)
-                    self.lb.Append(path)
-                    self.lb.SetSelection(self.lb.GetCount() - 1)
-        wx.CallAfter(self.add_file_btn.SetFocus)
+                self.epg_sources.append(path)
+                self.lb.Append(path)
 
     def OnAddURL(self, _):
-        dlg = wx.TextEntryDialog(self, "Enter EPG XMLTV URL:", "Add URL")
-        if dlg.ShowModal() == wx.ID_OK:
-            url = dlg.GetValue().strip()
-            if url and url not in self.epg_sources:
-                self.epg_sources.append(url)
-                self.lb.Append(url)
-                self.lb.SetSelection(self.lb.GetCount() - 1)
-        dlg.Destroy()
-        wx.CallAfter(self.add_url_btn.SetFocus)
+        with wx.TextEntryDialog(self, "Enter EPG URL:", "Add EPG URL") as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                url = dlg.GetValue().strip()
+                if url:
+                    self.epg_sources.append(url)
+                    self.lb.Append(url)
 
     def OnRemove(self, _):
-        idx = self.lb.GetSelection()
-        if idx == wx.NOT_FOUND:
-            return
-        src = self.epg_sources[idx]
-        if wx.MessageBox(f"Remove this EPG source?\n{src}", "Confirm",
-                         wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING) == wx.YES:
-            self.epg_sources.pop(idx)
-            self.lb.Delete(idx)
-            new_count = self.lb.GetCount()
-            if new_count > 0:
-                self.lb.SetSelection(min(idx, new_count - 1))
+        i = self.lb.GetSelection()
+        if i != wx.NOT_FOUND:
+            self.epg_sources.pop(i)
+            self.lb.Delete(i)
 
-    def GetResult(self):
+    def GetSources(self) -> List[str]:
         return self.epg_sources
 
 class PlaylistManagerDialog(wx.Dialog):
@@ -502,7 +1147,6 @@ class PlaylistManagerDialog(wx.Dialog):
         self._build_ui()
         self.CenterOnParent()
         self.Layout()
-        wx.CallAfter(self.add_file_btn.SetFocus)
 
     def _build_ui(self):
         panel = wx.Panel(self)
@@ -511,9 +1155,7 @@ class PlaylistManagerDialog(wx.Dialog):
         self.add_file_btn = wx.Button(panel, label="Add File")
         self.add_url_btn = wx.Button(panel, label="Add URL")
         self.remove_btn = wx.Button(panel, label="Remove Selected")
-        self.up_btn = wx.Button(panel, label="Move Up")
-        self.down_btn = wx.Button(panel, label="Move Down")
-        for btn in (self.add_file_btn, self.add_url_btn, self.remove_btn, self.up_btn, self.down_btn):
+        for btn in (self.add_file_btn, self.add_url_btn, self.remove_btn):
             btn_sizer.Add(btn, 0, wx.ALL, 2)
         main_sizer.Add(btn_sizer, 0, wx.EXPAND)
         self.lb = wx.ListBox(panel, style=wx.LB_SINGLE)
@@ -532,66 +1174,28 @@ class PlaylistManagerDialog(wx.Dialog):
         self.add_file_btn.Bind(wx.EVT_BUTTON, self.OnAddFile)
         self.add_url_btn.Bind(wx.EVT_BUTTON, self.OnAddURL)
         self.remove_btn.Bind(wx.EVT_BUTTON, self.OnRemove)
-        self.up_btn.Bind(wx.EVT_BUTTON, self.OnMoveUp)
-        self.down_btn.Bind(wx.EVT_BUTTON, self.OnMoveDown)
 
     def OnAddFile(self, _):
-        with wx.FileDialog(self, "Add M3U/M3U8 File",
-                           wildcard="M3U Files (*.m3u;*.m3u8)|*.m3u;*.m3u8",
+        with wx.FileDialog(self, "Choose M3U file", wildcard="M3U files (*.m3u;*.m3u8)|*.m3u;*.m3u8|All files (*.*)|*.*",
                            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 path = dlg.GetPath()
-                if path and path not in self.playlist_sources:
-                    self.playlist_sources.append(path)
-                    self.lb.Append(path)
-                    self.lb.SetSelection(self.lb.GetCount() - 1)
-        wx.CallAfter(self.add_file_btn.SetFocus)
+                self.playlist_sources.append(path)
+                self.lb.Append(path)
 
     def OnAddURL(self, _):
-        dlg = wx.TextEntryDialog(self, "Enter M3U URL:", "Add URL")
-        if dlg.ShowModal() == wx.ID_OK:
-            url = dlg.GetValue().strip()
-            if url and url not in self.playlist_sources:
-                self.playlist_sources.append(url)
-                self.lb.Append(url)
-                self.lb.SetSelection(self.lb.GetCount() - 1)
-        dlg.Destroy()
-        wx.CallAfter(self.add_url_btn.SetFocus)
+        with wx.TextEntryDialog(self, "Enter Playlist URL:", "Add Playlist URL") as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                url = dlg.GetValue().strip()
+                if url:
+                    self.playlist_sources.append(url)
+                    self.lb.Append(url)
 
     def OnRemove(self, _):
-        idx = self.lb.GetSelection()
-        if idx == wx.NOT_FOUND:
-            return
-        src = self.playlist_sources[idx]
-        if wx.MessageBox(f"Remove this playlist?\n{src}", "Confirm",
-                         wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING) == wx.YES:
-            self.playlist_sources.pop(idx)
-            self.lb.Delete(idx)
-            new_count = self.lb.GetCount()
-            if new_count > 0:
-                self.lb.SetSelection(min(idx, new_count - 1))
+        i = self.lb.GetSelection()
+        if i != wx.NOT_FOUND:
+            self.playlist_sources.pop(i)
+            self.lb.Delete(i)
 
-    def OnMoveUp(self, _):
-        idx = self.lb.GetSelection()
-        if idx > 0:
-            self.playlist_sources[idx - 1], self.playlist_sources[idx] = (
-                self.playlist_sources[idx], self.playlist_sources[idx - 1]
-            )
-            self.RefreshList(idx - 1)
-
-    def OnMoveDown(self, _):
-        idx = self.lb.GetSelection()
-        if idx < len(self.playlist_sources) - 1 and idx != wx.NOT_FOUND:
-            self.playlist_sources[idx + 1], self.playlist_sources[idx] = (
-                self.playlist_sources[idx], self.playlist_sources[idx + 1]
-            )
-            self.RefreshList(idx + 1)
-
-    def RefreshList(self, new_idx: int):
-        self.lb.Clear()
-        for src in self.playlist_sources:
-            self.lb.Append(src)
-        self.lb.SetSelection(new_idx)
-
-    def GetResult(self):
+    def GetSources(self) -> List[str]:
         return self.playlist_sources
