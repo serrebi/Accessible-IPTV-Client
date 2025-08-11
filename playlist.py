@@ -1,14 +1,60 @@
 # playlist.py
+# NOTE: Debug logging is ON by default. Log file: epg_debug.log (same folder as this file).
 import os
 import re
 import io
 import wx
 import gzip
+import time
+import json
+import tracemalloc
 import sqlite3
 import urllib.request
 import xml.etree.ElementTree as ET
 import datetime
+import logging
+import logging.handlers
 from typing import Dict, List, Optional, Tuple, Set
+
+# =========================
+# Debug logging (rotating file) + memory helpers
+# =========================
+
+DEBUG = False if os.getenv("EPG_DEBUG", "1").strip() not in {"0", "false", "False"} else False
+LOG_PATH = os.path.join(os.path.dirname(__file__) or ".", "epg_debug.log")
+_logger = logging.getLogger("EPG")
+if not _logger.handlers:
+    _logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+    _fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    _fh = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8")
+    _fh.setFormatter(_fmt)
+    _logger.addHandler(_fh)
+    # Also mirror to stderr while debugging (harmless if GUI)
+    if DEBUG:
+        _sh = logging.StreamHandler()
+        _sh.setFormatter(_fmt)
+        _logger.addHandler(_sh)
+_logger.debug("EPG debug logging initialized. File: %s", LOG_PATH)
+
+def _mem_mb() -> int:
+    try:
+        import psutil  # optional
+        p = psutil.Process(os.getpid())
+        return int(p.memory_info().rss / (1024 * 1024))
+    except Exception:
+        try:
+            import resource  # *nix
+            # ru_maxrss is in kilobytes on Linux, bytes on macOS; normalize to MB best-effort
+            rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            if rss_kb > 1024 * 1024:  # assume bytes (macOS)
+                return int(rss_kb / (1024 * 1024))
+            return int(rss_kb / 1024)
+        except Exception:
+            return -1
+
+def _safe(s: str, n=200) -> str:
+    s = str(s or "")
+    return (s[:n] + "...") if len(s) > n else s
 
 # =========================
 # Normalization & Tokenizing
@@ -28,123 +74,98 @@ NOISE_WORDS = [
 
 def group_synonyms():
     return {
-        # North America
-        "us": ["us", "usa", "u.s.", "u.s", "us.", "united states", "united states of america", "america"],
-        "ca": ["ca", "can", "canada", "car"],
-        "mx": ["mx", "mex", "mexico", "méxico"],
-
-        # UK + Ireland
-        "uk": ["uk", "u.k.", "gb", "gbr", "great britain", "britain", "united kingdom", "england", "scotland", "wales", "northern ireland"],
-        "ie": ["ie", "irl", "ireland", "eire", "éire"],
-
-        # DACH
-        "de": ["de", "ger", "deu", "germany", "deutschland"],
-        "at": ["at", "aut", "austria", "österreich", "oesterreich"],
-        "ch": ["ch", "che", "switzerland", "schweiz", "suisse", "svizzera"],
-
-        # Benelux
-        "nl": ["nl", "nld", "netherlands", "holland", "nederland"],
-        "be": ["be", "bel", "belgium", "belgie", "belgië", "belgique"],
-        "lu": ["lu", "lux", "luxembourg", "letzebuerg", "lëtzebuerg"],
-
-        # Nordics
-        "se": ["se", "swe", "sweden", "svenska", "sverige"],
-        "no": ["no", "nor", "norway", "norge", "noreg"],
-        "dk": ["dk", "dnk", "denmark", "danmark"],
-        "fi": ["fi", "fin", "finland", "suomi"],
-        "is": ["is", "isl", "iceland", "ísland"],
-
-        # Southern Europe
-        "fr": ["fr", "fra", "france", "français", "française"],
-        "it": ["it", "ita", "italy", "italia"],
-        "es": ["es", "esp", "spain", "españa", "espana", "español"],
-        "pt": ["pt", "prt", "portugal", "português"],
-        "gr": ["gr", "grc", "greece", "ελλάδα", "ellada"],
-        "mt": ["mt", "mlt", "malta"],
-        "cy": ["cy", "cyp", "cyprus"],
-
-        # Central/Eastern Europe
-        "pl": ["pl", "pol", "poland", "polska"],
-        "cz": ["cz", "cze", "czech", "czechia", "cesko", "česko"],
-        "sk": ["sk", "svk", "slovakia", "slovensko"],
-        "hu": ["hu", "hun", "hungary", "magyar"],
-        "si": ["si", "svn", "slovenia", "slovenija"],
-        "hr": ["hr", "hrv", "croatia", "hrvatska"],
-        "rs": ["rs", "srb", "serbia", "srbija"],
-        "ba": ["ba", "bih", "bosnia", "bosnia and herzegovina", "bosna", "hercegovina"],
-        "mk": ["mk", "mkd", "north macedonia", "macedonia"],
-        "ro": ["ro", "rou", "romania", "românia"],
-        "bg": ["bg", "bgr", "bulgaria", "българия", "balgariya"],
-        "ua": ["ua", "ukr", "ukraine", "ukraina"],
-        "by": ["by", "blr", "belarus"],
-        "ru": ["ru", "rus", "russia", "россия", "rossiya"],
-        "ee": ["ee", "est", "estonia", "eesti"],
-        "lv": ["lv", "lva", "latvia", "latvija"],
-        "lt": ["lt", "ltu", "lithuania", "lietuva"],
-
-        # Balkans + nearby
-        "al": ["al", "alb", "albania", "shqipëri", "shqiperia"],
-        "me": ["me", "mne", "montenegro", "crna gora"],
-        "xk": ["xk", "kosovo"],
-
-        # MENA (subset)
-        "tr": ["tr", "tur", "turkey", "türkiye", "turkiye"],
-        "ma": ["ma", "mar", "morocco", "maroc"],
-        "dz": ["dz", "dza", "algeria", "algérie"],
-        "tn": ["tn", "tun", "tunisia", "tunisie"],
-        "eg": ["eg", "egypt", "misr"],
-        "il": ["il", "isr", "israel"],
-        "sa": ["sa", "sau", "saudi", "saudi arabia"],
-        "ae": ["ae", "are", "uae", "united arab emirates"],
-        "qa": ["qa", "qat", "qatar"],
-        "kw": ["kw", "kwt", "kuwait"],
-
-        # Asia (subset)
-        "in": ["in", "ind", "india", "bharat"],
-        "pk": ["pk", "pak", "pakistan"],
-        "bd": ["bd", "bgd", "bangladesh"],
-        "lk": ["lk", "lka", "sri lanka"],
-        "np": ["np", "npl", "nepal"],
-        "cn": ["cn", "chn", "china"],
-        "hk": ["hk", "hkg", "hong kong"],
-        "tw": ["tw", "twn", "taiwan"],
-        "jp": ["jp", "jpn", "japan", "日本"],
-        "kr": ["kr", "kor", "korea", "south korea"],
-        "sg": ["sg", "sgp", "singapore"],
-        "my": ["my", "mys", "malaysia"],
-        "th": ["th", "tha", "thailand"],
-        "vn": ["vn", "vnm", "vietnam"],
-        "ph": ["ph", "phl", "philippines"],
-        "id": ["id", "idn", "indonesia"],
-
-        # Oceania
-        "au": ["au", "aus", "australia"],
-        "nz": ["nz", "nzl", "new zealand", "aotearoa"],
-
-        # Latin America (subset)
-        "br": ["br", "bra", "brazil", "brasil"],
-        "ar": ["ar", "arg", "argentina"],
-        "cl": ["cl", "chl", "chile"],
-        "co": ["co", "col", "colombia"],
-        "pe": ["pe", "per", "peru", "perú"],
-        "uy": ["uy", "ury", "uruguay"],
-        "py": ["py", "pry", "paraguay"],
-        "bo": ["bo", "bol", "bolivia"],
-        "ec": ["ec", "ecu", "ecuador"],
-        "ve": ["ve", "ven", "venezuela"],
-        "cr": ["cr", "cri", "costa rica"],
-        "pr": ["pr", "pri", "puerto rico"],
-
-        # Africa (subset)
-        "ng": ["ng", "nga", "nigeria"],
-        "za": ["za", "zaf", "south africa"],
-        "ke": ["ke", "ken", "kenya"],
-        "gh": ["gh", "gha", "ghana"],
-        "et": ["et", "eth", "ethiopia"],
-        "tz": ["tz", "tza", "tanzania"],
-        "ug": ["ug", "uga", "uganda"],
-        "ci": ["ci", "civ", "côte d’ivoire", "ivory coast"],
-        "sn": ["sn", "sen", "senegal"],
+        "us": ["us","usa","u.s.","u.s","us.","united states","united states of america","america"],
+        "ca": ["ca","can","canada","car"],
+        "mx": ["mx","mex","mexico","méxico"],
+        "uk": ["uk","u.k.","gb","gbr","great britain","britain","united kingdom","england","scotland","wales","northern ireland"],
+        "ie": ["ie","irl","ireland","eire","éire"],
+        "de": ["de","ger","deu","germany","deutschland"],
+        "at": ["at","aut","austria","österreich","oesterreich"],
+        "ch": ["ch","che","switzerland","schweiz","suisse","svizzera"],
+        "nl": ["nl","nld","netherlands","holland","nederland"],
+        "be": ["be","bel","belgium","belgie","belgië","belgique"],
+        "lu": ["lu","lux","luxembourg","letzebuerg","lëtzebuerg"],
+        "se": ["se","swe","sweden","svenska","sverige"],
+        "no": ["no","nor","norway","norge","noreg"],
+        "dk": ["dk","dnk","denmark","danmark"],
+        "fi": ["fi","fin","finland","suomi"],
+        "is": ["is","isl","iceland","ísland"],
+        "fr": ["fr","fra","france","français","française"],
+        "it": ["it","ita","italy","italia"],
+        "es": ["es","esp","spain","españa","espana","español"],
+        "pt": ["pt","prt","portugal","português"],
+        "gr": ["gr","grc","greece","ελλάδα","ellada"],
+        "mt": ["mt","mlt","malta"],
+        "cy": ["cy","cyp","cyprus"],
+        "pl": ["pl","pol","poland","polska"],
+        "cz": ["cz","cze","czech","czechia","cesko","česko"],
+        "sk": ["sk","svk","slovakia","slovensko"],
+        "hu": ["hu","hun","hungary","magyar"],
+        "si": ["si","svn","slovenia","slovenija"],
+        "hr": ["hr","hrv","croatia","hrvatska"],
+        "rs": ["rs","srb","serbia","srbija"],
+        "ba": ["ba","bih","bosnia","bosnia and herzegovina","bosna","hercegovina"],
+        "mk": ["mk","mkd","north macedonia","macedonia"],
+        "ro": ["ro","rou","romania","românia"],
+        "bg": ["bg","bgr","bulgaria","българия","balgariya"],
+        "ua": ["ua","ukr","ukraine","ukraina"],
+        "by": ["by","blr","belarus"],
+        "ru": ["ru","rus","russia","россия","rossiya"],
+        "ee": ["ee","est","estonia","eesti"],
+        "lv": ["lv","lva","latvia","latvija"],
+        "lt": ["lt","ltu","lithuania","lietuva"],
+        "al": ["al","alb","albania","shqipëri","shqiperia"],
+        "me": ["me","mne","montenegro","crna gora"],
+        "xk": ["xk","kosovo"],
+        "tr": ["tr","tur","turkey","türkiye","turkiye"],
+        "ma": ["ma","mar","morocco","maroc"],
+        "dz": ["dz","dza","algeria","algérie"],
+        "tn": ["tn","tun","tunisia","tunisie"],
+        "eg": ["eg","egypt","misr"],
+        "il": ["il","isr","israel"],
+        "sa": ["sa","sau","saudi","saudi arabia"],
+        "ae": ["ae","are","uae","united arab emirates"],
+        "qa": ["qa","qat","qatar"],
+        "kw": ["kw","kwt","kuwait"],
+        "in": ["in","ind","india","bharat"],
+        "pk": ["pk","pak","pakistan"],
+        "bd": ["bd","bgd","bangladesh"],
+        "lk": ["lk","lka","sri lanka"],
+        "np": ["np","npl","nepal"],
+        "cn": ["cn","chn","china"],
+        "hk": ["hk","hkg","hong kong"],
+        "tw": ["tw","twn","taiwan"],
+        "jp": ["jp","jpn","japan","日本"],
+        "kr": ["kr","kor","korea","south korea"],
+        "sg": ["sg","sgp","singapore"],
+        "my": ["my","mys","malaysia"],
+        "th": ["th","tha","thailand"],
+        "vn": ["vn","vnm","vietnam"],
+        "ph": ["ph","phl","philippines"],
+        "id": ["id","idn","indonesia"],
+        "au": ["au","aus","australia"],
+        "nz": ["nz","nzl","new zealand","aotearoa"],
+        "br": ["br","bra","brazil","brasil"],
+        "ar": ["ar","arg","argentina"],
+        "cl": ["cl","chl","chile"],
+        "co": ["co","col","colombia"],
+        "pe": ["pe","per","peru","perú"],
+        "uy": ["uy","ury","uruguay"],
+        "py": ["py","pry","paraguay"],
+        "bo": ["bo","bolivia"],
+        "ec": ["ec","ecu","ecuador"],
+        "ve": ["ve","ven","venezuela"],
+        "cr": ["cr","cri","costa rica"],
+        "pr": ["pr","pri","puerto rico"],
+        "ng": ["ng","nga","nigeria"],
+        "za": ["za","zaf","south africa"],
+        "ke": ["ke","ken","kenya"],
+        "gh": ["gh","gha","ghana"],
+        "et": ["et","eth","ethiopia"],
+        "tz": ["tz","tza","tanzania"],
+        "ug": ["ug","uga","uganda"],
+        "ci": ["ci","civ","côte d’ivoire","ivory coast"],
+        "sn": ["sn","sen","senegal"],
     }
 
 def canonicalize_name(name: str) -> str:
@@ -212,7 +233,7 @@ def strip_backup_terms(name: str) -> str:
 # Matching helpers
 # =========================
 
-MATCH_DEBUG = bool(os.environ.get("EPG_MATCH_DEBUG"))
+MATCH_DEBUG = bool(os.environ.get("EPG_MATCH_DEBUG")) or DEBUG
 
 ZONE_SYNONYMS = {
     "east": {"east", "e", "eastern"},
@@ -227,19 +248,12 @@ def _mk(*xs):
     return {x.lower() for x in xs if x}
 
 # ==== HBO Variant Helpers ====
-
-# Recognized HBO variants
 _HBO_VARIANTS = ("base", "1", "2", "family", "latino", "signature", "comedy", "hits", "zone", "plus")
 
 def _extract_hbo_variant(raw_text: str) -> str:
-    """
-    Return which HBO subbrand is referenced in text.
-    'base' means plain HBO (or HBO East/West without a number).
-    """
     if not raw_text:
         return ""
     s = raw_text.lower()
-    # Look for explicit sub-brands first
     if re.search(r'\bfamily\b', s): return "family"
     if re.search(r'\blatino\b', s): return "latino"
     if re.search(r'\bsignature\b', s): return "signature"
@@ -247,31 +261,18 @@ def _extract_hbo_variant(raw_text: str) -> str:
     if re.search(r'\bhits\b', s): return "hits"
     if re.search(r'\bzone\b', s): return "zone"
     if re.search(r'\bplus\b', s): return "plus"
-
-    # Numeric variants
-    if re.search(r'\bhbo[\s\-]*1\b', s) or re.search(r'\b1\b', s):
-        return "1"
-    if re.search(r'\bhbo[\s\-]*2\b', s) or re.search(r'\b2\b', s):
-        return "2"
-
-    # Default: if 'hbo' mentioned, assume base
-    if re.search(r'\bhbo\b', s):
-        return "base"
+    if re.search(r'\bhbo[\s\-]*1\b', s) or re.search(r'\b1\b', s): return "1"
+    if re.search(r'\bhbo[\s\-]*2\b', s) or re.search(r'\b2\b', s): return "2"
+    if re.search(r'\bhbo\b', s): return "base"
     return ""
 
 def _normalize_hbo_variant(country_code: str, variant: str) -> str:
-    """
-    Region-aware normalization:
-    - US: treat HBO1 as base (same channel). '1' => 'base'
-    - CA: keep '1' distinct (Canada HBO1 should match to Canada HBO1, not base).
-    """
     v = (variant or "").strip().lower()
     cc = (country_code or "").strip().lower()
     if not v:
         return ""
-    if cc == "us":
-        if v == "1":
-            return "base"
+    if cc == "us" and v == "1":
+        return "base"
     return v
 
 def _is_hbo_family(text: str) -> bool:
@@ -279,103 +280,44 @@ def _is_hbo_family(text: str) -> bool:
 
 AFFILIATE_MARKETS: Dict[str, Dict[str, Dict[str, Set[str]]]] = {
     "ca": {
-        "cbc": {
-            "vancouver-bc": _mk("vancouver", "bc", "british columbia"),
-            "calgary-ab": _mk("calgary", "ab"),
-            "edmonton-ab": _mk("edmonton", "ab"),
-            "saskatoon-sk": _mk("saskatoon", "sk"),
-            "regina-sk": _mk("regina", "sk"),
-            "winnipeg-mb": _mk("winnipeg", "mb"),
-            "ottawa-on": _mk("ottawa", "on"),
-            "toronto-on": _mk("toronto", "on"),
-            "montreal-qc": _mk("montreal", "montréal", "qc"),
-            "halifax-ns": _mk("halifax", "ns"),
-            "stjohns-nl": _mk("st johns", "st. johns", "nl"),
-        },
-        "ctv": {
-            "vancouver-bc": _mk("vancouver", "bc"),
-            "calgary-ab": _mk("calgary", "ab"),
-            "edmonton-ab": _mk("edmonton", "ab"),
-            "saskatoon-sk": _mk("saskatoon", "sk"),
-            "regina-sk": _mk("regina", "sk"),
-            "winnipeg-mb": _mk("winnipeg", "mb"),
-            "ottawa-on": _mk("ottawa", "on"),
-            "toronto-on": _mk("toronto", "on"),
-            "london-on": _mk("london", "on"),
-            "montreal-qc": _mk("montreal", "montréal", "qc"),
-            "halifax-ns": _mk("halifax", "ns"),
-        },
-        "ctv2": {
-            "vancouver-bc": _mk("vancouver", "bc"),
-            "ottawa-on": _mk("ottawa", "on"),
-            "london-on": _mk("london", "on"),
-            "windsor-on": _mk("windsor", "on"),
-        },
-        "citytv": {
-            "vancouver-bc": _mk("vancouver", "bc"),
-            "calgary-ab": _mk("calgary", "ab"),
-            "edmonton-ab": _mk("edmonton", "ab"),
-            "winnipeg-mb": _mk("winnipeg", "mb"),
-            "toronto-on": _mk("toronto", "on"),
-            "montreal-qc": _mk("montreal", "montréal", "qc"),
-        },
-        "global": {
-            "vancouver-bc": _mk("vancouver", "bc", "british columbia", "global bc"),
-            "calgary-ab": _mk("calgary", "ab"),
-            "edmonton-ab": _mk("edmonton", "ab"),
-            "saskatoon-sk": _mk("saskatoon", "sk"),
-            "regina-sk": _mk("regina", "sk"),
-            "winnipeg-mb": _mk("winnipeg", "mb"),
-            "toronto-on": _mk("toronto", "on"),
-            "montreal-qc": _mk("montreal", "montréal", "qc"),
-            "halifax-ns": _mk("halifax", "ns"),
-        },
-        "tsn": {
-            "tsn1-west": _mk("tsn1", "west", "bc", "ab", "pacific", "mountain"),
-            "tsn2-central": _mk("tsn2", "central"),
-            "tsn3-prairies": _mk("prairies", "mb", "sk"),
-            "tsn4-ontario": _mk("ontario", "on", "toronto"),
-            "tsn5-east": _mk("east", "ottawa", "montreal", "qc", "atlantic"),
-        },
-        "sportsnet": {
-            "pacific": _mk("pacific", "bc", "vancouver"),
-            "west": _mk("west", "ab", "calgary", "edmonton"),
-            "prairies": _mk("prairies", "sk", "mb"),
-            "ontario": _mk("ontario", "on", "toronto"),
-            "east": _mk("east", "qc", "montreal", "atlantic"),
-            "one": _mk("sn1", "sportsnet one", "one"),
-            "360": _mk("sportsnet 360", "sn360", "360"),
-        },
-        "tva": {"montreal-qc": _mk("montreal", "montréal", "qc"), "quebeccity-qc": _mk("quebec city", "québec")},
-        "noovo": {"montreal-qc": _mk("montreal", "montréal", "qc")},
-        # Optional named brand to let region grouping exist for HBO in CA if present
+        "cbc": {"vancouver-bc": _mk("vancouver","bc"), "calgary-ab": _mk("calgary","ab"), "edmonton-ab": _mk("edmonton","ab"),
+                "saskatoon-sk": _mk("saskatoon","sk"), "regina-sk": _mk("regina","sk"), "winnipeg-mb": _mk("winnipeg","mb"),
+                "ottawa-on": _mk("ottawa","on"), "toronto-on": _mk("toronto","on"), "montreal-qc": _mk("montreal","montréal","qc"),
+                "halifax-ns": _mk("halifax","ns"), "stjohns-nl": _mk("st johns","st. johns","nl")},
+        "ctv": {"vancouver-bc": _mk("vancouver","bc"), "calgary-ab": _mk("calgary","ab"), "edmonton-ab": _mk("edmonton","ab"),
+                "saskatoon-sk": _mk("saskatoon","sk"), "regina-sk": _mk("regina","sk"), "winnipeg-mb": _mk("winnipeg","mb"),
+                "ottawa-on": _mk("ottawa","on"), "toronto-on": _mk("toronto","on"), "london-on": _mk("london","on"),
+                "montreal-qc": _mk("montreal","montréal","qc"), "halifax-ns": _mk("halifax","ns")},
+        "ctv2": {"vancouver-bc": _mk("vancouver","bc"), "ottawa-on": _mk("ottawa","on"), "london-on": _mk("london","on"), "windsor-on": _mk("windsor","on")},
+        "citytv": {"vancouver-bc": _mk("vancouver","bc"), "calgary-ab": _mk("calgary","ab"), "edmonton-ab": _mk("edmonton","ab"),
+                   "winnipeg-mb": _mk("winnipeg","mb"), "toronto-on": _mk("toronto","on"), "montreal-qc": _mk("montreal","montréal","qc")},
+        "global": {"vancouver-bc": _mk("vancouver","bc","british columbia","global bc"), "calgary-ab": _mk("calgary","ab"),
+                   "edmonton-ab": _mk("edmonton","ab"), "saskatoon-sk": _mk("saskatoon","sk"), "regina-sk": _mk("regina","sk"),
+                   "winnipeg-mb": _mk("winnipeg","mb"), "toronto-on": _mk("toronto","on"), "montreal-qc": _mk("montreal","montréal","qc"),
+                   "halifax-ns": _mk("halifax","ns")},
+        "tsn": {"tsn1-west": _mk("tsn1","west","bc","ab","pacific","mountain"), "tsn2-central": _mk("central"),
+                "tsn3-prairies": _mk("prairies","mb","sk"), "tsn4-ontario": _mk("ontario","on","toronto"),
+                "tsn5-east": _mk("east","ottawa","montreal","qc","atlantic")},
+        "sportsnet": {"pacific": _mk("pacific","bc","vancouver"), "west": _mk("west","ab","calgary","edmonton"),
+                      "prairies": _mk("prairies","sk","mb"), "ontario": _mk("ontario","on","toronto"),
+                      "east": _mk("east","qc","montreal","atlantic"), "one": _mk("sn1","sportsnet one","one"),
+                      "360": _mk("sportsnet 360","sn360","360")},
+        "tva": {"montreal-qc": _mk("montreal","montréal","qc")},
+        "noovo": {"montreal-qc": _mk("montreal","montréal","qc")},
         "hbo": {},
     },
-    "us": {
-        "abc": {}, "nbc": {}, "cbs": {}, "fox": {}, "pbs": {}, "cw": {}, "mynetwork": {}, "telemundo": {}, "univision": {},
-        "hbo": {},  # Allow region tagging if EPG uses it
-    },
-    "uk": {
-        "bbc one": {"london": _mk("london"), "wales": _mk("wales", "cymru"), "scotland": _mk("scotland", "stv"), "northern ireland": _mk("northern ireland", "ni")},
-        "bbc two": {"wales": _mk("wales"), "scotland": _mk("scotland"), "northern ireland": _mk("northern ireland")},
-        "itv": {"london": _mk("london"), "wales": _mk("wales"), "yorkshire": _mk("yorkshire"), "granada": _mk("granada"),
-                "tyne tees": _mk("tyne tees"), "meridian": _mk("meridian"), "central": _mk("central"),
-                "border": _mk("border"), "stv": _mk("stv"), "utv": _mk("utv", "ulster", "northern ireland")},
-        "sky crime": {},
-        "sky mix": {},
-        "sky max": {},
-    },
+    "us": {"abc": {}, "nbc": {}, "cbs": {}, "fox": {}, "pbs": {}, "cw": {}, "mynetwork": {}, "telemundo": {}, "univision": {}, "hbo": {}},
+    "uk": {"bbc one": {}, "bbc two": {}, "itv": {}, "sky crime": {}, "sky mix": {}, "sky max": {}},
     "de": {"ard": {}, "wdr": {}, "ndr": {}, "mdr": {}, "br": {}, "hr": {}, "rbb": {}, "swr": {}},
     "au": {"abc": {}, "seven": {}, "nine": {}, "ten": {}, "sbs": {}},
     "nz": {"tvnz 1": {}, "tvnz 2": {}, "three": {}},
 }
 
 AFFILIATE_BRANDS: Set[str] = {
-    "cbc", "ctv", "ctv2", "citytv", "global", "tva", "noovo", "tsn", "sportsnet",
-    "abc", "nbc", "cbs", "fox", "pbs", "cw", "mynetwork", "telemundo", "univision",
-    "bbc one", "bbc two", "itv", "channel 4", "channel 5", "sky crime", "sky mix", "sky max",
-    "ard", "wdr", "ndr", "mdr", "br", "hr", "rbb", "swr",
-    "seven", "nine", "ten", "sbs", "tvnz 1", "tvnz 2", "three",
+    "cbc","ctv","ctv2","citytv","global","tva","noovo","tsn","sportsnet",
+    "abc","nbc","cbs","fox","pbs","cw","mynetwork","telemundo","univision",
+    "bbc one","bbc two","itv","channel 4","channel 5","sky crime","sky mix","sky max",
+    "ard","wdr","ndr","mdr","br","hr","rbb","swr","seven","nine","ten","sbs","tvnz 1","tvnz 2","three",
     "hbo",
 }
 
@@ -520,7 +462,6 @@ def _reverse_brand_lookup(text: str) -> str:
     if re.search(r'\bbr\b', t): return "br"
     if re.search(r'\bhr\b', t): return "hr"
     if re.search(r'\bhbo\b', t):
-        # Any HBO or subbrand maps to 'hbo' family
         return "hbo"
     return ""
 
@@ -561,8 +502,7 @@ def _market_tokens_for(country: str, brand: str, text: str) -> Tuple[Set[str], S
             if re.search(r'\b' + re.escape(full) + r'\b', s):
                 provinces.add(abbr)
 
-    brand_l = (brand or "").lower()
-    markets_map = AFFILIATE_MARKETS.get(country, {}).get(brand_l, {})
+    markets_map = AFFILIATE_MARKETS.get(country, {}).get((brand or "").lower(), {})
     if markets_map:
         for mk, syns in markets_map.items():
             for syn in syns:
@@ -581,63 +521,185 @@ def _market_tokens_for(country: str, brand: str, text: str) -> Tuple[Set[str], S
             "cleveland","sacramento","st louis","portland","pittsburgh","raleigh","charlotte","baltimore",
             "indianapolis","san diego","nashville","salt lake","san antonio","kansas city","columbus","milwaukee",
             "cincinnati","austin","las vegas","new orleans","memphis","oklahoma city","albuquerque","boise","anchorage",
-            "birmingham","buffalo","charleston","dayton","el paso","fresno","greensboro","hartford","jacksonville",
-            "knoxville","louisville","madison","norfolk","omaha","providence","richmond","rochester","san jose","st paul",
-            "toledo","tulsa","wichita","spokane","eugene","bakersfield","grand rapids"
+            "birmingham","charleston","charlottesville","chattanooga","dayton","des moines","el paso","fort worth","grand rapids",
+            "greensboro","greenville","hartford","jacksonville","knoxville","louisville","madison","norfolk","omaha",
+            "providence","richmond","rochester","roanoke","san jose","spokane","springfield","toledo","tucson","tulsa"
         }
         for city in MAJOR_US_CITIES:
             if re.search(r'\b' + re.escape(city) + r'\b', s):
-                markets.add(city.replace(' ', ''))
                 cities.add(city)
-
-    if country == "uk" and (brand_l in {"bbc one","bbc two","itv"} or brand_l == ""):
-        UK_REGIONS = {
-            "london","wales","scotland","northern ireland","yorkshire","granada","tyne tees","meridian","central","border","stv","utv","ulster","england"
-        }
-        for reg in UK_REGIONS:
-            if re.search(r'\b' + re.escape(reg) + r'\b', s):
-                markets.add(reg.replace(' ', '-'))
-
-    if country == "de":
-        DE_LAND = {
-            "bayern","berlin","brandenburg","hessen","nordrhein","westfalen","nrw","niedersachsen","schleswig","holstein",
-            "hamburg","sachsen","anhalt","thüringen","thueringen","baden","württemberg","rheinland","pfalz","mecklenburg","vorpommern"
-        }
-        for reg in DE_LAND:
-            if re.search(r'\b' + re.escape(reg) + r'\b', s):
-                markets.add(reg.replace(' ', '-'))
 
     return markets, provinces, cities
 
 # =========================
-# XMLTV time parsing to UTC
+# XMLTV time parsing to UTC (ROBUST & EXCEPTION-SAFE)
 # =========================
 
+# Classic strict XMLTV pattern used as a fallback
 _XMLTV_TS_RX = re.compile(
-    r'^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\s*([+\-]\d{4})|Z)?'
+    r'^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\s*(Z|[+\-]\d{4}))?$'
 )
 
 def _parse_xmltv_to_utc_str(s: str) -> Optional[str]:
+    """
+    Robustly parse XMLTV/ISO8601-ish timestamps to UTC "YYYYMMDDHHMMSS".
+    Accepts:
+      - 20250811153000 +0000   (classic XMLTV, seconds required in this variant)
+      - 20250811153000Z
+      - 202508111530 +0000     (seconds optional)
+      - 2025-08-11 15:30:00 +00:00
+      - 2025-08-11T15:30:00Z
+      - 2025-08-11T15:30Z
+      - 2025/08/11 15:30:00 +0000
+    Never raises; returns None if it can’t parse.
+    """
+    try:
+        if not s:
+            return None
+        s = str(s).strip()
+
+        # Fast ISO-8601 path for strings with '-' or 'T' or ':' or '/'
+        if ('T' in s) or ('-' in s) or (':' in s) or ('/' in s):
+            iso = s.replace('z', 'Z')
+            # Convert trailing Z to explicit +00:00
+            if iso.endswith('Z'):
+                iso = iso[:-1] + '+00:00'
+            # Normalize offsets like +0000 -> +00:00 (handles both with/without colon)
+            iso = re.sub(r'([+\-]\d{2})(\d{2})$', r'\1:\2', iso)
+            try:
+                dt = datetime.datetime.fromisoformat(iso)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+                return dt.astimezone(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
+            except Exception:
+                # Fall through to regex handling
+                pass
+
+            # Flexible hyphen/colon/slash pattern (seconds optional, offset optional)
+            m = re.match(
+                r'^\s*(?P<Y>\d{4})[.\-\/]?(?P<Mo>\d{2})[.\-\/]?(?P<D>\d{2})[T\s]?'
+                r'(?P<H>\d{2}):?(?P<M>\d{2})(?::?(?P<S>\d{2}))?\s*'
+                r'(?P<OFF>Z|[+\-]\d{2}:?\d{2})?\s*$',
+                s
+            )
+            if m:
+                y = int(m.group('Y')); mo = int(m.group('Mo')); d = int(m.group('D'))
+                hh = int(m.group('H')); mm = int(m.group('M')); ss = int((m.group('S') or '0'))
+                offs = m.group('OFF')
+                dt = datetime.datetime(y, mo, d, hh, mm, ss)
+                if offs:
+                    if offs == 'Z':
+                        # already UTC
+                        pass
+                    else:
+                        offs_clean = offs.replace(':', '')
+                        sign = 1 if offs_clean[0] == '+' else -1
+                        oh = int(offs_clean[1:3]); om = int(offs_clean[3:5])
+                        dt -= datetime.timedelta(hours=sign*oh, minutes=sign*om)
+                # with no offset treat as UTC already
+                return dt.strftime("%Y%m%d%H%M%S")
+
+        # Classic XMLTV: 14 or 12 digits with optional Z or +HHMM
+        m2 = re.match(
+            r'^\s*(?P<Y>\d{4})(?P<Mo>\d{2})(?P<D>\d{2})(?P<H>\d{2})(?P<M>\d{2})(?P<S>\d{2})?\s*(?P<OFF>Z|[+\-]\d{4})?\s*$',
+            s
+        )
+        if m2:
+            y = int(m2.group('Y')); mo = int(m2.group('Mo')); d = int(m2.group('D'))
+            hh = int(m2.group('H')); mm = int(m2.group('M')); ss = int((m2.group('S') or '0'))
+            offs = m2.group('OFF')
+            dt = datetime.datetime(y, mo, d, hh, mm, ss)
+            if offs:
+                if offs == 'Z':
+                    pass
+                else:
+                    sign = 1 if offs[0] == '+' else -1
+                    oh = int(offs[1:3]); om = int(offs[3:5])
+                    dt -= datetime.timedelta(hours=sign*oh, minutes=sign*om)
+            return dt.strftime("%Y%m%d%H%M%S")
+
+        return None
+    except Exception:
+        # Absolutely no exceptions escape this function
+        return None
+
+# ---- duration helpers ----
+
+_ISO8601_DUR_RX = re.compile(
+    r'^P(?:(?P<days>\d+)D)?(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?$',
+    re.I
+)
+
+def _parse_duration_to_seconds(s: str) -> Optional[int]:
     if not s:
         return None
-    m = _XMLTV_TS_RX.match(s.strip())
-    if not m:
+    s = s.strip()
+    # Try integer minutes (XMLTV <length> default is minutes)
+    if re.match(r'^\d+$', s):
+        try:
+            return int(s) * 60
+        except Exception:
+            return None
+    m = _ISO8601_DUR_RX.match(s)
+    if m:
+        days = int(m.group('days') or 0)
+        hours = int(m.group('hours') or 0)
+        minutes = int(m.group('minutes') or 0)
+        seconds = int(m.group('seconds') or 0)
+        return days*86400 + hours*3600 + minutes*60 + seconds
+    return None
+
+def _calc_end_from_length_or_duration(start_utc: Optional[str], elem: ET.Element) -> Optional[str]:
+    """If provider uses <length units="minutes"> or <duration>PT...,
+    compute end time. Returns UTC "YYYYMMDDHHMMSS" or None."""
+    if not start_utc:
         return None
-    y, mo, d, h, mi, sec, off = m.groups()
+    # <length units="minutes">NN</length> or units="seconds"
+    length_elem = elem.find(".//length")
+    dur_seconds = None
+    if length_elem is not None and (length_elem.text or "").strip():
+        units = (length_elem.get("units") or "").strip().lower()
+        try:
+            val = float(length_elem.text.strip())
+        except Exception:
+            val = None
+        if val is not None:
+            if units in {"", "minute", "minutes", "mins", "min"}:
+                dur_seconds = int(val * 60)
+            elif units in {"second", "seconds", "sec", "secs"}:
+                dur_seconds = int(val)
+    if dur_seconds is None:
+        # <duration>PT1H30M</duration>
+        dur_elem = elem.find(".//duration")
+        if dur_elem is not None and (dur_elem.text or "").strip():
+            dur_seconds = _parse_duration_to_seconds(dur_elem.text.strip())
+    if dur_seconds is None:
+        return None
     try:
-        y = int(y); mo = int(mo); d = int(d); h = int(h); mi = int(mi); sec = int(sec)
+        st = datetime.datetime.strptime(start_utc, "%Y%m%d%H%M%S")
+        end_dt = st + datetime.timedelta(seconds=dur_seconds)
+        return end_dt.strftime("%Y%m%d%H%M%S")
     except Exception:
         return None
-    base = datetime.datetime(y, mo, d, h, mi, sec)
-    if off:
-        try:
-            sign = 1 if off[0] == '+' else -1
-            offset_hours = int(off[1:3])
-            offset_minutes = int(off[3:5])
-            base -= datetime.timedelta(hours=sign*offset_hours, minutes=sign*offset_minutes)
-        except Exception:
-            pass
-    return base.strftime("%Y%m%d%H%M%S")
+
+# =========================
+# DB PRAGMAs
+# =========================
+
+PRAGMA_IMPORT = [
+    "PRAGMA journal_mode=WAL;",
+    "PRAGMA synchronous=NORMAL;",
+    "PRAGMA temp_store=MEMORY;",
+    "PRAGMA mmap_size=268435456;",   # 256MB
+    "PRAGMA cache_size=-131072;",    # ~128MB
+    "PRAGMA wal_autocheckpoint=0;",  # we'll checkpoint manually
+    "PRAGMA busy_timeout=5000;",
+]
+
+PRAGMA_READONLY = [
+    "PRAGMA busy_timeout=2000;",
+    "PRAGMA read_uncommitted=1;",    # let readers proceed during writer txn
+]
 
 # =========================
 # EPG Database
@@ -646,10 +708,28 @@ def _parse_xmltv_to_utc_str(s: str) -> Optional[str]:
 class EPGDatabase:
     def __init__(self, db_path: str, readonly: bool = False, for_threading: bool = False):
         self.db_path = db_path
-        if for_threading:
-            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.readonly = readonly
+        self.for_threading = for_threading
+        self._open()
+
+    def _open(self):
+        if self.readonly:
+            # Open as read-only, shared cache; set reader-friendly pragmas
+            uri = f"file:{self.db_path}?mode=ro&cache=shared"
+            self.conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+            for p in PRAGMA_READONLY:
+                try:
+                    self.conn.execute(p)
+                except Exception:
+                    pass
         else:
-            self.conn = sqlite3.connect(self.db_path)
+            # Writer/normal
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=not self.for_threading)
+            for p in PRAGMA_IMPORT:
+                try:
+                    self.conn.execute(p)
+                except Exception:
+                    pass
         self._create_tables()
 
     def _create_tables(self):
@@ -673,9 +753,19 @@ class EPGDatabase:
                 UNIQUE(channel_id, start, end)
             )
         """)
+        # Indexes crucial for fast lookups
         c.execute("CREATE INDEX IF NOT EXISTS idx_programmes_channel_start ON programmes (channel_id, start)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_programmes_channel_end ON programmes (channel_id, end)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_programmes_channel_start_end ON programmes (channel_id, start, end)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_programmes_title ON programmes (title)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_channels_norm ON channels (norm_name)")
         self.conn.commit()
+
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
     def insert_channel(self, channel_id: str, display_name: str):
         name_region = extract_group(display_name)
@@ -703,10 +793,91 @@ class EPGDatabase:
     def commit(self):
         self.conn.commit()
 
+    # ---------- Candidate selection (fast; no full table scan) ----------
+    def _candidate_rows(self, c, name: str, tvg_name: str, region: str) -> List[Tuple[str, str, str]]:
+        """
+        Return a limited set of likely channel rows: (id, display_name, group_tag)
+        Strategy:
+          1) exact norm_name for tvg_name and name
+          2) brand-key LIKE
+          3) token LIKEs (up to 3 tokens)
+          4) restrict to region/unknown region when available
+        """
+        out: List[Tuple[str, str, str]] = []
+        seen: Set[str] = set()
+
+        def add_rows(rows):
+            for r in rows:
+                if r[0] not in seen:
+                    seen.add(r[0])
+                    out.append(r)
+
+        norm_name = canonicalize_name(strip_noise_words(name))
+        norm_tvg = canonicalize_name(strip_noise_words(tvg_name))
+        brand = _brand_key(name)
+        tokens = list(tokenize_channel_name(name))[:3]
+
+        region_clause = ""
+        params_region: List[str] = []
+        if region:
+            region_clause = " AND (group_tag = ? OR group_tag = '') "
+            params_region = [region]
+
+        # 1) exact norm matches
+        if norm_tvg:
+            rows = c.execute(
+                f"SELECT id, display_name, group_tag FROM channels WHERE norm_name = ? {region_clause} LIMIT 100",
+                [norm_tvg] + params_region
+            ).fetchall()
+            add_rows(rows)
+        if norm_name and norm_name != norm_tvg:
+            rows = c.execute(
+                f"SELECT id, display_name, group_tag FROM channels WHERE norm_name = ? {region_clause} LIMIT 100",
+                [norm_name] + params_region
+            ).fetchall()
+            add_rows(rows)
+
+        # 2) brand-key LIKE
+        if brand:
+            rows = c.execute(
+                f"SELECT id, display_name, group_tag FROM channels WHERE norm_name LIKE ? {region_clause} LIMIT 200",
+                [f"%{brand}%"] + params_region
+            ).fetchall()
+            add_rows(rows)
+
+        # 3) token LIKEs
+        for tok in tokens:
+            rows = c.execute(
+                f"SELECT id, display_name, group_tag FROM channels WHERE norm_name LIKE ? {region_clause} LIMIT 200",
+                [f"%{tok}%"] + params_region
+            ).fetchall()
+            add_rows(rows)
+
+        # Fallback if we still have nothing and region provided: pull small regional sample
+        if not out and region:
+            rows = c.execute(
+                "SELECT id, display_name, group_tag FROM channels WHERE group_tag = ? LIMIT 200",
+                (region,)
+            ).fetchall()
+            add_rows(rows)
+
+        # Cap result size to keep scoring cheap
+        return out[:400]
+
     def _has_any_schedule_from_now(self, ch_id: str) -> bool:
         now = self._utcnow().strftime("%Y%m%d%H%M%S")
         c = self.conn.cursor()
-        row = c.execute("SELECT 1 FROM programmes WHERE channel_id = ? AND end >= ? LIMIT 1", (ch_id, now)).fetchone()
+        row = c.execute(
+            "SELECT 1 FROM programmes WHERE channel_id = ? AND end > ? LIMIT 1",
+            (ch_id, now)
+        ).fetchone()
+        if not row:
+            # Try next few hours window
+            fut = (self._utcnow() + datetime.timedelta(hours=3)).strftime("%Y%m%d%H%M%S")
+            row = c.execute(
+                "SELECT 1 FROM programmes WHERE channel_id = ? AND start <= ? AND end > ? LIMIT 1",
+                (ch_id, fut, now)
+            ).fetchone()
         return bool(row)
 
     def _collect_candidates_by_id_and_name(self, c, tvg_id: str, tvg_name: str, name: str):
@@ -723,11 +894,9 @@ class EPGDatabase:
             for r in rows:
                 candidates[r[0]] = {'id': r[0], 'group_tag': r[1], 'score': 96, 'display_name': r[2], 'why': 'exact-tvg-name', 'ts_offset': 0}
 
-        norm_name_pl = canonicalize_name(strip_noise_words(name))
-        rows = c.execute("SELECT id, group_tag, display_name FROM channels WHERE norm_name = ?", (norm_name_pl)).fetchall() if False else []
         return candidates
 
-    def get_matching_channel_ids(self, channel: Dict[str, str]) -> List[dict]:
+    def get_matching_channel_ids(self, channel: Dict[str, str]) -> Tuple[List[dict], str]:
         tvg_id = (channel.get("tvg-id") or "").strip()
         tvg_name = (channel.get("tvg-name") or "").strip()
         name = (channel.get("name") or "").strip()
@@ -747,9 +916,8 @@ class EPGDatabase:
         c = self.conn.cursor()
         candidates = self._collect_candidates_by_id_and_name(c, tvg_id, tvg_name, name)
 
-        target_tokens = tokenize_channel_name(name)
-        rows_all = c.execute("SELECT id, display_name, group_tag FROM channels").fetchall()
-
+        # FAST candidate set (no full channels scan)
+        rows_all = self._candidate_rows(c, name, tvg_name, playlist_region)
         pl_markets, pl_provinces, _ = _market_tokens_for(playlist_region or "", playlist_brand_family, " ".join([tvg_name, name]))
 
         for ch_id, disp, grp in rows_all:
@@ -760,9 +928,7 @@ class EPGDatabase:
             families_align = (playlist_brand_family and epg_brand_family and playlist_brand_family == epg_brand_family)
             cs_delta, cs_reason = callsign_overlap_score(pl_calls, epg_calls)
 
-            # Let strong local market mapping through even if brands don't match (for US locals),
-            # otherwise require family align or strong callsign match
-            if not (families_align or cs_delta >= 60 or (not playlist_brand_family and epg_calls and pl_calls and cs_delta >= 60)):
+            if not (families_align or cs_delta >= 60):
                 strong_us_local = False
                 if playlist_region == "us":
                     epg_markets_tmp, epg_provs_tmp, _ = _market_tokens_for("us", epg_brand_family, disp)
@@ -796,7 +962,6 @@ class EPGDatabase:
                 else:
                     score -= 40
                     why.append('-other-region')
-                # Keep region penalty for HBO too if region mismatches
                 if playlist_brand_family == "hbo" and families_align and grp and playlist_region and grp != playlist_region:
                     score -= 20
                     why.append('-hbo-wrong-region')
@@ -811,7 +976,6 @@ class EPGDatabase:
                     why.append('-zone')
 
             epg_ts = _detect_timeshift(" ".join([disp, ch_id]))
-            ts_delta = 0
             if playlist_ts and epg_ts:
                 ts_delta = abs(playlist_ts - epg_ts)
                 if ts_delta == 0:
@@ -829,13 +993,11 @@ class EPGDatabase:
                 epg_hbo_variant_raw = _extract_hbo_variant(" ".join([disp, ch_id]))
                 epg_hbo_variant = _normalize_hbo_variant(grp, epg_hbo_variant_raw)
 
-                # Treat US 'HBO1' as base; in CA keep '1' distinct
                 if pl_hbo_variant or epg_hbo_variant:
                     if _normalize_hbo_variant(playlist_region, pl_hbo_variant or "base") == _normalize_hbo_variant(grp, epg_hbo_variant or "base"):
                         score += 40
                         why.append(f'+hbo-variant({pl_hbo_variant or "base"})')
                     else:
-                        # If playlist is generic/base and EPG is either base or 1 in US, still give a smaller boost
                         if playlist_region == "us":
                             if (pl_hbo_variant in {"", "base", "1"} and epg_hbo_variant in {"base", "1"}) or (epg_hbo_variant in {"", "base"} and pl_hbo_variant in {"base", "1"}):
                                 score += 18
@@ -844,13 +1006,11 @@ class EPGDatabase:
                                 score -= 10
                                 why.append('-hbo-variant-mismatch')
                         else:
-                            # In Canada, 1 must match 1 explicitly
                             score -= 12
                             why.append('-hbo-variant-mismatch-ca')
 
-            # Token overlap
             epg_tokens = tokenize_channel_name(disp)
-            token_overlap = len(target_tokens & epg_tokens)
+            token_overlap = len(tokenize_channel_name(name) & epg_tokens)
             score += min(20, token_overlap * 4)
             if token_overlap:
                 why.append(f'+tokens({token_overlap})')
@@ -865,7 +1025,10 @@ class EPGDatabase:
                     'ts_offset': epg_ts if families_align else 0
                 }
 
-        return list(candidates.values()), playlist_region
+        out = list(candidates.values())
+        if MATCH_DEBUG and DEBUG:
+            _logger.debug("MATCH TRACE for '%s' (tvg-id=%s tvg-name=%s): kept=%d", _safe(name, 120), tvg_id, _safe(tvg_name, 120), len(out))
+        return out, playlist_region
 
     def _utcnow(self):
         try:
@@ -874,88 +1037,107 @@ class EPGDatabase:
             return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
 
     def get_now_next(self, channel: Dict[str, str]) -> Optional[tuple]:
-        matches, playlist_region = self.get_matching_channel_ids(channel)
+        matches, _playlist_region = self.get_matching_channel_ids(channel)
         if not matches:
+            if DEBUG:
+                _logger.debug("NOW/NEXT: no candidates for '%s' (tvg-id=%s tvg-name=%s)",
+                              _safe(channel.get('name')), _safe(channel.get('tvg-id')), _safe(channel.get('tvg-name')))
             return None
+
+        # Sort by score
         matches = sorted(matches, key=lambda m: -m.get('score', 0))
+
+        # Probe schedule availability for top-N only and reorder with those first
+        try:
+            avail = []
+            for m in matches[:20]:
+                ch_id = m['id']
+                has_any = self._has_any_schedule_from_now(ch_id)
+                avail.append((m, has_any))
+                if DEBUG:
+                    _logger.debug("MATCH CAND ch_id=%s score=%s grp=%s why=%s has_schedule_from_now=%s",
+                                  ch_id, m.get('score'), m.get('group_tag'), _safe(m.get('why'), 300), has_any)
+            matches = [m for m, ok in avail if ok] + [m for m, ok in avail if not ok] + matches[20:]
+        except Exception:
+            pass
 
         c = self.conn.cursor()
         now = self._utcnow()
         now_str = now.strftime("%Y%m%d%H%M%S")
+        now_int = int(now_str)
 
-        current_shows = []
-        next_shows = []
+        current_shows = []  # list of (start_int, payload)
+        next_shows = []     # list of (start_int, payload)
 
-        for match in matches[:12]:
-            ch_id = match['id']
-            grp = match['group_tag']
-            ts_offset = int(match.get('ts_offset', 0))
-            group_priority = bool(playlist_region and grp and playlist_region == grp)
+        GRACE_SECONDS = 120
 
-            query_now = now - datetime.timedelta(hours=ts_offset) if ts_offset > 0 else now
-            qnow_str = query_now.strftime("%Y%m%d%H%M%S")
+        for m in matches[:30]:
+            ch_id = m['id']
+            ts_offset = m.get('ts_offset') or 0
+            if ts_offset:
+                try:
+                    now_adj_dt = now + datetime.timedelta(hours=ts_offset)
+                except Exception:
+                    now_adj_dt = now
+            else:
+                now_adj_dt = now
+            now_adj = now_adj_dt.strftime("%Y%m%d%H%M%S")
+            now_adj_int = int(now_adj)
 
-            row = c.execute(
-                "SELECT title, start, end FROM programmes WHERE channel_id = ? AND start <= ? AND end > ? ORDER BY start DESC LIMIT 1",
-                (ch_id, qnow_str, qnow_str)).fetchone()
-            if row:
-                title, start, end = row
-                st_dt = datetime.datetime.strptime(start, "%Y%m%d%H%M%S")
-                en_dt = datetime.datetime.strptime(end, "%Y%m%d%H%M%S")
-                if ts_offset > 0:
-                    st_dt += datetime.timedelta(hours=ts_offset)
-                    en_dt += datetime.timedelta(hours=ts_offset)
-                current_shows.append({
-                    "title": title,
-                    "start": st_dt,
-                    "end": en_dt,
-                    "channel_id": ch_id,
-                    "group_tag": grp,
-                    "group_priority": group_priority,
-                    "score": match.get("score", 0)
-                })
+            rows = c.execute(
+                "SELECT title, start, end FROM programmes WHERE channel_id = ? AND end > ? ORDER BY start ASC LIMIT 6",
+                (ch_id, now_adj)
+            ).fetchall()
+            for title, start, end in rows:
+                st_i = int(start); en_i = int(end)
+                # Current if st <= now <= en, OR if within small grace after start
+                if st_i <= now_adj_int <= en_i or (st_i - GRACE_SECONDS) <= now_adj_int <= en_i:
+                    current_shows.append((st_i, {
+                        'channel_id': ch_id,
+                        'title': title,
+                        'start': datetime.datetime.strptime(start, "%Y%m%d%H%M%S"),
+                        'end': datetime.datetime.strptime(end, "%Y%m%d%H%M%S")
+                    }))
+                elif st_i > now_adj_int:
+                    next_shows.append((st_i, {
+                        'channel_id': ch_id,
+                        'title': title,
+                        'start': datetime.datetime.strptime(start, "%Y%m%d%H%M%S"),
+                        'end': datetime.datetime.strptime(end, "%Y%m%d%H%M%S")
+                    }))
 
-            row2 = c.execute(
-                "SELECT title, start, end FROM programmes WHERE channel_id = ? AND start > ? ORDER BY start ASC LIMIT 1",
-                (ch_id, qnow_str)).fetchone()
-            if row2:
-                title2, start2, end2 = row2
-                st2_dt = datetime.datetime.strptime(start2, "%Y%m%d%H%M%S")
-                en2_dt = datetime.datetime.strptime(end2, "%Y%m%d%H%M%S")
-                if ts_offset > 0:
-                    st2_dt += datetime.timedelta(hours=ts_offset)
-                    en2_dt += datetime.timedelta(hours=ts_offset)
-                next_shows.append({
-                    "title": title2,
-                    "start": st2_dt,
-                    "end": en2_dt,
-                    "channel_id": ch_id,
-                    "group_tag": grp,
-                    "group_priority": group_priority,
-                    "score": match.get("score", 0)
-                })
+        now_show = min(current_shows, key=lambda x: x[0])[1] if current_shows else None
 
-        def pick_best(showlist, is_now):
-            if not showlist:
-                return None
-            key_fn = (lambda s: (not s["group_priority"], -s["score"], s["end"])) if is_now else (lambda s: (not s["group_priority"], -s["score"], s["start"]))
-            return sorted(showlist, key=key_fn)[0]
+        if next_shows:
+            score_map = {m['id']: m.get('score', 0) for m in matches}
+            next_shows.sort(key=lambda x: (-score_map.get(x[1]['channel_id'], 0), x[0]))
+            next_show = next_shows[0][1]
+        else:
+            next_show = None
 
-        now_show = pick_best(current_shows, True)
-        next_show = pick_best(next_shows, False)
-        return (now_show, next_show)
+        if DEBUG:
+            _logger.debug("NOW/NEXT result for '%s' -> now=%s (ch=%s) next=%s (ch=%s)",
+                          _safe(channel.get('name')),
+                          _safe(now_show['title'] if now_show else None),
+                          now_show['channel_id'] if now_show else None,
+                          _safe(next_show['title'] if next_show else None),
+                          next_show['channel_id'] if next_show else None)
 
-    def get_channels_with_show(self, filter_text: str, max_results: int = 100):
-        now = self._utcnow().strftime("%Y%m%d%H%M%S")
+        return now_show, next_show
+    
+    def get_channels_with_show(self, query: str) -> List[Dict[str, str]]:
+        q = "%" + canonicalize_name(strip_noise_words(query)) + "%"
         c = self.conn.cursor()
+        now = self._utcnow().strftime("%Y%m%d%H%M%S")
         rows = c.execute("""
-            SELECT p.channel_id, p.title, p.start, p.end, ch.display_name
+            SELECT p.channel_id, p.title, p.start, p.end, c.display_name
             FROM programmes p
-            JOIN channels ch ON p.channel_id = ch.id
-            WHERE LOWER(p.title) LIKE ? AND p.end >= ?
+            JOIN channels c ON c.id = p.channel_id
+            WHERE (LOWER(c.norm_name) LIKE LOWER(?) OR LOWER(p.title) LIKE LOWER(?))
+              AND p.end >= ?
             ORDER BY p.start ASC
-            LIMIT ?
-        """, (f"%{filter_text.lower()}%", now, max_results*4)).fetchall()
+            LIMIT 200
+        """, (q, q, now)).fetchall()
         result = []
         for channel_id, show_title, start, end, channel_name in rows:
             result.append({
@@ -973,96 +1155,203 @@ class EPGDatabase:
         for r in on_now + future:
             key = (r["channel_id"], r["show_title"])
             if key not in added:
-                final.append(r)
                 added.add(key)
-            if len(final) >= max_results:
-                break
+                final.append(r)
         return final
 
-    def close(self):
-        self.conn.close()
-
+    # =========================
+    # Streaming importer with detailed debug
+    # =========================
     def import_epg_xml(self, xml_sources: List[str], progress_callback=None):
-        thread_db = EPGDatabase(self.db_path, for_threading=True)
-        total = len(xml_sources)
-        for idx, src in enumerate(xml_sources):
+        """
+        Streaming import of XMLTV EPG sources with detailed debug.
+        - Streams .xml and .xml.gz without loading all into RAM.
+        - Logs response headers, parse progress, commit checkpoints, and memory use.
+        - Logs a few sample programme timestamps (OK and FAIL) per source.
+        - Parser errors never abort a source; they get logged and skipped.
+        - Uses WAL and import PRAGMAs to keep readers snappy during import.
+        """
+        tracemalloc.start()
+
+        # Make sure PRAGMAs are in the right mode for import
+        for p in PRAGMA_IMPORT:
             try:
-                if src.startswith("http"):
-                    req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req, timeout=60) as resp:
-                        if src.endswith(".gz"):
-                            with gzip.GzipFile(fileobj=io.BytesIO(resp.read())) as gz:
-                                content = gz.read().decode("utf-8", "ignore")
+                self.conn.execute(p)
+            except Exception:
+                pass
+
+        total = len(xml_sources)
+        BATCH = 5000  # commit every N programme rows
+        SAMPLE_OK_MAX = 8
+        SAMPLE_FAIL_MAX = 8
+        grand_prog = 0
+        grand_chan = 0
+
+        def _open_source(src):
+            if src.startswith(("http://", "https://")):
+                req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
+                resp = urllib.request.urlopen(req, timeout=300)
+                hdrs = dict(resp.headers.items()) if getattr(resp, "headers", None) else {}
+                clen = hdrs.get("Content-Length") or hdrs.get("content-length")
+                ce = (hdrs.get("Content-Encoding") or "").lower()
+                ct = (hdrs.get("Content-Type") or "").lower()
+                gz = src.lower().endswith(".gz") or "gzip" in ce or "gzip" in ct
+                _logger.debug("HTTP GET %s | status=%s len=%s enc=%s type=%s gz=%s mem=%sMB",
+                              src, getattr(resp, "status", "?"), clen, ce, ct, gz, _mem_mb())
+                if gz:
+                    return gzip.GzipFile(fileobj=resp), True, clen, hdrs
+                return resp, False, clen, hdrs
+            else:
+                f = open(src, "rb")
+                gz = src.lower().endswith(".gz")
+                _logger.debug("OPEN FILE %s | gz=%s size=%s bytes mem=%sMB",
+                              src, gz, os.path.getsize(src) if os.path.exists(src) else "?", _mem_mb())
+                if gz:
+                    return gzip.GzipFile(fileobj=f), True, None, {}
+                return f, False, None, {}
+
+        for idx, src in enumerate(xml_sources):
+            t0 = time.time()
+            chan_count = 0
+            prog_count = 0
+            inserted_since_commit = 0
+            sample_ok = 0
+            sample_fail = 0
+            fobj = None
+            try:
+                fobj, is_gz, clen, hdrs = _open_source(src)
+                _logger.debug("EPG START src=%s gz=%s total_sources=%d", src, is_gz, total)
+
+                # Use an explicit immediate txn for faster inserts
+                try:
+                    self.conn.execute("BEGIN IMMEDIATE")
+                except Exception:
+                    pass
+
+                context = ET.iterparse(fobj, events=("end",))
+                for event, elem in context:
+                    tag = elem.tag.lower().split('}', 1)[-1]
+                    if tag == "channel":
+                        ch_id = elem.get("id") or ""
+                        dn = elem.find(".//display-name")
+                        disp = (dn.text or "").strip() if dn is not None and dn.text else ""
+                        if ch_id or disp:
+                            self.insert_channel(ch_id, disp)
+                            chan_count += 1
+                        elem.clear()
+                    elif tag == "programme":
+                        ch_id = elem.get("channel") or ""
+                        title_elem = elem.find(".//title")
+                        title_txt = (title_elem.text or "").strip() if title_elem is not None else ""
+                        st_raw = elem.get("start") or ""
+                        # XMLTV spec uses 'stop'. Some feeds (rare) use 'end'. Support both.
+                        en_raw = elem.get("stop") or elem.get("end") or ""
+
+                        # Parse start/end; if end missing, try <length> or <duration>
+                        try:
+                            st_utc = _parse_xmltv_to_utc_str(st_raw)
+                        except Exception as e:
+                            st_utc = None
+                            if DEBUG and sample_fail < SAMPLE_FAIL_MAX:
+                                _logger.debug("EPG PARSE EXC src=%s field=start raw=%s err=%s", src, _safe(st_raw), e); sample_fail += 1
+
+                        try:
+                            en_utc = _parse_xmltv_to_utc_str(en_raw) if en_raw else None
+                        except Exception as e:
+                            en_utc = None
+                            if DEBUG and sample_fail < SAMPLE_FAIL_MAX:
+                                _logger.debug("EPG PARSE EXC src=%s field=end/stop raw=%s err=%s", src, _safe(en_raw), e); sample_fail += 1
+
+                        if not en_utc and st_utc:
+                            en_utc = _calc_end_from_length_or_duration(st_utc, elem)
+
+                        if st_utc and en_utc and ch_id:
+                            if DEBUG and sample_ok < SAMPLE_OK_MAX:
+                                _logger.debug("EPG SAMPLE OK src=%s channel=%s start_raw=%s end_raw=%s start_utc=%s end_utc=%s", src, _safe(ch_id), _safe(st_raw), _safe(en_raw), st_utc, en_utc); sample_ok += 1
+                            self.insert_programme(ch_id, title_txt, st_utc, en_utc)
+                            prog_count += 1
+                            inserted_since_commit += 1
+                            if inserted_since_commit >= BATCH:
+                                self.commit()
+                                current, peak = tracemalloc.get_traced_memory()
+                                _logger.debug("EPG COMMIT src=%s programmes+%d total_prog=%d mem=%sMB tracemalloc=%sKB peak=%sKB",
+                                              src, inserted_since_commit, prog_count, _mem_mb(), int(current/1024), int(peak/1024))
+                                inserted_since_commit = 0
                         else:
-                            content = resp.read().decode("utf-8", "ignore")
-                else:
-                    if src.endswith(".gz"):
-                        with gzip.open(src, "rt", encoding="utf-8", errors="ignore") as f:
-                            content = f.read()
-                    else:
-                        with open(src, "r", encoding="utf-8", errors="ignore") as f:
-                            content = f.read()
-                # Parse
-                root = ET.fromstring(content)
-                for ch in root.findall("./channel"):
-                    ch_id = ch.get("id") or ""
-                    disp = ""
-                    dn = ch.find("display-name")
-                    if dn is not None:
-                        disp = (dn.text or "").strip()
-                    thread_db.insert_channel(ch_id, disp)
-                for prg in root.findall("./programme"):
-                    ch_id = prg.get("channel") or ""
-                    title = prg.find("title")
-                    title_txt = (title.text or "").strip() if title is not None else ""
-                    start = prg.get("start") or ""
-                    end = prg.get("end") or ""
-                    st_utc = _parse_xmltv_to_utc_str(start)
-                    en_utc = _parse_xmltv_to_utc_str(end)
-                    if st_utc and en_utc:
-                        thread_db.insert_programme(ch_id, title_txt, st_utc, en_utc)
-                root.clear()
+                            if DEBUG and sample_fail < SAMPLE_FAIL_MAX:
+                                _logger.debug("EPG SAMPLE FAIL src=%s channel=%s start_raw=%s end_raw=%s", src, _safe(ch_id), _safe(st_raw), _safe(en_raw)); sample_fail += 1
+                        elem.clear()
+
+                self.commit()
+                # Checkpoint WAL so readers don't see a huge -wal file
+                try:
+                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                except Exception:
+                    pass
+
+                current, peak = tracemalloc.get_traced_memory()
+                _logger.debug("EPG DONE src=%s channels=%d programmes=%d elapsed=%.1fs mem=%sMB tracemalloc=%sKB peak=%sKB",
+                              src, chan_count, prog_count, time.time() - t0, _mem_mb(), int(current/1024), int(peak/1024))
+
             except Exception as e:
+                _logger.exception("EPG ERROR src=%s : %s", src, e)
                 try:
                     wx.LogError(f"Failed to import EPG source {src}: {e}")
                 except Exception:
                     pass
-            if progress_callback:
+            finally:
                 try:
-                    progress_callback(idx+1, total)
+                    if fobj and hasattr(fobj, 'close'):
+                        fobj.close()
                 except Exception:
                     pass
-        thread_db.commit()
-        thread_db.close()
 
-def _derive_playlist_region(channel: Dict[str, str]) -> str:
-    # Try tvg-id, name, and group fields
-    for field in ("tvg-id", "name", "group"):
-        val = (channel.get(field) or "").strip().lower()
-        if not val:
-            continue
-        parts = re.split(r'[.\-_:|/()\[\]\s]+', val)
-        for tok in parts:
-            code = _norm_country(tok)
-            if code:
-                return code
-    return ''
+            grand_chan += chan_count
+            grand_prog += prog_count
+            if progress_callback:
+                try:
+                    progress_callback(idx + 1, total)
+                except Exception:
+                    pass
+
+        try:
+            self.prune_old_programmes(days=14)
+        except Exception as e:
+            _logger.warning("EPG prune_old_programmes failed: %s", e)
+
+        # Final commit and summary
+        self.commit()
+        current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        try:
+            c = self.conn.cursor()
+            row_c = c.execute("SELECT COUNT(*) FROM channels").fetchone()
+            row_p = c.execute("SELECT COUNT(*) FROM programmes").fetchone()
+            _logger.info("EPG SUMMARY total_channels_added=%d total_programmes_added=%d db_channels=%s db_programmes=%s mem=%sMB peak_tracemalloc=%sKB",
+                         grand_chan, grand_prog, row_c[0] if row_c else "?", row_p[0] if row_p else "?", _mem_mb(), int(peak/1024))
+        except Exception as e:
+            _logger.debug("EPG SUMMARY failed to query DB counts: %s", e)
+
+# =========================
+# EPG Import/Manager UI
+# =========================
 
 class EPGImportDialog(wx.Dialog):
-    def __init__(self, parent, total_sources: int):
-        super().__init__(parent, title="Importing EPG…", size=(400, 120))
-        self.total = total_sources
-        self.current = 0
+    def __init__(self, parent, total_sources):
+        super().__init__(parent, title="Importing EPG", size=(400, 150))
+        self.total_sources = total_sources
         self._build_ui()
         self.CenterOnParent()
         self.Layout()
 
     def _build_ui(self):
-        p = wx.Panel(self)
-        s = wx.BoxSizer(wx.VERTICAL)
-        self.gauge = wx.Gauge(p, range=max(1, self.total))
-        s.Add(self.gauge, 1, wx.EXPAND | wx.ALL, 10)
-        p.SetSizer(s)
+        panel = wx.Panel(self)
+        vbox = wx.BoxSizer(wx.VERTICAL)
+        self.label = wx.StaticText(panel, label="Importing EPG data…")
+        self.gauge = wx.Gauge(panel, range=max(1, self.total_sources))
+        vbox.Add(self.label, 0, wx.ALL, 8)
+        vbox.Add(self.gauge, 0, wx.EXPAND | wx.ALL, 8)
+        panel.SetSizer(vbox)
 
     def set_progress(self, value, total):
         try:
@@ -1188,3 +1477,21 @@ class PlaylistManagerDialog(wx.Dialog):
 
     def GetSources(self):
         return self.playlist_sources
+
+# =========================
+# Helpers for region + playlist
+# =========================
+
+def _derive_playlist_region(channel: Dict[str, str]) -> str:
+    # Try group/title and tvg fields first
+    g = channel.get("group") or ""
+    for tok in re.findall(r'\b[a-z]{2,3}\b', g.lower()):
+        if tok in group_synonyms():
+            return tok
+    # tvg-id suffixes sometimes carry region
+    tid = (channel.get("tvg-id") or "").lower()
+    for tok in re.findall(r'[.\-_:|/]([a-z]{2,3})', tid):
+        if tok in group_synonyms():
+            return tok
+    # fallback: guess from display name
+    return extract_group(channel.get("name",""))

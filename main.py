@@ -157,6 +157,10 @@ class IPTVClient(wx.Frame):
     ]
     PLAYER_MENU_ATTRS = dict(PLAYER_KEYS)
 
+    # cache freshness policy
+    _CACHE_SHOW_STALE_SECS = 600   # show stale up to 10 minutes
+    _CACHE_REFRESH_AFTER_SECS = 30 # trigger background refresh if older than 30s
+
     def __init__(self):
         super().__init__(None, title="Accessible IPTV Client", size=(800, 600))
         self.config = load_config()
@@ -175,6 +179,9 @@ class IPTVClient(wx.Frame):
         self.minimize_to_tray = bool(self.config.get("minimize_to_tray", False))
         self.tray_icon = None
 
+        # Make the DB non-blocking for reads before we start anything else
+        self._ensure_db_tuned()
+
         self._build_ui()
         self.Centre()
         self.reload_all_sources_initial()
@@ -184,6 +191,36 @@ class IPTVClient(wx.Frame):
         self.start_refresh_timer()
         self.Bind(wx.EVT_ICONIZE, self.on_minimize)
         self.Bind(wx.EVT_CLOSE, self.on_close)
+
+    def _ensure_db_tuned(self):
+        """Enable WAL and indices so read lookups don’t stall behind imports."""
+        try:
+            path = get_db_path()
+            # open a config connection and tune the file. The settings persist for the DB file.
+            uri = f"file:{path}?cache=shared"
+            conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+            cur = conn.cursor()
+            cur.execute("PRAGMA journal_mode=WAL;")
+            cur.execute("PRAGMA synchronous=NORMAL;")
+            cur.execute("PRAGMA temp_store=MEMORY;")
+            # 256MB mmap; harmless if OS ignores
+            cur.execute("PRAGMA mmap_size=268435456;")
+            # ~64MB page cache
+            cur.execute("PRAGMA cache_size=-65536;")
+            # reduce frequent checkpoints while importing big XML; readers are fine in WAL
+            cur.execute("PRAGMA wal_autocheckpoint=0;")
+            # helpful indexes (no-op if already exist)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_programmes_channel_end ON programmes(channel_id, end);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_programmes_channel_start ON programmes(channel_id, start);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_programmes_channel_start_end ON programmes(channel_id, start, end);")
+            conn.commit()
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _sync_player_menu_from_config(self):
         defplayer = self.config.get("media_player", "VLC")
@@ -570,8 +607,22 @@ class IPTVClient(wx.Frame):
         def epg_search(token):
             try:
                 db = EPGDatabase(get_db_path(), readonly=True)
+                # avoid read stalls
+                try:
+                    if hasattr(db, "conn"):
+                        db.conn.execute("PRAGMA busy_timeout=2000;")
+                        db.conn.execute("PRAGMA read_uncommitted=1;")
+                except Exception:
+                    pass
                 results = db.get_channels_with_show(txt)
-                db.close()
+                # safe close
+                try:
+                    if hasattr(db, "close"):
+                        db.close()
+                    elif hasattr(db, "conn"):
+                        db.conn.close()
+                except Exception:
+                    pass
             except Exception:
                 results = []
             def update_ui():
@@ -608,11 +659,21 @@ class IPTVClient(wx.Frame):
                 cname = canonicalize_name(item["data"].get("name", ""))
                 with self.epg_cache_lock:
                     cached = self.epg_cache.get(cname)
-                if cached and (datetime.datetime.now() - cached[2]).total_seconds() < 60:
-                    self.epg_display.SetValue(self._epg_msg_from_tuple(cached[0], cached[1]))
-                else:
-                    self.epg_display.SetValue("Loading program info…")
-                    threading.Thread(target=self._fetch_and_cache_epg, args=(item["data"], cname), daemon=True).start()
+
+                # show stale immediately if we have anything recent-ish
+                if cached:
+                    age = (datetime.datetime.now() - cached[2]).total_seconds()
+                    if age <= self._CACHE_SHOW_STALE_SECS:
+                        self.epg_display.SetValue(self._epg_msg_from_tuple(cached[0], cached[1]))
+                        # revalidate if older than refresh threshold
+                        if age > self._CACHE_REFRESH_AFTER_SECS:
+                            threading.Thread(target=self._fetch_and_cache_epg, args=(item["data"], cname), daemon=True).start()
+                        return
+
+                # no cache or too old — fetch
+                self.epg_display.SetValue("Loading program info…")
+                threading.Thread(target=self._fetch_and_cache_epg, args=(item["data"], cname), daemon=True).start()
+
             elif item["type"] == "epg":
                 self.url_display.SetValue("")
                 r = item["data"]
@@ -638,6 +699,8 @@ class IPTVClient(wx.Frame):
         msg = ""
         if now:
             msg += f"Now: {now['title']} ({localfmt(now['start'])} – {localfmt(now['end'])})"
+        elif nxt:
+            msg += f"Starts at {localfmt(nxt['start'])}: {nxt['title']}"
         else:
             msg += "No program currently airing."
         if nxt:
@@ -648,8 +711,22 @@ class IPTVClient(wx.Frame):
         # Ensure we don't block while import is running; but still try reading latest data
         try:
             db = EPGDatabase(get_db_path(), readonly=True)
+            # make read resilient during writer activity
+            try:
+                if hasattr(db, "conn"):
+                    db.conn.execute("PRAGMA busy_timeout=2000;")
+                    db.conn.execute("PRAGMA read_uncommitted=1;")
+            except Exception:
+                pass
             now_next = db.get_now_next(channel)
-            db.close()
+            # safe close
+            try:
+                if hasattr(db, "close"):
+                    db.close()
+                elif hasattr(db, "conn"):
+                    db.conn.close()
+            except Exception:
+                pass
         except Exception:
             now_next = None
         if not now_next:
@@ -672,6 +749,11 @@ class IPTVClient(wx.Frame):
         if 0 <= i < len(self.displayed):
             item = self.displayed[i]
             if item["type"] == "channel" and canonicalize_name(item["data"].get("name", "")) == canonicalize_name(channel.get("name", "")):
+                # visible debug so you know it actually updated
+                try:
+                    print("[DEBUG] EPG UI update for:", item["data"].get("name", ""))
+                except Exception:
+                    pass
                 self.epg_display.SetValue(self._epg_msg_from_tuple(now_show, next_show))
 
     def _spawn_windows(self, exe_path, url):
@@ -823,76 +905,6 @@ class IPTVClient(wx.Frame):
             "Celluloid": "celluloid",
         }
 
-        if player == "Custom":
-            exe = custom_path
-            if not exe:
-                wx.MessageBox("No custom player set.", "Error", wx.OK | wx.ICON_ERROR)
-                return
-            if sys.platform.startswith("win"):
-                if not os.path.exists(exe):
-                    wx.MessageBox("Custom player path does not exist.", "Error", wx.OK | wx.ICON_ERROR)
-                    return
-                ok, err = self._spawn_windows(exe, url)
-            else:
-                found = exe if os.path.isabs(exe) else shutil.which(exe) or exe
-                ok, err = self._spawn_posix(found, url)
-            if not ok:
-                wx.MessageBox(f"Failed to start custom player: {err}", "Error", wx.OK | wx.ICON_ERROR)
-            return
-
-        if sys.platform.startswith("win"):
-            exe_list = win_paths.get(player, [])
-            found = ""
-            for p in exe_list:
-                if "*" in p:
-                    try:
-                        import glob
-                        matches = glob.glob(p)
-                        if matches:
-                            for match in matches:
-                                smplayer_exe = os.path.join(match, "smplayer.exe")
-                                if os.path.exists(smplayer_exe):
-                                    found = smplayer_exe
-                                    break
-                                am = os.path.join(match, "AppleMusic.exe")
-                                if os.path.exists(am):
-                                    found = am
-                                    break
-                            if found:
-                                break
-                    except Exception:
-                        continue
-                if os.path.exists(p):
-                    found = p
-                    break
-            if found:
-                ok, err = self._spawn_windows(found, url)
-                if not ok:
-                    wx.MessageBox(f"Failed to start {player}: {err}", "Error", wx.OK | wx.ICON_ERROR)
-                return
-            wx.MessageBox(f"{player} not found.", "Error",
-                          wx.OK | wx.ICON_ERROR)
-        elif sys.platform == "darwin":
-            plist = mac_paths.get(player, [])
-            for path in plist:
-                if os.path.exists(path):
-                    ok, err = self._spawn_posix(path, url)
-                    if not ok:
-                        wx.MessageBox(f"Failed to start {player}: {err}", "Error", wx.OK | wx.ICON_ERROR)
-                    return
-            wx.MessageBox(f"{player} not found in /Applications.", "Error",
-                          wx.OK | wx.ICON_ERROR)
-        else:
-            exe = linux_players.get(player, player.lower())
-            found = shutil.which(exe)
-            if found:
-                ok, err = self._spawn_posix(found, url)
-                if not ok:
-                    wx.MessageBox(f"Failed to start {player}: {err}", "Error", wx.OK | wx.ICON_ERROR)
-                return
-            wx.MessageBox(f"{player} not found in PATH.", "Error",
-                          wx.OK | wx.ICON_ERROR)
-
     def _refresh_group_ui(self):
         self.group_list.Clear()
         self.channel_list.Clear()
@@ -917,6 +929,14 @@ class IPTVClient(wx.Frame):
             try:
                 db = EPGDatabase(get_db_path(), for_threading=True)
                 db.import_epg_xml(sources)
+                # safe close
+                try:
+                    if hasattr(db, "close"):
+                        db.close()
+                    elif hasattr(db, "conn"):
+                        db.conn.close()
+                except Exception:
+                    pass
             except Exception:
                 pass
             finally:
@@ -968,6 +988,14 @@ class IPTVClient(wx.Frame):
                     wx.CallAfter(dlg.set_progress, value, total)
                 db = EPGDatabase(get_db_path(), for_threading=True)
                 db.import_epg_xml(sources, progress_callback)
+                # safe close
+                try:
+                    if hasattr(db, "close"):
+                        db.close()
+                    elif hasattr(db, "conn"):
+                        db.conn.close()
+                except Exception:
+                    pass
                 wx.CallAfter(dlg.Destroy)
                 wx.CallAfter(self.finish_import)
             except Exception as e:
