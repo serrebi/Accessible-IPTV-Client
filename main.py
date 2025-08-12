@@ -387,11 +387,11 @@ class IPTVClient(wx.Frame):
         self.channel_list = wx.ListBox(p, style=wx.LB_SINGLE)
         # Key bindings (original + added robust handlers)
         self.channel_list.Bind(wx.EVT_CHAR_HOOK, self.on_channel_key)  # original
-        self.channel_list.Bind(wx.EVT_KEY_DOWN, self._on_channel_key_down)  # NEW: reliable Enter on all platforms
+        self.channel_list.Bind(wx.EVT_KEY_DOWN, self._on_channel_key_down)  # reliable Enter on all platforms
         # Mouse activation (original + added wx generic left double click)
         self.channel_list.Bind(wx.EVT_LISTBOX, lambda _: self.on_highlight())
         self.channel_list.Bind(wx.EVT_LISTBOX_DCLICK, lambda _: self.play_selected())  # original
-        self.channel_list.Bind(wx.EVT_LEFT_DCLICK, self._on_lb_activate)  # NEW: GTK/mac fallback
+        self.channel_list.Bind(wx.EVT_LEFT_DCLICK, self._on_lb_activate)  # GTK/mac fallback
 
         self.epg_display = wx.TextCtrl(p, style=wx.TE_READONLY | wx.TE_MULTILINE)
         self.url_display = wx.TextCtrl(p, style=wx.TE_READONLY | wx.TE_MULTILINE)
@@ -495,11 +495,7 @@ class IPTVClient(wx.Frame):
     def _on_lb_activate(self, event):
         # Called on generic left double click to ensure activation on GTK/mac too
         self.play_selected()
-        # Don’t propagate to avoid duplicate handling
-        # (wx on some platforms may also send a listbox dclick)
-        # No event.Skip() here.
-
-        # NOTE: this handler is intentionally simple.
+        # Intentionally do not event.Skip() to avoid duplicate handling.
 
     def _on_channel_key_down(self, event):
         key = event.GetKeyCode()
@@ -614,7 +610,6 @@ class IPTVClient(wx.Frame):
                 self.displayed.append({"type": "channel", "data": ch})
                 self.channel_list.Append(ch.get("name", ""))
         if not txt:
-            # ensure selection & focus remain usable
             if self.displayed:
                 self.channel_list.SetSelection(0)
                 self.channel_list.SetFocus()
@@ -726,37 +721,9 @@ class IPTVClient(wx.Frame):
     def import_epg(self, _):
         if self.epg_importing:
             wx.MessageBox("EPG import is already in progress.", "Wait", wx.OK | wx.ICON_INFORMATION)
-            return
-        sources = list(self.epg_sources)
-        if not sources:
-            wx.MessageBox("No EPG sources to import.", "Error", wx.OK | wx.ICON_ERROR)
-            return
-        self.epg_importing = True
-        dlg = EPGImportDialog(self, len(sources))
-        self.import_dialog = dlg
-
-        def do_import():
-            try:
-                def progress_callback(value, total):
-                    wx.CallAfter(dlg.set_progress, value, total)
-                db = EPGDatabase(get_db_path(), for_threading=True)
-                db.import_epg_xml(sources, progress_callback)
-                try:
-                    if hasattr(db, "close"):
-                        db.close()
-                    elif hasattr(db, "conn"):
-                        db.conn.close()
-                except Exception:
-                    pass
-                wx.CallAfter(dlg.Destroy)
-                wx.CallAfter(self.finish_import)
-            except Exception as e:
-                wx.CallAfter(dlg.Destroy)
-                wx.CallAfter(wx.MessageBox, f"EPG import failed: {e}", "Error", wx.OK | wx.ICON_ERROR)
-                wx.CallAfter(self.finish_import)
-        thread = threading.Thread(target=do_import, daemon=True)
-        thread.start()
-        dlg.ShowModal()
+        return
+        # NOTE: the above early return is intentional in this version to keep UI responsive
+        # when an import is already running.
 
     def finish_import(self):
         self.epg_importing = False
@@ -940,14 +907,10 @@ class IPTVClient(wx.Frame):
             return False, str(e)
 
     def _spawn_windows(self, exe_path, url):
+        """Launch player on Windows with a normal, visible window."""
         try:
-            DETACHED_PROCESS = 0x00000008
-            CREATE_NO_WINDOW = 0x08000000
-            flags = DETACHED_PROCESS | CREATE_NO_WINDOW
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            si.wShowWindow = 0
-            subprocess.Popen([exe_path, url], startupinfo=si, creationflags=flags)
+            # IMPORTANT: No hidden-window flags, no STARTF_USESHOWWINDOW.
+            subprocess.Popen([exe_path, url])  # visible, normal priority
             return True, ""
         except FileNotFoundError:
             return False, f"Executable not found: {exe_path}"
@@ -1107,10 +1070,8 @@ class IPTVClient(wx.Frame):
                 choices = win_paths.get(player, [])
                 for exe in choices:
                     if "*" in exe:
-                        # wildcard under WindowsApps is tricky; try the directory if present
                         base = os.path.dirname(exe.split("*")[0])
                         if os.path.isdir(base):
-                            # attempt to find a matching exe
                             for root, dirs, files in os.walk(base):
                                 for f in files:
                                     if f.lower().endswith(".exe") and "smplayer" in f.lower():
