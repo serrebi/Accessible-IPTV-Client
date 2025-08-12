@@ -129,7 +129,7 @@ You’ll get the build in `dist\main.exe`.
 
 * Add XMLTV sources (URL or file). `.gz` is fine.
 * The app imports XMLTV on startup and in the background.
-* Data is stored in `epg.sqlite`. Old data is cleaned up.
+* Data is stored in RAM. Old data is cleaned up.
 * Now/Next is matched to channels automatically.
 
 **If your guide shows “No program currently airing”:**
