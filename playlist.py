@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple, Set
 # Debug logging (rotating file) + memory helpers
 # =========================
 
-DEBUG = False if os.getenv("EPG_DEBUG", "1").strip() not in {"0", "false", "False"} else False
+DEBUG = True if os.getenv("EPG_DEBUG", "1").strip() not in {"0", "false", "False"} else False
 LOG_PATH = os.path.join(os.path.dirname(__file__) or ".", "epg_debug.log")
 _logger = logging.getLogger("EPG")
 if not _logger.handlers:
@@ -916,6 +916,9 @@ class EPGDatabase:
         c = self.conn.cursor()
         candidates = self._collect_candidates_by_id_and_name(c, tvg_id, tvg_name, name)
 
+        # Drop exact-id/name candidates from the wrong region; keep only same or unknown region
+        if playlist_region:
+            candidates = {k: v for k, v in candidates.items() if (v.get("group_tag") in ("", playlist_region))}
         # FAST candidate set (no full channels scan)
         rows_all = self._candidate_rows(c, name, tvg_name, playlist_region)
         pl_markets, pl_provinces, _ = _market_tokens_for(playlist_region or "", playlist_brand_family, " ".join([tvg_name, name]))
@@ -1068,9 +1071,9 @@ class EPGDatabase:
 
         current_shows = []  # list of (start_int, payload)
         next_shows = []     # list of (start_int, payload)
+        score_map = {m["id"]: m.get("score", 0) for m in matches}
 
-        GRACE_SECONDS = 120
-
+        # strict interval; no pre-start grace
         for m in matches[:30]:
             ch_id = m['id']
             ts_offset = m.get('ts_offset') or 0
@@ -1091,7 +1094,7 @@ class EPGDatabase:
             for title, start, end in rows:
                 st_i = int(start); en_i = int(end)
                 # Current if st <= now <= en, OR if within small grace after start
-                if st_i <= now_adj_int <= en_i or (st_i - GRACE_SECONDS) <= now_adj_int <= en_i:
+                if st_i <= now_adj_int < en_i:
                     current_shows.append((st_i, {
                         'channel_id': ch_id,
                         'title': title,
@@ -1106,7 +1109,7 @@ class EPGDatabase:
                         'end': datetime.datetime.strptime(end, "%Y%m%d%H%M%S")
                     }))
 
-        now_show = min(current_shows, key=lambda x: x[0])[1] if current_shows else None
+        now_show = None if not current_shows else sorted(current_shows, key=lambda x: (-score_map.get(x[1]["channel_id"], 0), x[0]))[0][1]
 
         if next_shows:
             score_map = {m['id']: m.get('score', 0) for m in matches}
@@ -1148,7 +1151,7 @@ class EPGDatabase:
                 "channel_name": channel_name
             })
         now_int = int(now)
-        on_now = [r for r in result if int(r["start"]) <= now_int <= int(r["end"])]
+        on_now = [r for r in result if int(r["start"]) <= now_int < int(r["end"])]
         future = [r for r in result if int(r["start"]) > now_int]
         final = []
         added = set()
