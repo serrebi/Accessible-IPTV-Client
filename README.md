@@ -1,11 +1,9 @@
 ````markdown
 # Accessible IPTV Client
 
-A keyboard-first IPTV client built with wxPython. I made it for myself. It’s fast, simple, and works with screen readers.
+This is a keyboard-first IPTV client vibe coded with wxPython. I made it for myself. It’s fast, simple, and works with screen readers.
 
-**Platforms:** Windows and Linux (tested).  
-**macOS:** should work, but I didn’t test it.
-
+You deffinitly can run this on Windows, and Linux, but your milage may vary if you want to run it on MacOS. I don't need this on that platform, so I haven't tried it.
 ---
 
 ## What it does
@@ -15,11 +13,9 @@ A keyboard-first IPTV client built with wxPython. I made it for myself. It’s f
 - Lets you add and remove playlists.
 - Groups channels by category.
 - Search box for channels.
-- Full keyboard control. Mouse is optional.
-- Remembers your last playlist and channel.
 - Saves everything to the app’s folder:
   - `iptvclient.conf` for options and playlists.
-  - `epg.sqlite` for the TV guide (XMLTV).
+  - `EPG is stored in ram.
 - Opens streams in your external media player.
 
 ---
@@ -38,7 +34,7 @@ A keyboard-first IPTV client built with wxPython. I made it for myself. It’s f
 
 ### Windows (PowerShell or CMD)
 
-1) Install Python:
+1) Install Python: Either this way, directly from python.org  or through the windows store.
 
 ```bat
 winget install -e --id Python.Python.3.12
@@ -47,8 +43,8 @@ winget install -e --id Python.Python.3.12
 2. Get wxPython:
 
 ```bat
-python -m pip install --upgrade pip
-pip install wxpython
+pip3 install --upgrade pip
+pip3 install wxpython
 ```
 
 3. Run the app from the project folder:
@@ -65,8 +61,8 @@ Debian/Ubuntu:
 sudo apt update
 sudo apt install -y python3 python3-pip
 # Option A: pip (usually fine)
-pip install --upgrade pip
-pip install wxpython
+pip3 install --upgrade pip
+pip3 install wxpython
 # Option B: distro package (alternative)
 sudo apt install -y python3-wxgtk4.0
 python ./main.py
@@ -93,19 +89,80 @@ sudo zypper install -y python3 python3-pip python3-wxPython
 python ./main.py
 ```
 
-### macOS (untested)
 
-```bash
-python3 -m pip install --upgrade pip
-pip install wxpython
-python ./main.py
-```
+
+## How to use it
+
+1. **Run the app.**
+2. **Add a playlist:** Menu → **Playlists** → **Add URL** or **Add File**.
+3. **Pick a channel group** with arrow keys.
+4. **Pick a channel** and press **Enter** to play in your external player.
+5. **Set your player path (once):** **Options → Media Player**.
+6. **EPG (TV guide):** Menu → **EPG** → **Add URL** or **Add File**. XMLTV `.xml` or `.xml.gz` works.
+
+**Navigation (keyboard):**
+
+* **Tab / Shift+Tab:** move between controls
+* **Arrow keys / Page Up / Page Down:** move lists
+* **Enter:** activate / play
+* **Esc:** close dialogs
+* **Alt key:** open menu bar
+
+Everything saves automatically to `iptvclient.conf`. The guide is stored in ram.
 
 ---
 
+## Building a single-file EXE (Windows)
+
+From the project folder:
+
+```bat
+pip install pyinstaller
+pyinstaller --noconsole --onefile main.py
+```
+
+You’ll get the build in `dist\main.exe`.
+
+---
+
+## EPG details (XMLTV)
+
+* Add XMLTV sources (URL or file). `.gz` is fine.
+* The app imports XMLTV on startup and in the background.
+* Data is stored in `epg.sqlite`. Old data is cleaned up.
+* Now/Next is matched to channels automatically.
+
+**If your guide shows “No program currently airing”:**
+
+* Give it a minute after adding a big EPG. It parses in the background.
+
+---
+
+## Tips that actually help
+
+* Install your media player **before** first run so auto-detect can find it.
+* VLC and MPC family handle most formats. MPV and Fauxdacious are very robust too.
+* If a stream fails in one player, try another. The app doesn’t fix bad streams.
+
+
+---
+
+## Known limits
+
+* No DVR. No catchup. I didn’t need them. It's beyond the scope of this app.
+* EPG quality depends on your XMLTV source. Some channels won’t have guide data, and I've tried to work around this, but it might not be perfect..
+* Streams open in external players by design.
+
+---
+
+## License and support
+
+I wrote this for me. Use it if it helps. No formal support.
+Bugs and PRs welcome if you want to help improve it.
+
 ## Install media players (Windows)
 
-Pick what you like. Install as many as you want.
+This is an optional section, I'm including just to be useful. Pick what you like. Install as many as you want.
 
 ```bat
 :: VLC
@@ -149,88 +206,3 @@ sudo pacman -S --noconfirm vlc mpv smplayer kodi
 Set your preferred player in **Options → Media Player** inside the app.
 
 ---
-
-## How to use it
-
-1. **Run the app.**
-2. **Add a playlist:** Menu → **Playlists** → **Add URL** or **Add File**.
-3. **Pick a channel group** with arrow keys.
-4. **Pick a channel** and press **Enter** to play in your external player.
-5. **Set your player path (once):** **Options → Media Player**.
-6. **EPG (TV guide):** Menu → **EPG** → **Add URL** or **Add File**. XMLTV `.xml` or `.xml.gz` works.
-
-**Navigation (keyboard):**
-
-* **Tab / Shift+Tab:** move between controls
-* **Arrow keys / Page Up / Page Down:** move lists
-* **Enter:** activate / play
-* **Esc:** close dialogs
-* **Alt key:** open menu bar
-
-Everything saves automatically to `iptvclient.conf`. The guide is stored in `epg.sqlite`.
-
----
-
-## Building a single-file EXE (Windows)
-
-From the project folder:
-
-```bat
-pip install pyinstaller
-pyinstaller --noconsole --onefile main.py
-```
-
-You’ll get the build in `dist\main.exe`.
-
----
-
-## EPG details (XMLTV)
-
-* Add XMLTV sources (URL or file). `.gz` is fine.
-* The app imports XMLTV on startup and in the background.
-* Data is stored in `epg.sqlite`. Old data is cleaned up.
-* Now/Next is matched to channels automatically.
-
-**If your guide shows “No program currently airing”:**
-
-* Your EPG is empty or out of date. Add a better XMLTV source.
-* The channel name is weird. Try another playlist or name variant.
-* Give it a minute after adding a big EPG. It parses in the background.
-
----
-
-## Tips that actually help
-
-* Install your media player **before** first run so auto-detect can find it.
-* VLC and MPC family handle most formats. MPV is very robust too.
-* If a stream fails in one player, try another. The app doesn’t fix bad streams.
-* Keep your playlists and EPG sources clean. Garbage in, garbage out.
-
----
-
-## Known limits
-
-* No DVR. No catchup. I didn’t need them.
-* EPG quality depends on your XMLTV source. Some channels won’t have guide data.
-* Streams open in external players by design.
-
----
-
-## Problem solving (blunt)
-
-* **Nothing plays:** your player path is wrong, the stream is dead, or your firewall is blocking it.
-* **Guide is blank:** your XMLTV source is bad or stale.
-* **Wrong guide on CW/locals:** your playlist names are messy. Use a source with clear station names/callsigns.
-
----
-
-## License and support
-
-I wrote this for me. Use it if it helps. No formal support.
-Bugs and PRs welcome if you want to improve it.
-
-```
-
-Sources for Winget package IDs and usage: VideoLAN.VLC, MPC-HC (clsid2.mpc-hc), MPC-BE (MPC-BE.MPC-BE), mpv.net (mpv.net), SMPlayer (SMPlayer.SMPlayer), Kodi (XBMCFoundation.Kodi), PotPlayer (Daum.PotPlayer), and Winget docs. :contentReference[oaicite:0]{index=0}
-::contentReference[oaicite:1]{index=1}
-```
