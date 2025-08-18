@@ -28,8 +28,15 @@ Keyboard-first IPTV client built with wxPython. Works with screen readers. Runs 
 
 ## Install
 
-### Windows
-
-1. Install Python:
-   ```bat
-   winget install -e --id Python.Python.3.12
+### Running on windows or Linux:
+Most people can just download release from https://github.com/serrebi/accessible-IPTV-Client/releases
+, but if you want to build your own or fork, install python, and then...
+pip3 install --upgrade pip
+pip3 install wxpython
+Clone this repository, and cd into the directory: make sure you are in the directory of the repo, and then:
+python3 ./main.py
+### Building on windows or Linux:
+Make sure you are in the directory of the repo, then:
+pip install pyinstaller
+pyinstaller --noconsole --onefile main.py
+You will find an executable in the ./dist directory.
