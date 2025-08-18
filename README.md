@@ -28,6 +28,7 @@ Keyboard-first IPTV client VibeCoded with wxPython. Works with screen readers. R
 ## Install
 
 ### Windows
+Install from the releases on this page: Follow onward in this section if you want to build
 1. Install Python:
    ```bat
    winget install -e --id Python.Python.3.12
