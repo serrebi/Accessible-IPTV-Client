@@ -1,5 +1,3 @@
-# playlist.py
-# NOTE: Debug logging is ON by default. Log file: epg_debug.log (same folder as this file).
 import os
 import re
 import io
@@ -14,6 +12,7 @@ import xml.etree.ElementTree as ET
 import datetime
 import logging
 import logging.handlers
+import tempfile
 from typing import Dict, List, Optional, Tuple, Set
 
 # =========================
@@ -21,20 +20,26 @@ from typing import Dict, List, Optional, Tuple, Set
 # =========================
 
 DEBUG = True if os.getenv("EPG_DEBUG", "1").strip() not in {"0", "false", "False"} else False
-LOG_PATH = os.path.join(os.path.dirname(__file__) or ".", "epg_debug.log")
+# FIX: Write log to temp dir to avoid permission errors on startup
+LOG_PATH = os.path.join(tempfile.gettempdir(), "iptvclient_epg_debug.log")
 _logger = logging.getLogger("EPG")
 if not _logger.handlers:
     _logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
     _fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    _fh = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8")
-    _fh.setFormatter(_fmt)
-    _logger.addHandler(_fh)
-    # Also mirror to stderr while debugging (harmless if GUI)
-    if DEBUG:
-        _sh = logging.StreamHandler()
-        _sh.setFormatter(_fmt)
-        _logger.addHandler(_sh)
-_logger.debug("EPG debug logging initialized. File: %s", LOG_PATH)
+    try:
+        _fh = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8")
+        _fh.setFormatter(_fmt)
+        _logger.addHandler(_fh)
+        # Also mirror to stderr while debugging (harmless if GUI)
+        if DEBUG:
+            _sh = logging.StreamHandler()
+            _sh.setFormatter(_fmt)
+            _logger.addHandler(_sh)
+        _logger.debug("EPG debug logging initialized. File: %s", LOG_PATH)
+    except Exception as e:
+        # If logging setup fails, don't crash the app. Print error and continue.
+        print(f"FATAL: Could not initialize logger at {LOG_PATH}. Error: {e}")
+
 
 def _mem_mb() -> int:
     try:
@@ -535,93 +540,37 @@ def _market_tokens_for(country: str, brand: str, text: str) -> Tuple[Set[str], S
 # XMLTV time parsing to UTC (ROBUST & EXCEPTION-SAFE)
 # =========================
 
-# Classic strict XMLTV pattern used as a fallback
-_XMLTV_TS_RX = re.compile(
-    r'^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\s*(Z|[+\-]\d{4}))?$'
-)
+_XMLTV_TS_RX = re.compile(r'^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\s*([+\-]\d{4})?$')
 
 def _parse_xmltv_to_utc_str(s: str) -> Optional[str]:
-    """
-    Robustly parse XMLTV/ISO8601-ish timestamps to UTC "YYYYMMDDHHMMSS".
-    Accepts:
-      - 20250811153000 +0000   (classic XMLTV, seconds required in this variant)
-      - 20250811153000Z
-      - 202508111530 +0000     (seconds optional)
-      - 2025-08-11 15:30:00 +00:00
-      - 2025-08-11T15:30:00Z
-      - 2025-08-11T15:30Z
-      - 2025/08/11 15:30:00 +0000
-    Never raises; returns None if it can’t parse.
-    """
+    if not s:
+        return None
+    s = str(s).strip()
     try:
-        if not s:
-            return None
-        s = str(s).strip()
+        if 'T' in s:
+            if s.endswith('Z'):
+                s = s[:-1] + '+00:00'
+            elif re.search(r'[+\-]\d{4}$', s):
+                s = s[:-2] + ':' + s[-2:]
+            dt = datetime.datetime.fromisoformat(s)
+        else: # Handle formats like "YYYYMMDDHHMMSS +ZZZZ"
+            m = _XMLTV_TS_RX.match(s)
+            if not m: return None
+            dt_str, offset_str = "".join(m.groups()[:6]), m.group(7)
+            dt = datetime.datetime.strptime(dt_str, "%Y%m%d%H%M%S")
+            if offset_str:
+                offset_val = int(offset_str)
+                tz = datetime.timezone(datetime.timedelta(hours=offset_val//100, minutes=offset_val%100))
+                dt = dt.replace(tzinfo=tz)
+            else:
+                 dt = dt.replace(tzinfo=datetime.timezone.utc)
 
-        # Fast ISO-8601 path for strings with '-' or 'T' or ':' or '/'
-        if ('T' in s) or ('-' in s) or (':' in s) or ('/' in s):
-            iso = s.replace('z', 'Z')
-            # Convert trailing Z to explicit +00:00
-            if iso.endswith('Z'):
-                iso = iso[:-1] + '+00:00'
-            # Normalize offsets like +0000 -> +00:00 (handles both with/without colon)
-            iso = re.sub(r'([+\-]\d{2})(\d{2})$', r'\1:\2', iso)
-            try:
-                dt = datetime.datetime.fromisoformat(iso)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=datetime.timezone.utc)
-                return dt.astimezone(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
-            except Exception:
-                # Fall through to regex handling
-                pass
-
-            # Flexible hyphen/colon/slash pattern (seconds optional, offset optional)
-            m = re.match(
-                r'^\s*(?P<Y>\d{4})[.\-\/]?(?P<Mo>\d{2})[.\-\/]?(?P<D>\d{2})[T\s]?'
-                r'(?P<H>\d{2}):?(?P<M>\d{2})(?::?(?P<S>\d{2}))?\s*'
-                r'(?P<OFF>Z|[+\-]\d{2}:?\d{2})?\s*$',
-                s
-            )
-            if m:
-                y = int(m.group('Y')); mo = int(m.group('Mo')); d = int(m.group('D'))
-                hh = int(m.group('H')); mm = int(m.group('M')); ss = int((m.group('S') or '0'))
-                offs = m.group('OFF')
-                dt = datetime.datetime(y, mo, d, hh, mm, ss)
-                if offs:
-                    if offs == 'Z':
-                        # already UTC
-                        pass
-                    else:
-                        offs_clean = offs.replace(':', '')
-                        sign = 1 if offs_clean[0] == '+' else -1
-                        oh = int(offs_clean[1:3]); om = int(offs_clean[3:5])
-                        dt -= datetime.timedelta(hours=sign*oh, minutes=sign*om)
-                # with no offset treat as UTC already
-                return dt.strftime("%Y%m%d%H%M%S")
-
-        # Classic XMLTV: 14 or 12 digits with optional Z or +HHMM
-        m2 = re.match(
-            r'^\s*(?P<Y>\d{4})(?P<Mo>\d{2})(?P<D>\d{2})(?P<H>\d{2})(?P<M>\d{2})(?P<S>\d{2})?\s*(?P<OFF>Z|[+\-]\d{4})?\s*$',
-            s
-        )
-        if m2:
-            y = int(m2.group('Y')); mo = int(m2.group('Mo')); d = int(m2.group('D'))
-            hh = int(m2.group('H')); mm = int(m2.group('M')); ss = int((m2.group('S') or '0'))
-            offs = m2.group('OFF')
-            dt = datetime.datetime(y, mo, d, hh, mm, ss)
-            if offs:
-                if offs == 'Z':
-                    pass
-                else:
-                    sign = 1 if offs[0] == '+' else -1
-                    oh = int(offs[1:3]); om = int(offs[3:5])
-                    dt -= datetime.timedelta(hours=sign*oh, minutes=sign*om)
-            return dt.strftime("%Y%m%d%H%M%S")
-
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
+    except (ValueError, TypeError):
         return None
-    except Exception:
-        # Absolutely no exceptions escape this function
-        return None
+
 
 # ---- duration helpers ----
 
@@ -1166,163 +1115,100 @@ class EPGDatabase:
     # Streaming importer with detailed debug
     # =========================
     def import_epg_xml(self, xml_sources: List[str], progress_callback=None):
-        """
-        Streaming import of XMLTV EPG sources with detailed debug.
-        - Streams .xml and .xml.gz without loading all into RAM.
-        - Logs response headers, parse progress, commit checkpoints, and memory use.
-        - Logs a few sample programme timestamps (OK and FAIL) per source.
-        - Parser errors never abort a source; they get logged and skipped.
-        - Uses WAL and import PRAGMAs to keep readers snappy during import.
-        """
+        if DEBUG and tracemalloc.is_tracing(): tracemalloc.stop()
         tracemalloc.start()
 
-        # Make sure PRAGMAs are in the right mode for import
         for p in PRAGMA_IMPORT:
-            try:
-                self.conn.execute(p)
-            except Exception:
-                pass
+            try: self.conn.execute(p)
+            except Exception: pass
 
         total = len(xml_sources)
-        BATCH = 5000  # commit every N programme rows
-        SAMPLE_OK_MAX = 8
-        SAMPLE_FAIL_MAX = 8
-        grand_prog = 0
-        grand_chan = 0
+        BATCH = 10000
+        grand_prog, grand_chan = 0, 0
 
-        def _open_source(src):
+        def _open_stream(src):
+            _logger.debug("Opening stream: %s", src)
             if src.startswith(("http://", "https://")):
                 req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
                 resp = urllib.request.urlopen(req, timeout=300)
-                hdrs = dict(resp.headers.items()) if getattr(resp, "headers", None) else {}
-                clen = hdrs.get("Content-Length") or hdrs.get("content-length")
-                ce = (hdrs.get("Content-Encoding") or "").lower()
-                ct = (hdrs.get("Content-Type") or "").lower()
-                gz = src.lower().endswith(".gz") or "gzip" in ce or "gzip" in ct
-                _logger.debug("HTTP GET %s | status=%s len=%s enc=%s type=%s gz=%s mem=%sMB",
-                              src, getattr(resp, "status", "?"), clen, ce, ct, gz, _mem_mb())
-                if gz:
-                    return gzip.GzipFile(fileobj=resp), True, clen, hdrs
-                return resp, False, clen, hdrs
-            else:
-                f = open(src, "rb")
-                gz = src.lower().endswith(".gz")
-                _logger.debug("OPEN FILE %s | gz=%s size=%s bytes mem=%sMB",
-                              src, gz, os.path.getsize(src) if os.path.exists(src) else "?", _mem_mb())
-                if gz:
-                    return gzip.GzipFile(fileobj=f), True, None, {}
-                return f, False, None, {}
+                _logger.debug("HTTP GET %s | status=%s mem=%sMB", src, getattr(resp, "status", "?"), _mem_mb())
+                is_gz = resp.info().get('Content-Encoding') == 'gzip' or src.lower().endswith('.gz')
+                return gzip.GzipFile(fileobj=resp) if is_gz else resp
+            else: # Local file
+                is_gz = src.lower().endswith('.gz')
+                return gzip.open(src, 'rb') if is_gz else open(src, 'rb')
 
         for idx, src in enumerate(xml_sources):
             t0 = time.time()
-            chan_count = 0
-            prog_count = 0
-            inserted_since_commit = 0
-            sample_ok = 0
-            sample_fail = 0
-            fobj = None
+            chan_count, prog_count, inserted_since_commit, sample_ok = 0, 0, 0, 0
+            stream = None
             try:
-                fobj, is_gz, clen, hdrs = _open_source(src)
-                _logger.debug("EPG START src=%s gz=%s total_sources=%d", src, is_gz, total)
+                stream = _open_stream(src)
+                parser = ET.XMLPullParser(['end'])
+                _logger.debug("EPG START src=%s (mem=%sMB)", src, _mem_mb())
+                self.conn.execute("BEGIN IMMEDIATE")
 
-                # Use an explicit immediate txn for faster inserts
-                try:
-                    self.conn.execute("BEGIN IMMEDIATE")
-                except Exception:
-                    pass
+                # *** DEFINITIVE MEMORY LEAK FIX ***
+                # Read stream in chunks and feed to the pull parser
+                while True:
+                    chunk = stream.read(65536) # 64KB chunk
+                    if not chunk:
+                        break
+                    parser.feed(chunk)
+                    for _, elem in parser.read_events():
+                        tag = elem.tag.rsplit('}', 1)[-1]
+                        if tag == 'channel':
+                            ch_id = elem.get("id", "")
+                            dn_elem = elem.find("./display-name")
+                            disp = dn_elem.text.strip() if dn_elem is not None and dn_elem.text else ""
+                            if ch_id or disp:
+                                self.insert_channel(ch_id, disp)
+                                chan_count += 1
+                        elif tag == 'programme':
+                            ch_id = elem.get("channel", "")
+                            title_elem = elem.find("./title")
+                            title_txt = title_elem.text.strip() if title_elem is not None and title_elem.text else ""
+                            st_raw = elem.get("start", "")
+                            en_raw = elem.get("stop") or elem.get("end", "")
 
-                context = ET.iterparse(fobj, events=("end",))
-                for event, elem in context:
-                    tag = elem.tag.lower().split('}', 1)[-1]
-                    if tag == "channel":
-                        ch_id = elem.get("id") or ""
-                        dn = elem.find(".//display-name")
-                        disp = (dn.text or "").strip() if dn is not None and dn.text else ""
-                        if ch_id or disp:
-                            self.insert_channel(ch_id, disp)
-                            chan_count += 1
-                        elem.clear()
-                    elif tag == "programme":
-                        ch_id = elem.get("channel") or ""
-                        title_elem = elem.find(".//title")
-                        title_txt = (title_elem.text or "").strip() if title_elem is not None else ""
-                        st_raw = elem.get("start") or ""
-                        # XMLTV spec uses 'stop'. Some feeds (rare) use 'end'. Support both.
-                        en_raw = elem.get("stop") or elem.get("end") or ""
-
-                        # Parse start/end; if end missing, try <length> or <duration>
-                        try:
                             st_utc = _parse_xmltv_to_utc_str(st_raw)
-                        except Exception as e:
-                            st_utc = None
-                            if DEBUG and sample_fail < SAMPLE_FAIL_MAX:
-                                _logger.debug("EPG PARSE EXC src=%s field=start raw=%s err=%s", src, _safe(st_raw), e); sample_fail += 1
-
-                        try:
                             en_utc = _parse_xmltv_to_utc_str(en_raw) if en_raw else None
-                        except Exception as e:
-                            en_utc = None
-                            if DEBUG and sample_fail < SAMPLE_FAIL_MAX:
-                                _logger.debug("EPG PARSE EXC src=%s field=end/stop raw=%s err=%s", src, _safe(en_raw), e); sample_fail += 1
+                            if not en_utc and st_utc:
+                                en_utc = _calc_end_from_length_or_duration(st_utc, elem)
 
-                        if not en_utc and st_utc:
-                            en_utc = _calc_end_from_length_or_duration(st_utc, elem)
-
-                        if st_utc and en_utc and ch_id:
-                            if DEBUG and sample_ok < SAMPLE_OK_MAX:
-                                _logger.debug("EPG SAMPLE OK src=%s channel=%s start_raw=%s end_raw=%s start_utc=%s end_utc=%s", src, _safe(ch_id), _safe(st_raw), _safe(en_raw), st_utc, en_utc); sample_ok += 1
-                            self.insert_programme(ch_id, title_txt, st_utc, en_utc)
-                            prog_count += 1
-                            inserted_since_commit += 1
-                            if inserted_since_commit >= BATCH:
-                                self.commit()
-                                current, peak = tracemalloc.get_traced_memory()
-                                _logger.debug("EPG COMMIT src=%s programmes+%d total_prog=%d mem=%sMB tracemalloc=%sKB peak=%sKB",
-                                              src, inserted_since_commit, prog_count, _mem_mb(), int(current/1024), int(peak/1024))
-                                inserted_since_commit = 0
-                        else:
-                            if DEBUG and sample_fail < SAMPLE_FAIL_MAX:
-                                _logger.debug("EPG SAMPLE FAIL src=%s channel=%s start_raw=%s end_raw=%s", src, _safe(ch_id), _safe(st_raw), _safe(en_raw)); sample_fail += 1
-                        elem.clear()
-
+                            if st_utc and en_utc and ch_id:
+                                if DEBUG and sample_ok < 8:
+                                    _logger.debug("EPG SAMPLE OK src=%s ...", src); sample_ok += 1
+                                self.insert_programme(ch_id, title_txt, st_utc, en_utc)
+                                prog_count += 1
+                                inserted_since_commit += 1
+                                if inserted_since_commit >= BATCH:
+                                    self.commit()
+                                    _logger.debug("EPG COMMIT src=%s progs+%d total=%d mem=%sMB", src, BATCH, prog_count, _mem_mb())
+                                    inserted_since_commit = 0
+                
+                parser.close() # Finalize
                 self.commit()
-                # Checkpoint WAL so readers don't see a huge -wal file
-                try:
-                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                except Exception:
-                    pass
-
-                current, peak = tracemalloc.get_traced_memory()
-                _logger.debug("EPG DONE src=%s channels=%d programmes=%d elapsed=%.1fs mem=%sMB tracemalloc=%sKB peak=%sKB",
-                              src, chan_count, prog_count, time.time() - t0, _mem_mb(), int(current/1024), int(peak/1024))
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                _logger.debug("EPG DONE src=%s channels=%d progs=%d elapsed=%.1fs mem=%sMB",
+                              src, chan_count, prog_count, time.time() - t0, _mem_mb())
 
             except Exception as e:
                 _logger.exception("EPG ERROR src=%s : %s", src, e)
-                try:
-                    wx.LogError(f"Failed to import EPG source {src}: {e}")
-                except Exception:
-                    pass
+                try: wx.LogError(f"Failed to import EPG source {src}: {e}")
+                except Exception: pass
             finally:
-                try:
-                    if fobj and hasattr(fobj, 'close'):
-                        fobj.close()
-                except Exception:
-                    pass
+                if stream:
+                    try: stream.close()
+                    except Exception: pass
 
             grand_chan += chan_count
             grand_prog += prog_count
             if progress_callback:
-                try:
-                    progress_callback(idx + 1, total)
-                except Exception:
-                    pass
-
-        try:
-            self.prune_old_programmes(days=14)
-        except Exception as e:
-            _logger.warning("EPG prune_old_programmes failed: %s", e)
-
-        # Final commit and summary
+                try: progress_callback(idx + 1, total)
+                except Exception: pass
+        
+        self.prune_old_programmes(days=14)
         self.commit()
         current, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
@@ -1330,10 +1216,10 @@ class EPGDatabase:
             c = self.conn.cursor()
             row_c = c.execute("SELECT COUNT(*) FROM channels").fetchone()
             row_p = c.execute("SELECT COUNT(*) FROM programmes").fetchone()
-            _logger.info("EPG SUMMARY total_channels_added=%d total_programmes_added=%d db_channels=%s db_programmes=%s mem=%sMB peak_tracemalloc=%sKB",
-                         grand_chan, grand_prog, row_c[0] if row_c else "?", row_p[0] if row_p else "?", _mem_mb(), int(peak/1024))
-        except Exception as e:
-            _logger.debug("EPG SUMMARY failed to query DB counts: %s", e)
+            _logger.info("EPG SUMMARY total_added ch=%d pg=%d | db_final ch=%s pg=%s | mem=%sMB peak_trace=%sKB",
+                         grand_chan, grand_prog, row_c[0] if row_c else '?', row_p[0] if row_p else '?', _mem_mb(), int(peak/1024))
+        except Exception as e: _logger.debug("EPG SUMMARY failed to query DB counts: %s", e)
+
 
 # =========================
 # EPG Import/Manager UI
@@ -1419,7 +1305,7 @@ class EPGManagerDialog(wx.Dialog):
             self.epg_sources.pop(i)
             self.lb.Delete(i)
 
-    def GetSources(self):
+    def GetResult(self):
         return self.epg_sources
 
 class PlaylistManagerDialog(wx.Dialog):
@@ -1478,7 +1364,7 @@ class PlaylistManagerDialog(wx.Dialog):
             self.playlist_sources.pop(i)
             self.lb.Delete(i)
 
-    def GetSources(self):
+    def GetResult(self):
         return self.playlist_sources
 
 # =========================

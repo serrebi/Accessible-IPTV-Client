@@ -33,42 +33,114 @@ def get_cwd_dir():
     except Exception:
         return None
 
+def get_user_config_dir():
+    """
+    Gets the user-specific config directory, creating it if it doesn't exist.
+    This relies on a wx.App object having been created with AppName set.
+    """
+    try:
+        # This will fail if wx.App doesn't exist, which is handled by the except block.
+        # We will set the AppName in main.py to ensure this works.
+        paths = wx.StandardPaths.Get()
+        config_dir = paths.GetUserConfigDir()
+        os.makedirs(config_dir, exist_ok=True)
+        return config_dir
+    except Exception:
+        # Fallback for headless environments or if called before wx.App is created.
+        if sys.platform == "win32":
+            path = os.path.join(os.getenv('APPDATA', os.path.expanduser('~')), "IPTVClient")
+        elif sys.platform == "darwin":
+            path = os.path.join(os.path.expanduser('~/Library/Application Support'), "IPTVClient")
+        else: # linux and other unix
+            path = os.path.join(os.getenv('XDG_CONFIG_HOME', os.path.expanduser('~/.config')), "IPTVClient")
+
+        try:
+            os.makedirs(path, exist_ok=True)
+            return path
+        except Exception:
+             # Last resort if we can't create any directory
+            return tempfile.gettempdir()
+
 def get_config_read_candidates():
+    # Priority: CWD (portable) -> App Dir (legacy) -> User Config Dir (standard)
     candidates = []
     cwd = get_cwd_dir()
     if cwd:
         candidates.append(os.path.join(cwd, CONFIG_FILE))
-    candidates.append(os.path.join(get_app_dir(), CONFIG_FILE))
-    return candidates
+
+    app_dir = get_app_dir()
+    if app_dir:
+        candidates.append(os.path.join(app_dir, CONFIG_FILE))
+
+    user_dir = get_user_config_dir()
+    if user_dir:
+        candidates.append(os.path.join(user_dir, CONFIG_FILE))
+
+    # De-duplicate paths while preserving order
+    unique_candidates = []
+    seen = set()
+    for c in candidates:
+        if c not in seen:
+            unique_candidates.append(c)
+            seen.add(c)
+    return unique_candidates
 
 def get_config_write_target():
+    # Priority for writing:
+    # 1. If a config file exists in CWD, attempt to write there first (portable mode).
+    # 2. If a config file exists in app dir, attempt to write there (legacy portable).
+    # 3. If CWD is writable, write a new config there (for new portable instances).
+    # 4. As a final, reliable default, write to the user config directory.
+
     cwd = get_cwd_dir()
+    app_dir = get_app_dir()
+
+    # Check for existing config in CWD
+    if cwd and os.path.exists(os.path.join(cwd, CONFIG_FILE)):
+        if _is_writable_dir(cwd):
+            return os.path.join(cwd, CONFIG_FILE)
+
+    # Check for existing config in app_dir
+    if app_dir and app_dir != cwd and os.path.exists(os.path.join(app_dir, CONFIG_FILE)):
+        if _is_writable_dir(app_dir):
+            return os.path.join(app_dir, CONFIG_FILE)
+
+    # If no existing config, prefer CWD for new portable config if writable
     if cwd and _is_writable_dir(cwd):
         return os.path.join(cwd, CONFIG_FILE)
-    appdir = get_app_dir()
-    if _is_writable_dir(appdir):
-        return os.path.join(appdir, CONFIG_FILE)
-    return os.path.join(cwd or appdir, CONFIG_FILE)
+
+    # Otherwise, fall back to the user config directory. This is the most robust location.
+    return os.path.join(get_user_config_dir(), CONFIG_FILE)
 
 def load_config() -> Dict:
-    default = {"playlists": [], "epgs": [], "media_player": "VLC", "custom_player_path": "", "minimize_to_tray": False}
+    default = {
+        "playlists": [],
+        "epgs": [],
+        "media_player": "VLC",
+        "custom_player_path": "",
+        "minimize_to_tray": False,
+        "epg_enabled": True
+    }
     for p in get_config_read_candidates():
         if os.path.exists(p):
             try:
                 with open(p, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, dict):
+                    # Ensure all default keys are present
                     for k, v in default.items():
                         data.setdefault(k, v)
                     return data
             except Exception as e:
                 wx.LogError(f"Failed to load config from {p}: {e}")
-                break
+                # Do not break; try the next candidate location.
     return default
 
 def save_config(cfg: Dict):
     path = get_config_write_target()
     try:
+        # Ensure the directory exists before writing
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp_path = path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)

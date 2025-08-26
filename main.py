@@ -157,9 +157,8 @@ class IPTVClient(wx.Frame):
     ]
     PLAYER_MENU_ATTRS = dict(PLAYER_KEYS)
 
-    # cache freshness policy
-    _CACHE_SHOW_STALE_SECS = 600   # show stale up to 10 minutes
-    _CACHE_REFRESH_AFTER_SECS = 30 # trigger background refresh if older than 30s
+    _CACHE_SHOW_STALE_SECS = 600
+    _CACHE_REFRESH_AFTER_SECS = 30
 
     def __init__(self):
         super().__init__(None, title="Accessible IPTV Client", size=(800, 600))
@@ -179,18 +178,31 @@ class IPTVClient(wx.Frame):
         self.minimize_to_tray = bool(self.config.get("minimize_to_tray", False))
         self.tray_icon = None
 
-        # Make the DB non-blocking for reads before we start anything else
-        self._ensure_db_tuned()
+        # batch-population state to avoid UI hangs
+        self._populate_token = 0
 
+        # Timer for polling DB during EPG import so UI shows incoming data.
+        self._epg_poll_timer: Optional[wx.Timer] = None
+        # Track in-flight EPG fetches to avoid hammering get_now_next while importer is busy
+        self._epg_fetch_inflight = set()
+        self._epg_inflight_lock = threading.Lock()
+
+        self._ensure_db_tuned()
         self._build_ui()
         self.Centre()
-        self.reload_all_sources_initial()
-        self.reload_epg_sources()
+
+        self.group_list.Append("Loading playlists...")
         self.Show()
-        self.start_epg_import_background()
-        self.start_refresh_timer()
+
+        # Defer all loading. This call starts ONLY the playlist loading thread.
+        wx.CallAfter(self.start_playlist_load)
+        
         self.Bind(wx.EVT_ICONIZE, self.on_minimize)
         self.Bind(wx.EVT_CLOSE, self.on_close)
+
+    def start_playlist_load(self):
+        """Kicks off ONLY the playlist loading thread."""
+        threading.Thread(target=self._do_playlist_refresh, daemon=True).start()
 
     def _ensure_db_tuned(self):
         """Enable WAL and indices so read lookups don’t stall behind imports."""
@@ -246,121 +258,89 @@ class IPTVClient(wx.Frame):
         self.refresh_timer.Start(3 * 60 * 60 * 1000, wx.TIMER_CONTINUOUS)
 
     def on_timer_refresh(self, event):
-        self.reload_all_sources_initial()
-        self.reload_epg_sources()
-        self.start_epg_import_background()
+        # This full cycle can be triggered by the timer.
+        self.start_playlist_load()
 
-    def reload_all_sources_initial(self):
-        self.playlist_sources = self.config.get("playlists", [])
-        self.channels_by_group.clear()
-        self.all_channels.clear()
+    def _do_playlist_refresh(self):
+        """
+        Loads playlists from cache for a fast UI update, then refreshes from the network.
+        Crucially, it only starts the EPG import *after* playlists are loaded.
+        """
+        playlist_sources = self.config.get("playlists", [])
+        channels_by_group: Dict[str, List[Dict[str, str]]] = {}
+        all_channels: List[Dict[str, str]] = []
         valid_caches = set()
         seen_channel_keys = set()
-        for src in self.playlist_sources:
+        results = [None] * len(playlist_sources)
+
+        def fetch_playlist(idx, src):
+            text = None
             try:
                 if src.startswith(("http://", "https://")):
                     cache_path = get_cache_path_for_url(src)
                     valid_caches.add(cache_path)
+                    download = True
                     if os.path.exists(cache_path):
+                        age = (datetime.datetime.now() - datetime.datetime.fromtimestamp(os.path.getmtime(cache_path))).total_seconds()
+                        if age < 15 * 60:
+                            download = False
+                    
+                    if download:
+                        with urllib.request.urlopen(
+                            urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"}), timeout=60
+                        ) as resp:
+                            raw = resp.read()
+                            try: text = raw.decode("utf-8")
+                            except UnicodeDecodeError: text = raw.decode("latin-1", "ignore")
+                        with open(cache_path, "w", encoding="utf-8") as f:
+                            f.write(text)
+                    else:
                         with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
                             text = f.read()
-                    else:
-                        continue
                 else:
                     if os.path.exists(src):
                         with open(src, "r", encoding="utf-8", errors="ignore") as f:
                             text = f.read()
-                    else:
-                        continue
+                results[idx] = text
+            except Exception:
+                results[idx] = None
+        
+        threads = []
+        for idx, src in enumerate(playlist_sources):
+            t = threading.Thread(target=fetch_playlist, args=(idx, src), daemon=True)
+            t.start()
+            threads.append(t)
+        
+        for t in threads:
+            t.join()
+
+        for text in results:
+            if not text: continue
+            try:
                 channels = self._parse_m3u_return(text)
                 for ch in channels:
                     key = (ch.get("name", ""), ch.get("url", ""))
-                    if key in seen_channel_keys:
-                        continue
+                    if key in seen_channel_keys: continue
                     seen_channel_keys.add(key)
                     grp = ch.get("group") or "Uncategorized"
-                    self.channels_by_group.setdefault(grp, []).append(ch)
-                    self.all_channels.append(ch)
+                    channels_by_group.setdefault(grp, []).append(ch)
+                    all_channels.append(ch)
             except Exception:
                 continue
-        self._refresh_group_ui()
-        self._cleanup_cache_and_channels(valid_caches)
-        self._reload_all_sources_background()
 
-    def _reload_all_sources_background(self):
-        def load():
-            playlist_sources = self.config.get("playlists", [])
-            channels_by_group: Dict[str, List[Dict[str, str]]] = {}
-            all_channels: List[Dict[str, str]] = []
-            valid_caches = set()
-            seen_channel_keys = set()
-            results = [None] * len(playlist_sources)
-            def fetch_playlist(idx, src):
-                try:
-                    if src.startswith(("http://", "https://")):
-                        cache_path = get_cache_path_for_url(src)
-                        valid_caches.add(cache_path)
-                        download = True
-                        if os.path.exists(cache_path):
-                            age = (datetime.datetime.now() - datetime.datetime.fromtimestamp(os.path.getmtime(cache_path))).total_seconds()
-                            if age < 15 * 60:
-                                download = False
-                        if download:
-                            with urllib.request.urlopen(
-                                urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"}), timeout=60
-                            ) as resp:
-                                raw = resp.read()
-                                try:
-                                    text = raw.decode("utf-8")
-                                except UnicodeDecodeError:
-                                    text = raw.decode("latin-1", "ignore")
-                            with open(cache_path, "w", encoding="utf-8") as f:
-                                f.write(text)
-                        else:
-                            with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
-                                text = f.read()
-                    else:
-                        if os.path.exists(src):
-                            with open(src, "r", encoding="utf-8", errors="ignore") as f:
-                                text = f.read()
-                        else:
-                            return
-                    results[idx] = text
-                except Exception:
-                    results[idx] = None
-            threads = []
-            for idx, src in enumerate(playlist_sources):
-                if src.startswith(("http://", "https://")):
-                    t = threading.Thread(target=fetch_playlist, args=(idx, src), daemon=True)
-                    t.start()
-                    threads.append(t)
-                else:
-                    fetch_playlist(idx, src)
-            for t in threads:
-                t.join()
-            for idx, src in enumerate(playlist_sources):
-                text = results[idx]
-                if not text:
-                    continue
-                try:
-                    channels = self._parse_m3u_return(text)
-                    for ch in channels:
-                        key = (ch.get("name", ""), ch.get("url", ""))
-                        if key in seen_channel_keys:
-                            continue
-                        seen_channel_keys.add(key)
-                        grp = ch.get("group") or "Uncategorized"
-                        channels_by_group.setdefault(grp, []).append(ch)
-                        all_channels.append(ch)
-                except Exception:
-                    continue
-            def finish():
-                self.channels_by_group = channels_by_group
-                self.all_channels = all_channels
-                self._refresh_group_ui()
-                self._cleanup_cache_and_channels(valid_caches)
-            wx.CallAfter(finish)
-        threading.Thread(target=load, daemon=True).start()
+        def finish_playlist_load_and_start_background_tasks():
+            self.channels_by_group = channels_by_group
+            self.all_channels = all_channels
+            self._refresh_group_ui()
+            self._cleanup_cache_and_channels(valid_caches)
+
+            # Now that playlists are loaded, start the other processes.
+            self.reload_epg_sources()
+            self.start_refresh_timer()
+            wx.CallLater(2000, self.start_epg_import_background)
+
+        wx.CallAfter(finish_playlist_load_and_start_background_tasks)
+
 
     def _cleanup_cache_and_channels(self, valid_caches):
         cache_dir = get_cache_dir()
@@ -554,6 +534,11 @@ class IPTVClient(wx.Frame):
             wx.CallAfter(self.show_tray_icon)
             event.Veto()
         else:
+            # Ensure poll timer stopped on exit
+            try:
+                self._stop_epg_poll_timer()
+            except Exception:
+                pass
             if self.tray_icon:
                 try:
                     self.tray_icon.RemoveIcon()
@@ -602,67 +587,106 @@ class IPTVClient(wx.Frame):
     def apply_filter(self):
         txt = self.filter_box.GetValue().strip().lower()
         self.displayed = []
-        self.channel_list.Clear()
-        source = (self.all_channels if self.current_group == "All Channels"
-                  else self.channels_by_group.get(self.current_group, []))
-        for ch in source:
-            if txt in ch.get("name", "").lower():
-                self.displayed.append({"type": "channel", "data": ch})
-                self.channel_list.Append(ch.get("name", ""))
-        if not txt:
-            if self.displayed:
-                self.channel_list.SetSelection(0)
-                self.channel_list.SetFocus()
-                self.on_highlight()
-            return
+        self.channel_list.Freeze()
+        try:
+            self.channel_list.Clear()
+            source = (self.all_channels if self.current_group == "All Channels"
+                      else self.channels_by_group.get(self.current_group, []))
+            if not txt:
+                # Rebuild current group quickly without blocking the UI
+                self.channel_list.Thaw()
+                self.on_group_select()
+                return
 
-        if not hasattr(self, "_search_token"):
-            self._search_token = 0
-        self._search_token += 1
-        my_token = self._search_token
+            items = []
+            for ch in source:
+                if txt in ch.get("name", "").lower():
+                    self.displayed.append({"type": "channel", "data": ch})
+                    items.append(ch.get("name", ""))
 
-        def epg_search(token):
+            if items:
+                self.channel_list.AppendItems(items)
+
+            # Kick off EPG search in background and append results later
+            if not hasattr(self, "_search_token"):
+                self._search_token = 0
+            self._search_token += 1
+            my_token = self._search_token
+
+            def epg_search(token):
+                try:
+                    db = EPGDatabase(get_db_path(), readonly=True)
+                    try:
+                        if hasattr(db, "conn"):
+                            db.conn.execute("PRAGMA busy_timeout=2000;")
+                            db.conn.execute("PRAGMA read_uncommitted=1;")
+                    except Exception:
+                        pass
+                    results = db.get_channels_with_show(txt)
+                    try:
+                        if hasattr(db, "close"):
+                            db.close()
+                        elif hasattr(db, "conn"):
+                            db.conn.close()
+                    except Exception:
+                        pass
+                except Exception:
+                    results = []
+                def update_ui():
+                    if getattr(self, "_search_token", 0) != token:
+                        return
+                    if txt != self.filter_box.GetValue().strip().lower():
+                        return
+                    if results:
+                        add_items = []
+                        for r in results:
+                            label = f"{r['channel_name']} - {r['show_title']} ({self._fmt_time(r['start'])}–{self._fmt_time(r['end'])})"
+                            self.displayed.append({"type": "epg", "data": r})
+                            add_items.append(label)
+                        if add_items:
+                            self.channel_list.AppendItems(add_items)
+                    if self.displayed:
+                        self.channel_list.SetSelection(0)
+                        self.channel_list.SetFocus()
+                        self.on_highlight()
+                wx.CallAfter(update_ui)
+            threading.Thread(target=lambda: epg_search(my_token), daemon=True).start()
+        finally:
             try:
-                db = EPGDatabase(get_db_path(), readonly=True)
-                try:
-                    if hasattr(db, "conn"):
-                        db.conn.execute("PRAGMA busy_timeout=2000;")
-                        db.conn.execute("PRAGMA read_uncommitted=1;")
-                except Exception:
-                    pass
-                results = db.get_channels_with_show(txt)
-                try:
-                    if hasattr(db, "close"):
-                        db.close()
-                    elif hasattr(db, "conn"):
-                        db.conn.close()
-                except Exception:
-                    pass
+                self.channel_list.Thaw()
             except Exception:
-                results = []
-            def update_ui():
-                if getattr(self, "_search_token", 0) != token:
-                    return
-                if txt != self.filter_box.GetValue().strip().lower():
-                    return
-                for r in results:
-                    label = f"{r['channel_name']} - {r['show_title']} ({self._fmt_time(r['start'])}–{self._fmt_time(r['end'])})"
-                    self.displayed.append({"type": "epg", "data": r})
-                    self.channel_list.Append(label)
-                if self.displayed:
-                    self.channel_list.SetSelection(0)
-                    self.channel_list.SetFocus()
-                    self.on_highlight()
-            wx.CallAfter(update_ui)
-        threading.Thread(target=lambda: epg_search(my_token), daemon=True).start()
+                pass
 
     def _refresh_group_ui(self):
-        self.group_list.Clear()
-        self.channel_list.Clear()
-        self.group_list.Append(f"All Channels ({len(self.all_channels)})")
-        for grp in sorted(self.channels_by_group):
-            self.group_list.Append(f"{grp} ({len(self.channels_by_group[grp])})")
-        self.group_list.SetSelection(0)
+        self.group_list.Freeze()
+        try:
+            self.group_list.Clear()
+            self.channel_list.Clear()
+
+            if not self.all_channels:
+                self.group_list.Append("No channels found.")
+                return
+
+            self.group_list.Append(f"All Channels ({len(self.all_channels)})")
+            for grp in sorted(self.channels_by_group):
+                self.group_list.Append(f"{grp} ({len(self.channels_by_group[grp])})")
+            
+            try:
+                current_idx = self.group_list.FindString(self.current_group)
+                if current_idx != wx.NOT_FOUND and self.current_group != "All Channels":
+                    for i in range(self.group_list.GetCount()):
+                        if self.group_list.GetString(i).startswith(f"{self.current_group} ("):
+                            current_idx = i
+                            break
+                self.group_list.SetSelection(current_idx if current_idx != wx.NOT_FOUND else 0)
+            except Exception:
+                self.group_list.SetSelection(0)
+        finally:
+            try:
+                self.group_list.Thaw()
+            except Exception:
+                pass
+        
         self.on_group_select()
 
     def reload_epg_sources(self):
@@ -670,15 +694,20 @@ class IPTVClient(wx.Frame):
 
     def start_epg_import_background(self):
         sources = list(self.epg_sources)
-        if not sources:
+        if not sources or not self.config.get("epg_enabled", True):
             return
         if self.epg_importing:
             return
         self.epg_importing = True
 
+        # Start a short poll timer so UI can show EPG as it arrives for the selected channel.
+        wx.CallAfter(self._start_epg_poll_timer)
+
         def do_import():
             try:
                 db = EPGDatabase(get_db_path(), for_threading=True)
+                # Pass a coarse progress callback (per-source). The DB importer writes as it streams,
+                # so readers can pick up newly inserted rows during import.
                 db.import_epg_xml(sources)
                 try:
                     if hasattr(db, "close"):
@@ -695,6 +724,8 @@ class IPTVClient(wx.Frame):
 
     def finish_import_background(self):
         self.epg_importing = False
+        # Stop polling for incremental updates
+        wx.CallAfter(self._stop_epg_poll_timer)
         with self.epg_cache_lock:
             self.epg_cache.clear()
         self.on_highlight()
@@ -705,7 +736,7 @@ class IPTVClient(wx.Frame):
             self.playlist_sources = dlg.GetResult()
             self.config["playlists"] = self.playlist_sources
             save_config(self.config)
-            self.reload_all_sources_initial()
+            self.start_playlist_load() # Reload everything after changes
         dlg.Destroy()
 
     def show_epg_manager(self, _):
@@ -715,18 +746,25 @@ class IPTVClient(wx.Frame):
             self.config["epgs"] = self.epg_sources
             save_config(self.config)
             self.reload_epg_sources()
-            self.start_epg_import_background()
+            wx.CallLater(1000, self.start_epg_import_background) # Start import after dialog closes
         dlg.Destroy()
 
     def import_epg(self, _):
         if self.epg_importing:
-            wx.MessageBox("EPG import is already in progress.", "Wait", wx.OK | wx.ICON_INFORMATION)
-        return
-        # NOTE: the above early return is intentional in this version to keep UI responsive
-        # when an import is already running.
+            wx.MessageBox("EPG import is already in progress.", "In Progress", wx.OK | wx.ICON_INFORMATION)
+            return
+        
+        if not self.epg_sources:
+            wx.MessageBox("No EPG sources configured. Please add one in File > EPG Manager.", "No Sources", wx.OK | wx.ICON_WARNING)
+            return
+
+        wx.MessageBox("EPG import will start in the background.", "Import Started", wx.OK | wx.ICON_INFORMATION)
+        self.start_epg_import_background()
 
     def finish_import(self):
+        # legacy-sounding API; ensure poll timer is stopped here too.
         self.epg_importing = False
+        wx.CallAfter(self._stop_epg_poll_timer)
         with self.epg_cache_lock:
             self.epg_cache.clear()
         self.on_highlight()
@@ -769,19 +807,103 @@ class IPTVClient(wx.Frame):
         else:
             grp = label.split(" (", 1)[0]
         self.current_group = grp
-        self.displayed = []
-        self.channel_list.Clear()
+
         source = self.all_channels if grp == "All Channels" else self.channels_by_group.get(grp, [])
-        for ch in source:
-            self.displayed.append({"type": "channel", "data": ch})
-            self.channel_list.Append(ch.get("name", ""))
-        if self.displayed:
+        self._populate_channel_list_chunked(source)
+
+    def _populate_channel_list_chunked(self, source: List[Dict[str, str]]):
+        self._populate_token += 1
+        token = self._populate_token
+
+        self.displayed = []
+        self.channel_list.Freeze()
+        try:
+            self.channel_list.Clear()
+        finally:
+            try:
+                self.channel_list.Thaw()
+            except Exception:
+                pass
+
+        total = len(source)
+        if total == 0:
+            self.epg_display.SetValue("")
+            self.url_display.SetValue("")
+            return
+
+        # For small lists, append in one shot for speed
+        if total <= 1500:
+            names = []
+            for ch in source:
+                self.displayed.append({"type": "channel", "data": ch})
+                names.append(ch.get("name", ""))
+            self.channel_list.Freeze()
+            try:
+                if names:
+                    self.channel_list.AppendItems(names)
+            finally:
+                try:
+                    self.channel_list.Thaw()
+                except Exception:
+                    pass
             self.channel_list.SetSelection(0)
             self.channel_list.SetFocus()
             self.on_highlight()
-        else:
-            self.epg_display.SetValue("")
-            self.url_display.SetValue("")
+            return
+
+        # For large lists, add in batches to keep UI responsive
+        batch = 800 if total > 8000 else 500
+        idx = 0
+
+        # Provide a minimal immediate preview
+        preview_end = min(200, total)
+        preview_names = []
+        for ch in source[:preview_end]:
+            self.displayed.append({"type": "channel", "data": ch})
+            preview_names.append(ch.get("name", ""))
+        self.channel_list.Freeze()
+        try:
+            if preview_names:
+                self.channel_list.AppendItems(preview_names)
+        finally:
+            try:
+                self.channel_list.Thaw()
+            except Exception:
+                pass
+        self.channel_list.SetSelection(0)
+        self.channel_list.SetFocus()
+        self.on_highlight()
+        idx = preview_end
+        self.epg_display.SetValue(f"Loading channels… {idx}/{total}")
+
+        def add_next_chunk():
+            nonlocal idx
+            if token != self._populate_token:
+                return  # canceled due to group/filter change
+            end = min(idx + batch, total)
+            names = []
+            for ch in source[idx:end]:
+                self.displayed.append({"type": "channel", "data": ch})
+                names.append(ch.get("name", ""))
+            if names:
+                self.channel_list.Freeze()
+                try:
+                    self.channel_list.AppendItems(names)
+                finally:
+                    try:
+                        self.channel_list.Thaw()
+                    except Exception:
+                        pass
+            idx = end
+            if idx >= total or token != self._populate_token:
+                if token == self._populate_token:
+                    self.epg_display.SetValue("")
+                return
+            # update progress and schedule next chunk
+            self.epg_display.SetValue(f"Loading channels… {idx}/{total}")
+            wx.CallLater(30, add_next_chunk)  # 30ms between chunks keeps UI smooth
+
+        wx.CallLater(30, add_next_chunk)
 
     def _fmt_time(self, s):
         # s: "YYYYMMDDHHMMSS" (UTC)
@@ -793,9 +915,9 @@ class IPTVClient(wx.Frame):
             return "?"
 
     def on_highlight(self):
+        # Allow viewing cached or currently available EPG even while an import is running.
         i = self.channel_list.GetSelection()
         if i < 0 or i >= len(self.displayed):
-            self.epg_display.SetValue("")
             self.url_display.SetValue("")
             return
         item = self.displayed[i]
@@ -804,22 +926,37 @@ class IPTVClient(wx.Frame):
             self.url_display.SetValue(ch.get("url", ""))
             cname = ch.get("name", "")
 
-            # check cache
+            if not self.config.get("epg_enabled", True):
+                self.epg_display.SetValue("EPG is disabled in configuration.")
+                return
+
             key = canonicalize_name(cname)
             with self.epg_cache_lock:
                 cached = self.epg_cache.get(key)
             if cached:
                 now_show, next_show, ts = cached
-                if (datetime.datetime.now() - ts).total_seconds() < self._CACHE_SHOW_STALE_SECS:
-                    self.epg_display.SetValue(self._epg_msg_from_tuple(now_show, next_show))
-                else:
-                    self.epg_display.SetValue("Refreshing EPG…")
-                    with self.epg_cache_lock:
-                        self.epg_cache.pop(key, None)
-                    threading.Thread(target=self._fetch_and_cache_epg, args=(ch, cname), daemon=True).start()
+                # If cached data is stale, refresh in background but still show it immediately.
+                if (datetime.datetime.now() - ts).total_seconds() >= self._CACHE_SHOW_STALE_SECS:
+                    # Only spawn refresh if not already inflight
+                    with self._epg_inflight_lock:
+                        if key not in self._epg_fetch_inflight:
+                            threading.Thread(target=self._fetch_and_cache_epg, args=(ch, cname), daemon=True).start()
+                msg = self._epg_msg_from_tuple(now_show, next_show)
+                # If an import is running, indicate that data may still be arriving.
+                if self.epg_importing:
+                    msg = msg + "\n\nNote: EPG import in progress — newer program data may still arrive."
+                self.epg_display.SetValue(msg)
             else:
-                self.epg_display.SetValue("Looking up EPG…")
-                threading.Thread(target=self._fetch_and_cache_epg, args=(ch, cname), daemon=True).start()
+                # No cached entry: fetch what exists now (reader connection to DB).
+                with self._epg_inflight_lock:
+                    already = canonicalize_name(cname) in self._epg_fetch_inflight
+                    if not already:
+                        threading.Thread(target=self._fetch_and_cache_epg, args=(ch, cname), daemon=True).start()
+                # Provide placeholder while we wait for DB read.
+                placeholder = "Loading EPG for this channel…"
+                if self.epg_importing:
+                    placeholder += "\n\nEPG import in progress — displaying available data as it arrives."
+                self.epg_display.SetValue(placeholder)
         elif item["type"] == "epg":
             self.url_display.SetValue("")
             r = item["data"]
@@ -832,11 +969,10 @@ class IPTVClient(wx.Frame):
                 f"Show: {r['show_title']} | Channel: {r['channel_name']} | "
                 f"Start: {self._fmt_time(r['start'])} | End: {self._fmt_time(r['end'])}"
             )
+            if self.epg_importing:
+                msg = msg + "\n\nNote: EPG import in progress — data may still be updating."
             self.epg_display.SetValue(msg)
             self.url_display.SetValue(url)
-        else:
-            self.epg_display.SetValue("")
-            self.url_display.SetValue("")
 
     def _epg_msg_from_tuple(self, now, nxt):
         def localfmt(dt):
@@ -854,34 +990,32 @@ class IPTVClient(wx.Frame):
         return msg
 
     def _fetch_and_cache_epg(self, channel, cname):
+        key = canonicalize_name(cname)
+        # Deduplicate inflight fetches per canonical name to avoid heavy repeated scoring during import.
+        with self._epg_inflight_lock:
+            if key in self._epg_fetch_inflight:
+                return
+            self._epg_fetch_inflight.add(key)
         try:
-            db = EPGDatabase(get_db_path(), readonly=True)
             try:
-                if hasattr(db, "conn"):
-                    db.conn.execute("PRAGMA busy_timeout=2000;")
-                    db.conn.execute("PRAGMA read_uncommitted=1;")
+                db = EPGDatabase(get_db_path(), readonly=True)
+                now_next = db.get_now_next(channel)
+                db.close()
             except Exception:
-                pass
-            now_next = db.get_now_next(channel)
-            try:
-                if hasattr(db, "close"):
-                    db.close()
-                elif hasattr(db, "conn"):
-                    db.conn.close()
-            except Exception:
-                pass
-        except Exception:
-            now_next = None
+                now_next = None
+        finally:
+            # Ensure we always remove from inflight even if DB access raised.
+            with self._epg_inflight_lock:
+                try:
+                    self._epg_fetch_inflight.discard(key)
+                except Exception:
+                    pass
+
         if not now_next:
-            if self.epg_importing:
-                wx.CallAfter(self.epg_display.SetValue, "EPG importing…")
-            elif not self.epg_sources:
-                wx.CallAfter(self.epg_display.SetValue, "No EPG data available.")
-            else:
-                wx.CallAfter(self.epg_display.SetValue, "No program info found.")
             now_show, next_show = None, None
         else:
             now_show, next_show = now_next
+            
         with self.epg_cache_lock:
             self.epg_cache[canonicalize_name(cname)] = (now_show, next_show, datetime.datetime.now())
         wx.CallAfter(self._update_epg_display_if_selected, channel, now_show, next_show)
@@ -891,11 +1025,63 @@ class IPTVClient(wx.Frame):
         if 0 <= i < len(self.displayed):
             item = self.displayed[i]
             if item["type"] == "channel" and canonicalize_name(item["data"].get("name", "")) == canonicalize_name(channel.get("name", "")):
+                msg = self._epg_msg_from_tuple(now_show, next_show)
+                if self.epg_importing:
+                    msg = msg + "\n\nNote: EPG import in progress — newer program data may still arrive."
+                self.epg_display.SetValue(msg)
+
+    def _start_epg_poll_timer(self):
+        try:
+            if self._epg_poll_timer:
+                return
+            self._epg_poll_timer = wx.Timer(self)
+            # Bind with timer as source so we can unbind cleanly later
+            self.Bind(wx.EVT_TIMER, self._on_epg_poll_timer, self._epg_poll_timer)
+            # Poll less aggressively to avoid repeated expensive matching while importer churns.
+            self._epg_poll_timer.Start(8000, wx.TIMER_CONTINUOUS)  # 8s
+        except Exception:
+            self._epg_poll_timer = None
+
+    def _stop_epg_poll_timer(self):
+        try:
+            if self._epg_poll_timer:
                 try:
-                    print("[DEBUG] EPG UI update for:", item["data"].get("name", ""))
+                    self._epg_poll_timer.Stop()
                 except Exception:
                     pass
-                self.epg_display.SetValue(self._epg_msg_from_tuple(now_show, next_show))
+                # Unbind the specific handler for this timer source to avoid removing other EVT_TIMER bindings.
+                try:
+                    # Unbind signature: Unbind(event, source=timer, handler=callable)
+                    self.Unbind(wx.EVT_TIMER, handler=self._on_epg_poll_timer, source=self._epg_poll_timer)
+                except Exception:
+                    # Fallback: attempt to unbind by event only (best-effort)
+                    try:
+                        self.Unbind(wx.EVT_TIMER, handler=self._on_epg_poll_timer)
+                    except Exception:
+                        pass
+                self._epg_poll_timer = None
+        except Exception:
+            self._epg_poll_timer = None
+
+    def _on_epg_poll_timer(self, event):
+        # Only refresh the currently highlighted channel (cheap, targeted).
+        try:
+            i = self.channel_list.GetSelection()
+            if i < 0 or i >= len(self.displayed):
+                return
+            item = self.displayed[i]
+            if item["type"] != "channel":
+                return
+            ch = item["data"]
+            cname = ch.get("name", "")
+            key = canonicalize_name(cname)
+            # Only spawn a refresh if one isn't already running for this channel.
+            with self._epg_inflight_lock:
+                already = key in self._epg_fetch_inflight
+            if not already:
+                threading.Thread(target=self._fetch_and_cache_epg, args=(ch, cname), daemon=True).start()
+        except Exception:
+            pass
 
     def _spawn_posix(self, exe_path_or_cmd, url):
         try:
@@ -909,8 +1095,7 @@ class IPTVClient(wx.Frame):
     def _spawn_windows(self, exe_path, url):
         """Launch player on Windows with a normal, visible window."""
         try:
-            # IMPORTANT: No hidden-window flags, no STARTF_USESHOWWINDOW.
-            subprocess.Popen([exe_path, url])  # visible, normal priority
+            subprocess.Popen([exe_path, url])
             return True, ""
         except FileNotFoundError:
             return False, f"Executable not found: {exe_path}"
@@ -940,175 +1125,58 @@ class IPTVClient(wx.Frame):
         custom_path = self.config.get("custom_player_path", "")
 
         win_paths = {
-            "VLC": [
-                r"C:\Program Files\VideoLAN\VLC\vlc.exe",
-                r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"
-            ],
-            "MPC": [
-                r"C:\Program Files\MPC-HC\mpc-hc64.exe",
-                r"C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe",
-                r"C:\Program Files (x86)\MPC-HC\mpc-hc.exe",
-            ],
-            "MPC-BE": [
-                r"C:\Program Files\MPC-BE\mpc-be64.exe",
-                r"C:\Program Files (x86)\MPC-BE\mpc-be.exe",
-                r"C:\Program Files\MPC-BE x64\mpc-be64.exe",
-                r"C:\Program Files\MPC-BE\mpc-be.exe"
-            ],
+            "VLC": [r"C:\Program Files\VideoLAN\VLC\vlc.exe", r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"],
+            "MPC": [r"C:\Program Files\MPC-HC\mpc-hc64.exe", r"C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe", r"C:\Program Files (x86)\MPC-HC\mpc-hc.exe"],
+            "MPC-BE": [r"C:\Program Files\MPC-BE\mpc-be64.exe", r"C:\Program Files (x86)\MPC-BE\mpc-be.exe", r"C:\Program Files\MPC-BE x64\mpc-be64.exe", r"C:\Program Files\MPC-BE\mpc-be.exe"],
             "Kodi": [r"C:\Program Files\Kodi\kodi.exe"],
             "Winamp": [r"C:\Program Files\Winamp\winamp.exe"],
             "Foobar2000": [r"C:\Program Files\foobar2000\foobar2000.exe"],
-            "MPV": [
-                r"C:\Program Files\mpv\mpv.exe",
-                r"C:\Program Files (x86)\mpv\mpv.exe"
-            ],
-            "SMPlayer": [
-                r"C:\Program Files\SMPlayer\smplayer.exe",
-                r"C:\Program Files (x86)\SMPlayer\smplayer.exe",
-                r"C:\Program Files\WindowsApps\SMPlayerTeam.SMPlayer_*",
-                r"C:\Program Files\WindowsApps\SMPlayerTeam.SMPlayer*\smplayer.exe"
-            ],
-            "Totem": [],
-            "QuickTime": [
-                r"C:\Program Files\QuickTime\QuickTimePlayer.exe",
-                r"C:\Program Files (x86)\QuickTime\QuickTimePlayer.exe"
-            ],
-            "iTunes/Apple Music": [
-                r"C:\Program Files\iTunes\iTunes.exe",
-                r"C:\Program Files (x86)\iTunes\iTunes.exe",
-                r"C:\Program Files\WindowsApps\AppleInc.AppleMusic_*",
-                r"C:\Program Files\Apple\Music\AppleMusic.exe",
-            ],
-            "QMPlay2": [
-                r"C:\Program Files\QMPlay2\QMPlay2.exe",
-                r"C:\Program Files (x86)\QMPlay2\QMPlay2.exe",
-            ],
-            "PotPlayer": [
-                r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe",
-                r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini.exe",
-            ],
-            "KMPlayer": [
-                r"C:\Program Files\KMP Media\KMPlayer\KMPlayer64.exe",
-                r"C:\Program Files\KMP Media\KMPlayer\KMPlayer.exe",
-            ],
-            "AIMP": [
-                r"C:\Program Files\AIMP\AIMP.exe",
-                r"C:\Program Files (x86)\AIMP\AIMP.exe",
-            ],
-            "GOM Player": [
-                r"C:\Program Files\GRETECH\GomPlayer\GOM.exe",
-                r"C:\Program Files (x86)\GRETECH\GomPlayer\GOM.exe",
-            ],
+            "MPV": [r"C:\Program Files\mpv\mpv.exe", r"C:\Program Files (x86)\mpv\mpv.exe"],
+            "SMPlayer": [r"C:\Program Files\SMPlayer\smplayer.exe", r"C:\Program Files (x86)\SMPlayer\smplayer.exe"],
+            "QuickTime": [r"C:\Program Files\QuickTime\QuickTimePlayer.exe", r"C:\Program Files (x86)\QuickTime\QuickTimePlayer.exe"],
+            "iTunes/Apple Music": [r"C:\Program Files\iTunes\iTunes.exe", r"C:\Program Files (x86)\iTunes\iTunes.exe", r"C:\Program Files\Apple\Music\AppleMusic.exe"],
+            "PotPlayer": [r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe", r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini.exe"],
+            "KMPlayer": [r"C:\Program Files\KMP Media\KMPlayer\KMPlayer64.exe", r"C:\Program Files (x86)\KMP Media\KMPlayer\KMPlayer.exe"],
+            "AIMP": [r"C:\Program Files\AIMP\AIMP.exe", r"C:\Program Files (x86)\AIMP\AIMP.exe"],
+            "QMPlay2": [r"C:\Program Files\QMPlay2\QMPlay2.exe", r"C:\Program Files (x86)\QMPlay2\QMPlay2.exe"],
+            "GOM Player": [r"C:\Program Files\GRETECH\GomPlayer\GOM.exe", r"C:\Program Files (x86)\GRETECH\GomPlayer\GOM.exe"],
             "Clementine": [r"C:\Program Files\Clementine\clementine.exe"],
             "Strawberry": [r"C:\Program Files\Strawberry\strawberry.exe"],
-            "Amarok": [],
-            "Rhythmbox": [],
-            "Pragha": [],
-            "Lollypop": [],
-            "Exaile": [],
-            "Quod Libet": [],
-            "Gmusicbrowser": [],
-            "Xmms": [],
-            "Vocal": [],
-            "Haruna": [],
-            "Celluloid": [],
         }
+        
+        linux_players = { "VLC": "vlc", "MPV": "mpv", "Kodi": "kodi", "SMPlayer": "smplayer", "Totem": "totem", "PotPlayer": "potplayer", "KMPlayer": "kmplayer", "AIMP": "aimp", "QMPlay2": "qmplay2", "GOM Player": "gomplayer", "Audacious": "audacious", "Fauxdacious": "fauxdacious", "MPC-BE": "mpc-be", "Clementine": "clementine", "Strawberry": "strawberry", "Amarok": "amarok", "Rhythmbox": "rhythmbox", "Pragha": "pragha", "Lollypop": "lollypop", "Exaile": "exaile", "Quod Libet": "quodlibet", "Gmusicbrowser": "gmusicbrowser", "Xmms": "xmms", "Vocal": "vocal", "Haruna": "haruna", "Celluloid": "celluloid" }
+        mac_paths = { "VLC": ["/Applications/VLC.app/Contents/MacOS/VLC"], "QuickTime": ["/Applications/QuickTime Player.app/Contents/MacOS/QuickTime Player"], "iTunes/Apple Music": ["/Applications/Music.app/Contents/MacOS/Music", "/Applications/iTunes.app/Contents/MacOS/iTunes"], "QMPlay2": ["/Applications/QMPlay2.app/Contents/MacOS/QMPlay2"], "Audacious": ["/Applications/Audacious.app/Contents/MacOS/Audacious"], "Fauxdacious": ["/Applications/Fauxdacious.app/Contents/MacOS/Fauxdacious"] }
 
-        mac_paths = {
-            "VLC": ["/Applications/VLC.app/Contents/MacOS/VLC", "/Applications/VLC.app/Contents/MacOS/VLC"],
-            "QuickTime": ["/Applications/QuickTime Player.app/Contents/MacOS/QuickTime Player"],
-            "iTunes/Apple Music": [
-                "/Applications/iTunes.app/Contents/MacOS/iTunes",
-                "/Applications/Music.app/Contents/MacOS/Music"
-            ],
-            "QMPlay2": ["/Applications/QMPlay2.app/Contents/MacOS/QMPlay2"],
-            "Audacious": ["/Applications/Audacious.app/Contents/MacOS/Audacious"],
-            "Fauxdacious": ["/Applications/Fauxdacious.app/Contents/MacOS/Fauxdacious"],
-        }
-
-        linux_players = {
-            "VLC": "vlc",
-            "MPV": "mpv",
-            "Kodi": "kodi",
-            "SMPlayer": "smplayer",
-            "Totem": "totem",
-            "PotPlayer": "potplayer",
-            "KMPlayer": "kmplayer",
-            "AIMP": "aimp",
-            "QMPlay2": "qmplay2",
-            "GOM Player": "gomplayer",
-            "Audacious": "audacious",
-            "Fauxdacious": "fauxdacious",
-            "MPC-BE": "mpc-be",
-            "Clementine": "clementine",
-            "Strawberry": "strawberry",
-            "Amarok": "amarok",
-            "Rhythmbox": "rhythmbox",
-            "Pragha": "pragha",
-            "Lollypop": "lollypop",
-            "Exaile": "exaile",
-            "Quod Libet": "quodlibet",
-            "Gmusicbrowser": "gmusicbrowser",
-            "Xmms": "xmms",
-            "Vocal": "vocal",
-            "Haruna": "haruna",
-            "Celluloid": "celluloid",
-        }
-
-        ok = False
-        err = ""
-
+        ok, err = False, ""
         if self.default_player == "Custom" and custom_path:
             exe = custom_path
-            if platform.system() == "Windows":
-                ok, err = self._spawn_windows(exe, url)
-            else:
-                ok, err = self._spawn_posix(exe, url)
+            ok, err = self._spawn_windows(exe, url) if platform.system() == "Windows" else self._spawn_posix(exe, url)
         else:
             system = platform.system()
             if system == "Windows":
                 choices = win_paths.get(player, [])
                 for exe in choices:
-                    if "*" in exe:
-                        base = os.path.dirname(exe.split("*")[0])
-                        if os.path.isdir(base):
-                            for root, dirs, files in os.walk(base):
-                                for f in files:
-                                    if f.lower().endswith(".exe") and "smplayer" in f.lower():
-                                        exe_path = os.path.join(root, f)
-                                        ok, err = self._spawn_windows(exe_path, url)
-                                        if ok:
-                                            break
-                                if ok:
-                                    break
-                        if ok:
-                            break
                     if os.path.exists(exe):
                         ok, err = self._spawn_windows(exe, url)
-                        if ok:
-                            break
-                if not ok:
-                    err = err or f"Could not locate {player} executable."
+                        if ok: break
+                if not ok: err = err or f"Could not locate {player} executable."
             elif system == "Darwin":
                 choices = mac_paths.get(player, [])
                 for exe in choices:
                     if os.path.exists(exe):
                         ok, err = self._spawn_posix(exe, url)
-                        if ok:
-                            break
-                if not ok:
-                    err = err or f"Could not locate {player} app."
+                        if ok: break
+                if not ok: err = err or f"Could not locate {player} app."
             else:
                 cmd = linux_players.get(player)
-                if cmd:
-                    ok, err = self._spawn_posix(cmd, url)
-                else:
-                    err = f"{player} is not configured for Linux."
+                if cmd: ok, err = self._spawn_posix(cmd, url)
+                else: err = f"{player} is not configured for Linux."
 
         if not ok:
             wx.MessageBox(f"Failed to launch {self.default_player}:\n{err}", "Launch Error", wx.OK | wx.ICON_ERROR)
 
 if __name__ == "__main__":
     app = wx.App()
+    app.SetAppName("IPTVClient")
     IPTVClient()
     app.MainLoop()
