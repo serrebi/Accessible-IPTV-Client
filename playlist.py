@@ -1144,7 +1144,8 @@ class EPGDatabase:
             stream = None
             try:
                 stream = _open_stream(src)
-                parser = ET.XMLPullParser(['end'])
+                parser = ET.XMLPullParser(['start', 'end'])
+                elem_stack: List[ET.Element] = []
                 _logger.debug("EPG START src=%s (mem=%sMB)", src, _mem_mb())
                 self.conn.execute("BEGIN IMMEDIATE")
 
@@ -1155,7 +1156,16 @@ class EPGDatabase:
                     if not chunk:
                         break
                     parser.feed(chunk)
-                    for _, elem in parser.read_events():
+                    for event, elem in parser.read_events():
+                        if event == 'start':
+                            elem_stack.append(elem)
+                            continue
+                        # event == 'end'
+                        try:
+                            elem_stack.pop()
+                        except IndexError:
+                            elem_stack = []
+                        parent = elem_stack[-1] if elem_stack else None
                         tag = elem.tag.rsplit('}', 1)[-1]
                         if tag == 'channel':
                             ch_id = elem.get("id", "")
@@ -1186,6 +1196,15 @@ class EPGDatabase:
                                     self.commit()
                                     _logger.debug("EPG COMMIT src=%s progs+%d total=%d mem=%sMB", src, BATCH, prog_count, _mem_mb())
                                     inserted_since_commit = 0
+                        # Clear processed nodes and detach them from their parent so
+                        # completed <programme>/<channel> elements don't accumulate.
+                        if tag in {'channel', 'programme'}:
+                            try:
+                                elem.clear()
+                                if parent is not None:
+                                    parent.remove(elem)
+                            except Exception:
+                                pass
                 
                 parser.close() # Finalize
                 self.commit()
