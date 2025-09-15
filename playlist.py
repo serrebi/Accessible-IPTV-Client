@@ -13,7 +13,26 @@ import datetime
 import logging
 import logging.handlers
 import tempfile
+import random
+from providers import generate_provider_id
 from typing import Dict, List, Optional, Tuple, Set
+
+
+class _FieldAccessible(wx.Accessible):
+    def __init__(self, label: str, description: str):
+        super().__init__()
+        self._label = label
+        self._description = description
+
+    def GetName(self, childId):
+        if childId in (0, wx.ACC_SELF):
+            return wx.ACC_OK, self._label
+        return wx.ACC_NOT_IMPLEMENTED, None
+
+    def GetDescription(self, childId):
+        if childId in (0, wx.ACC_SELF):
+            return wx.ACC_OK, self._description
+        return wx.ACC_NOT_IMPLEMENTED, None
 
 # =========================
 # Debug logging (rotating file) + memory helpers
@@ -1111,6 +1130,47 @@ class EPGDatabase:
                 final.append(r)
         return final
 
+    def get_recent_programmes(self, channel: Dict[str, str], hours: int = 48, limit: int = 60) -> List[Dict[str, str]]:
+        matches, _ = self.get_matching_channel_ids(channel)
+        if not matches:
+            return []
+        now = self._utcnow()
+        now_str = now.strftime("%Y%m%d%H%M%S")
+        cutoff = (now - datetime.timedelta(hours=hours)).strftime("%Y%m%d%H%M%S")
+        c = self.conn.cursor()
+        results: List[Dict[str, str]] = []
+        seen: Set[Tuple[str, str, str]] = set()
+        per_match = max(1, limit // max(1, len(matches)))
+        ordered = sorted(matches, key=lambda m: -m.get('score', 0))[:5]
+        for m in ordered:
+            ch_id = m.get('id')
+            if not ch_id:
+                continue
+            rows = c.execute(
+                """
+                SELECT title, start, end
+                FROM programmes
+                WHERE channel_id = ? AND end <= ? AND end >= ?
+                ORDER BY start DESC
+                LIMIT ?
+                """,
+                (ch_id, now_str, cutoff, per_match)
+            ).fetchall()
+            for title, start, end in rows:
+                key = (ch_id, start, end)
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append({
+                    "channel_id": ch_id,
+                    "channel_name": m.get('display_name') or channel.get("name", ""),
+                    "title": title,
+                    "start": start,
+                    "end": end
+                })
+        results.sort(key=lambda r: r["start"], reverse=True)
+        return results[:limit]
+
     # =========================
     # Streaming importer with detailed debug
     # =========================
@@ -1341,13 +1401,15 @@ class PlaylistManagerDialog(wx.Dialog):
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.add_file_btn = wx.Button(panel, label="Add File")
         self.add_url_btn = wx.Button(panel, label="Add URL")
+        self.add_xtream_btn = wx.Button(panel, label="Add Xtream Codes")
+        self.add_stalker_btn = wx.Button(panel, label="Add Stalker Portal")
         self.remove_btn = wx.Button(panel, label="Remove Selected")
-        for btn in (self.add_file_btn, self.add_url_btn, self.remove_btn):
+        for btn in (self.add_file_btn, self.add_url_btn, self.add_xtream_btn, self.add_stalker_btn, self.remove_btn):
             btn_sizer.Add(btn, 0, wx.ALL, 2)
         main_sizer.Add(btn_sizer, 0, wx.EXPAND)
         self.lb = wx.ListBox(panel, style=wx.LB_SINGLE)
         for src in self.playlist_sources:
-            self.lb.Append(src)
+            self.lb.Append(self._format_source_label(src))
         if self.playlist_sources:
             self.lb.SetSelection(0)
         main_sizer.Add(self.lb, 1, wx.EXPAND | wx.ALL, 5)
@@ -1360,6 +1422,8 @@ class PlaylistManagerDialog(wx.Dialog):
         panel.SetSizer(main_sizer)
         self.add_file_btn.Bind(wx.EVT_BUTTON, self.OnAddFile)
         self.add_url_btn.Bind(wx.EVT_BUTTON, self.OnAddURL)
+        self.add_xtream_btn.Bind(wx.EVT_BUTTON, self.OnAddXtream)
+        self.add_stalker_btn.Bind(wx.EVT_BUTTON, self.OnAddStalker)
         self.remove_btn.Bind(wx.EVT_BUTTON, self.OnRemove)
 
     def OnAddFile(self, _):
@@ -1367,7 +1431,7 @@ class PlaylistManagerDialog(wx.Dialog):
             if dlg.ShowModal() == wx.ID_OK:
                 path = dlg.GetPath()
                 self.playlist_sources.append(path)
-                self.lb.Append(path)
+                self.lb.Append(self._format_source_label(path))
 
     def OnAddURL(self, _):
         with wx.TextEntryDialog(self, "Enter M3U URL") as dlg:
@@ -1375,7 +1439,27 @@ class PlaylistManagerDialog(wx.Dialog):
                 url = dlg.GetValue().strip()
                 if url:
                     self.playlist_sources.append(url)
-                    self.lb.Append(url)
+                    self.lb.Append(self._format_source_label(url))
+
+    def OnAddXtream(self, _):
+        dlg = XtreamCodesDialog(self)
+        if dlg.ShowModal() == wx.ID_OK:
+            data = dlg.get_data()
+            if data:
+                data.setdefault("id", generate_provider_id())
+                self.playlist_sources.append(data)
+                self.lb.Append(self._format_source_label(data))
+        dlg.Destroy()
+
+    def OnAddStalker(self, _):
+        dlg = StalkerPortalDialog(self)
+        if dlg.ShowModal() == wx.ID_OK:
+            data = dlg.get_data()
+            if data:
+                data.setdefault("id", generate_provider_id())
+                self.playlist_sources.append(data)
+                self.lb.Append(self._format_source_label(data))
+        dlg.Destroy()
 
     def OnRemove(self, _):
         i = self.lb.GetSelection()
@@ -1383,8 +1467,273 @@ class PlaylistManagerDialog(wx.Dialog):
             self.playlist_sources.pop(i)
             self.lb.Delete(i)
 
+    def _format_source_label(self, src):
+        if isinstance(src, dict):
+            stype = (src.get("type") or "").lower()
+            name = src.get("name") or src.get("username") or src.get("base_url") or "Provider"
+            if stype == "xtream":
+                return f"Xtream Codes – {name}"
+            if stype == "stalker":
+                return f"Stalker Portal – {name}"
+            return f"Provider – {name}"
+        return src
+
     def GetResult(self):
         return self.playlist_sources
+
+
+class XtreamCodesDialog(wx.Dialog):
+    STREAM_TYPES = ["m3u_plus", "m3u", "enigma2"]
+    OUTPUT_TYPES = ["ts", "m3u8", "rtmp"]
+
+    def __init__(self, parent):
+        super().__init__(parent, title="Add Xtream Codes Account")
+        self._build_ui()
+        self.CenterOnParent()
+
+    def _build_ui(self):
+        outer = wx.BoxSizer(wx.VERTICAL)
+        panel = wx.Panel(self)
+        grid = wx.FlexGridSizer(0, 2, 6, 10)
+        grid.AddGrowableCol(1, 1)
+
+        def add_row(label, ctrl, hint=None):
+            text = wx.StaticText(panel, label=f"{label}:")
+            text.SetName(f"{label} label")
+            if hasattr(text, "SetAccessibleName"):
+                text.SetAccessibleName(f"{label} label")
+            ctrl.SetName(label)
+            if hasattr(ctrl, "SetAccessibleName"):
+                ctrl.SetAccessibleName(label)
+            desc = hint or f"{label} field"
+            if hasattr(ctrl, "SetAccessibleDescription"):
+                ctrl.SetAccessibleDescription(desc)
+            if hint:
+                ctrl.SetToolTip(hint)
+            if hasattr(ctrl, "SetHelpText") and not isinstance(ctrl, wx.ComboBox):
+                ctrl.SetHelpText(desc)
+            # Only editable text controls support SetHint without assertions on Windows.
+            if isinstance(ctrl, wx.TextCtrl) and hint and hasattr(ctrl, "SetHint"):
+                try:
+                    ctrl.SetHint(hint)
+                except Exception:
+                    pass
+            if hasattr(ctrl, "SetAccessible"):
+                acc = _FieldAccessible(label, desc)
+                ctrl.SetAccessible(acc)
+                ctrl._field_accessible = acc
+            grid.Add(text, 0, wx.ALIGN_RIGHT | wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(ctrl, 1, wx.EXPAND)
+
+        self.name_ctrl = wx.TextCtrl(panel)
+        self.url_ctrl = wx.TextCtrl(panel)
+        self.user_ctrl = wx.TextCtrl(panel)
+        self.pass_ctrl = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        self.stream_ctrl = wx.ComboBox(panel, choices=self.STREAM_TYPES, value="m3u_plus", style=wx.CB_READONLY)
+        self.output_ctrl = wx.ComboBox(panel, choices=self.OUTPUT_TYPES, value="ts", style=wx.CB_READONLY)
+        self.auto_epg_ctrl = wx.CheckBox(panel, label="Automatically add XMLTV URL")
+        self.auto_epg_ctrl.SetName("Automatically add XMLTV URL")
+        if hasattr(self.auto_epg_ctrl, "SetAccessibleName"):
+            self.auto_epg_ctrl.SetAccessibleName("Automatically add XMLTV URL")
+        self.auto_epg_ctrl.SetToolTip("Include the provider's XMLTV guide automatically")
+        self.auto_epg_ctrl.SetValue(True)
+
+        add_row("Display name", self.name_ctrl, "Optional nickname for this Xtream Codes account")
+        add_row("Portal base URL", self.url_ctrl, "Base URL of the Xtream Codes server")
+        add_row("Username", self.user_ctrl, "Xtream Codes username")
+        add_row("Password", self.pass_ctrl, "Xtream Codes password")
+        add_row("Playlist type", self.stream_ctrl, "Select the playlist format to download")
+        add_row("Stream output", self.output_ctrl, "Preferred stream container format")
+        grid.Add(wx.StaticText(panel, label=""))
+        grid.Add(self.auto_epg_ctrl)
+
+        panel.SetSizer(grid)
+        outer.Add(panel, 1, wx.ALL | wx.EXPAND, 12)
+
+        btn_sizer = wx.StdDialogButtonSizer()
+        self.ok_btn = wx.Button(self, wx.ID_OK, "Add")
+        self.cancel_btn = wx.Button(self, wx.ID_CANCEL)
+        btn_sizer.AddButton(self.ok_btn)
+        btn_sizer.AddButton(self.cancel_btn)
+        btn_sizer.Realize()
+        outer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 12)
+
+        self.ok_btn.Bind(wx.EVT_BUTTON, self._on_ok)
+        self.ok_btn.SetDefault()
+        self.cancel_btn.Bind(wx.EVT_BUTTON, self._on_cancel)
+
+        self.SetSizerAndFit(outer)
+        self.SetEscapeId(wx.ID_CANCEL)
+        self.Bind(wx.EVT_CLOSE, self._on_close)
+
+    def _on_ok(self, event):
+        if not self.user_ctrl.GetValue().strip() or not self.pass_ctrl.GetValue().strip() or not self.url_ctrl.GetValue().strip():
+            wx.MessageBox("Username, password, and URL are required.", "Validation", wx.OK | wx.ICON_WARNING)
+            return
+        self.EndModal(wx.ID_OK)
+
+    def _on_cancel(self, event):
+        if self.IsModal():
+            self.EndModal(wx.ID_CANCEL)
+        else:
+            self.Destroy()
+
+    def _on_close(self, event):
+        self._on_cancel(event)
+
+    def get_data(self):
+        url = self.url_ctrl.GetValue().strip()
+        username = self.user_ctrl.GetValue().strip()
+        password = self.pass_ctrl.GetValue().strip()
+        if not url or not username or not password:
+            return None
+        return {
+            "type": "xtream",
+            "name": self.name_ctrl.GetValue().strip(),
+            "base_url": url,
+            "username": username,
+            "password": password,
+            "stream_type": self.stream_ctrl.GetValue() or "m3u_plus",
+            "output": self.output_ctrl.GetValue() or "ts",
+            "auto_epg": self.auto_epg_ctrl.GetValue()
+        }
+
+
+class StalkerPortalDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Add Stalker Portal Account")
+        self._build_ui()
+        self.CenterOnParent()
+
+    def _build_ui(self):
+        outer = wx.BoxSizer(wx.VERTICAL)
+        panel = wx.Panel(self)
+        grid = wx.FlexGridSizer(0, 2, 6, 10)
+        grid.AddGrowableCol(1, 1)
+
+        def add_row(label, ctrl, hint=None):
+            text = wx.StaticText(panel, label=f"{label}:")
+            text.SetName(f"{label} label")
+            if hasattr(text, "SetAccessibleName"):
+                text.SetAccessibleName(f"{label} label")
+            ctrl.SetName(label)
+            if hasattr(ctrl, "SetAccessibleName"):
+                ctrl.SetAccessibleName(label)
+            desc = hint or f"{label} field"
+            if hasattr(ctrl, "SetAccessibleDescription"):
+                ctrl.SetAccessibleDescription(desc)
+            if hint:
+                ctrl.SetToolTip(hint)
+            if hasattr(ctrl, "SetHelpText") and not isinstance(ctrl, wx.ComboBox):
+                ctrl.SetHelpText(desc)
+            if isinstance(ctrl, wx.TextCtrl) and hint and hasattr(ctrl, "SetHint"):
+                try:
+                    ctrl.SetHint(hint)
+                except Exception:
+                    pass
+            if hasattr(ctrl, "SetAccessible"):
+                acc = _FieldAccessible(label, desc)
+                ctrl.SetAccessible(acc)
+                ctrl._field_accessible = acc
+            grid.Add(text, 0, wx.ALIGN_RIGHT | wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(ctrl, 1, wx.EXPAND)
+
+        self.name_ctrl = wx.TextCtrl(panel)
+        self.url_ctrl = wx.TextCtrl(panel)
+        self.user_ctrl = wx.TextCtrl(panel)
+        self.pass_ctrl = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        self.mac_ctrl = wx.TextCtrl(panel)
+        self.auto_epg_ctrl = wx.CheckBox(panel, label="Attempt to add provider XMLTV")
+        self.auto_epg_ctrl.SetName("Attempt to add provider XMLTV")
+        if hasattr(self.auto_epg_ctrl, "SetAccessibleName"):
+            self.auto_epg_ctrl.SetAccessibleName("Attempt to add provider XMLTV")
+        self.auto_epg_ctrl.SetToolTip("Try to add the portal's XMLTV guide automatically")
+        self.auto_epg_ctrl.SetValue(True)
+
+        self.mac_ctrl.SetValue(self._default_mac())
+
+        self.mac_btn = wx.Button(panel, label="Randomise MAC")
+        self.mac_btn.Bind(wx.EVT_BUTTON, self._on_random_mac)
+
+        add_row("Display name", self.name_ctrl, "Optional nickname for this portal account")
+        add_row("Portal base URL", self.url_ctrl, "Base URL of the Stalker/Ministra portal")
+        add_row("Username", self.user_ctrl, "Portal account username")
+        add_row("Password", self.pass_ctrl, "Portal account password")
+        add_row("MAC address", self.mac_ctrl, "MAC address presented to the portal")
+        grid.Add(wx.StaticText(panel, label=""))
+        grid.Add(self.mac_btn)
+        grid.Add(wx.StaticText(panel, label=""))
+        grid.Add(self.auto_epg_ctrl)
+
+        panel.SetSizer(grid)
+        outer.Add(panel, 1, wx.ALL | wx.EXPAND, 12)
+
+        btn_sizer = wx.StdDialogButtonSizer()
+        self.ok_btn = wx.Button(self, wx.ID_OK, "Add")
+        self.cancel_btn = wx.Button(self, wx.ID_CANCEL)
+        btn_sizer.AddButton(self.ok_btn)
+        btn_sizer.AddButton(self.cancel_btn)
+        btn_sizer.Realize()
+        outer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 12)
+
+        self.ok_btn.Bind(wx.EVT_BUTTON, self._on_ok)
+        self.ok_btn.SetDefault()
+        self.cancel_btn.Bind(wx.EVT_BUTTON, self._on_cancel)
+
+        self.SetSizerAndFit(outer)
+        self.SetEscapeId(wx.ID_CANCEL)
+        self.Bind(wx.EVT_CLOSE, self._on_close)
+
+    def _sanitize_mac(self, value: str) -> str:
+        value = value.replace('-', ':').replace('.', '')
+        value = value.upper()
+        if ':' not in value and len(value) == 12:
+            value = ':'.join(value[i:i+2] for i in range(0, 12, 2))
+        return value
+
+    def _default_mac(self) -> str:
+        prefix = [0x00, 0x1A, 0x79]
+        suffix = [random.randint(0x00, 0xFF) for _ in range(3)]
+        return ':'.join(f"{b:02X}" for b in prefix + suffix)
+
+    def _on_random_mac(self, _):
+        self.mac_ctrl.SetValue(self._default_mac())
+
+    def _on_ok(self, event):
+        if not self.user_ctrl.GetValue().strip() or not self.pass_ctrl.GetValue().strip() or not self.url_ctrl.GetValue().strip():
+            wx.MessageBox("Portal URL, username, and password are required.", "Validation", wx.OK | wx.ICON_WARNING)
+            return
+        mac = self._sanitize_mac(self.mac_ctrl.GetValue().strip())
+        if len(mac.split(':')) != 6:
+            wx.MessageBox("MAC address must contain six octets (e.g., 00:1A:79:12:34:56).", "Validation", wx.OK | wx.ICON_WARNING)
+            return
+        self.mac_ctrl.SetValue(mac)
+        self.EndModal(wx.ID_OK)
+
+    def _on_cancel(self, event):
+        if self.IsModal():
+            self.EndModal(wx.ID_CANCEL)
+        else:
+            self.Destroy()
+
+    def _on_close(self, event):
+        self._on_cancel(event)
+
+    def get_data(self):
+        url = self.url_ctrl.GetValue().strip()
+        username = self.user_ctrl.GetValue().strip()
+        password = self.pass_ctrl.GetValue().strip()
+        if not url or not username or not password:
+            return None
+        return {
+            "type": "stalker",
+            "name": self.name_ctrl.GetValue().strip(),
+            "base_url": url,
+            "username": username,
+            "password": password,
+            "mac": self.mac_ctrl.GetValue().strip(),
+            "auto_epg": self.auto_epg_ctrl.GetValue()
+        }
 
 # =========================
 # Helpers for region + playlist

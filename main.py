@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import urllib.request
+import urllib.parse
 import gzip
 import io
 import sqlite3
@@ -26,6 +27,11 @@ from options import (
 )
 from playlist import (
     EPGDatabase, EPGImportDialog, EPGManagerDialog, PlaylistManagerDialog
+)
+from providers import (
+    XtreamCodesClient, XtreamCodesConfig,
+    StalkerPortalClient, StalkerPortalConfig,
+    ProviderError, generate_provider_id
 )
 
 def set_linux_env():
@@ -177,6 +183,8 @@ class IPTVClient(wx.Frame):
         self.refresh_timer = None
         self.minimize_to_tray = bool(self.config.get("minimize_to_tray", False))
         self.tray_icon = None
+        self.provider_clients: Dict[str, object] = {}
+        self.provider_epg_sources: List[str] = []
 
         # batch-population state to avoid UI hangs
         self._populate_token = 0
@@ -267,16 +275,78 @@ class IPTVClient(wx.Frame):
         Crucially, it only starts the EPG import *after* playlists are loaded.
         """
         playlist_sources = self.config.get("playlists", [])
+        # Ensure all provider entries have persistent IDs so we can track clients.
+        mutated = False
+        for src in playlist_sources:
+            if isinstance(src, dict) and not src.get("id"):
+                src["id"] = generate_provider_id()
+                mutated = True
+        if mutated:
+            self.config["playlists"] = playlist_sources
+            save_config(self.config)
+
         channels_by_group: Dict[str, List[Dict[str, str]]] = {}
         all_channels: List[Dict[str, str]] = []
         valid_caches = set()
         seen_channel_keys = set()
-        results = [None] * len(playlist_sources)
+        results: List[Optional[Dict]] = [None] * len(playlist_sources)
+        provider_clients_local: Dict[str, object] = {}
+        provider_epg_sources: List[str] = []
+        provider_lock = threading.Lock()
 
         def fetch_playlist(idx, src):
-            text = None
             try:
-                if src.startswith(("http://", "https://")):
+                if isinstance(src, dict):
+                    stype = (src.get("type") or "").lower()
+                    provider_id = src.get("id") or src.get("provider_id")
+                    if stype == "xtream":
+                        cfg = XtreamCodesConfig(
+                            base_url=src.get("base_url") or src.get("url") or "",
+                            username=src.get("username", ""),
+                            password=src.get("password", ""),
+                            stream_type=src.get("stream_type", "m3u_plus"),
+                            output=src.get("output", "ts"),
+                            name=src.get("name"),
+                            auto_epg=bool(src.get("auto_epg", True)),
+                            provider_id=provider_id
+                        )
+                        client = XtreamCodesClient(cfg)
+                        text = client.fetch_playlist()
+                        provider_meta = {"provider-type": "xtream", "provider-id": provider_id}
+                        results[idx] = {"kind": "m3u", "text": text, "provider": provider_meta}
+                        with provider_lock:
+                            provider_clients_local[provider_id] = client
+                            if cfg.auto_epg:
+                                for epg in client.epg_urls():
+                                    if epg and epg not in provider_epg_sources:
+                                        provider_epg_sources.append(epg)
+                    elif stype == "stalker":
+                        cfg = StalkerPortalConfig(
+                            base_url=src.get("base_url") or src.get("url") or "",
+                            username=src.get("username", ""),
+                            password=src.get("password", ""),
+                            mac=src.get("mac", ""),
+                            name=src.get("name"),
+                            auto_epg=bool(src.get("auto_epg", True)),
+                            provider_id=provider_id
+                        )
+                        client = StalkerPortalClient(cfg)
+                        channels, epgs = client.fetch_channels()
+                        for ch in channels:
+                            ch.setdefault("provider-id", provider_id)
+                            ch.setdefault("provider-type", "stalker")
+                        results[idx] = {"kind": "channels", "channels": channels}
+                        with provider_lock:
+                            provider_clients_local[provider_id] = client
+                            for epg in epgs:
+                                if epg and epg not in provider_epg_sources:
+                                    provider_epg_sources.append(epg)
+                    else:
+                        results[idx] = None
+                    return
+
+                # Plain playlist path or URL
+                if isinstance(src, str) and src.startswith(("http://", "https://")):
                     cache_path = get_cache_path_for_url(src)
                     valid_caches.add(cache_path)
                     download = True
@@ -284,49 +354,66 @@ class IPTVClient(wx.Frame):
                         age = (datetime.datetime.now() - datetime.datetime.fromtimestamp(os.path.getmtime(cache_path))).total_seconds()
                         if age < 15 * 60:
                             download = False
-                    
+
                     if download:
                         with urllib.request.urlopen(
                             urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"}), timeout=60
                         ) as resp:
                             raw = resp.read()
-                            try: text = raw.decode("utf-8")
-                            except UnicodeDecodeError: text = raw.decode("latin-1", "ignore")
+                            try:
+                                text = raw.decode("utf-8")
+                            except UnicodeDecodeError:
+                                text = raw.decode("latin-1", "ignore")
                         with open(cache_path, "w", encoding="utf-8") as f:
                             f.write(text)
                     else:
                         with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
                             text = f.read()
+                    results[idx] = {"kind": "m3u", "text": text, "provider": None}
+                elif isinstance(src, str) and os.path.exists(src):
+                    with open(src, "r", encoding="utf-8", errors="ignore") as f:
+                        text = f.read()
+                    results[idx] = {"kind": "m3u", "text": text, "provider": None}
                 else:
-                    if os.path.exists(src):
-                        with open(src, "r", encoding="utf-8", errors="ignore") as f:
-                            text = f.read()
-                results[idx] = text
-            except Exception:
-                results[idx] = None
+                    results[idx] = None
+            except Exception as e:
+                results[idx] = {"error": str(e)}
         
         threads = []
         for idx, src in enumerate(playlist_sources):
             t = threading.Thread(target=fetch_playlist, args=(idx, src), daemon=True)
             t.start()
             threads.append(t)
-        
+
         for t in threads:
             t.join()
 
-        for text in results:
-            if not text: continue
-            try:
-                channels = self._parse_m3u_return(text)
-                for ch in channels:
-                    key = (ch.get("name", ""), ch.get("url", ""))
-                    if key in seen_channel_keys: continue
-                    seen_channel_keys.add(key)
-                    grp = ch.get("group") or "Uncategorized"
-                    channels_by_group.setdefault(grp, []).append(ch)
-                    all_channels.append(ch)
-            except Exception:
+        # Build channel aggregates
+        for result in results:
+            if not result:
                 continue
+            if result.get("error"):
+                continue
+            if result.get("kind") == "channels":
+                channels = result.get("channels", [])
+            else:
+                text = result.get("text")
+                if not text:
+                    continue
+                channels = self._parse_m3u_return(text, provider_info=result.get("provider"))
+
+            for ch in channels or []:
+                key = (ch.get("name", ""), ch.get("url", ""), ch.get("provider-id", ""))
+                if key in seen_channel_keys:
+                    continue
+                seen_channel_keys.add(key)
+                grp = ch.get("group") or "Uncategorized"
+                channels_by_group.setdefault(grp, []).append(ch)
+                all_channels.append(ch)
+
+        # Replace provider mappings atomically after successful refresh
+        self.provider_clients = provider_clients_local
+        self.provider_epg_sources = provider_epg_sources
 
         def finish_playlist_load_and_start_background_tasks():
             self.channels_by_group = channels_by_group
@@ -372,6 +459,7 @@ class IPTVClient(wx.Frame):
         self.channel_list.Bind(wx.EVT_LISTBOX, lambda _: self.on_highlight())
         self.channel_list.Bind(wx.EVT_LISTBOX_DCLICK, lambda _: self.play_selected())  # original
         self.channel_list.Bind(wx.EVT_LEFT_DCLICK, self._on_lb_activate)  # GTK/mac fallback
+        self.channel_list.Bind(wx.EVT_CONTEXT_MENU, self._on_channel_context_menu)
 
         self.epg_display = wx.TextCtrl(p, style=wx.TE_READONLY | wx.TE_MULTILINE)
         self.url_display = wx.TextCtrl(p, style=wx.TE_READONLY | wx.TE_MULTILINE)
@@ -483,6 +571,46 @@ class IPTVClient(wx.Frame):
             self.play_selected()
             return  # swallow to prevent beep/focus issues
         event.Skip()
+
+    def _on_channel_context_menu(self, event):
+        if not self.displayed:
+            return
+        pos = event.GetPosition()
+        idx = self.channel_list.GetSelection()
+        if pos != wx.DefaultPosition and not (pos.x == -1 and pos.y == -1):
+            try:
+                local = self.channel_list.ScreenToClient(pos)
+                hit = self.channel_list.HitTest(local) if hasattr(self.channel_list, "HitTest") else (-1,)
+                hit_idx = hit[0] if isinstance(hit, tuple) else hit
+                if hit_idx not in (None, -1) and 0 <= hit_idx < len(self.displayed):
+                    self.channel_list.SetSelection(hit_idx)
+                    self.channel_list.SetFocus()
+                    idx = hit_idx
+            except Exception:
+                pass
+        if idx == wx.NOT_FOUND and self.channel_list.GetCount():
+            self.channel_list.SetSelection(0)
+            idx = 0
+        if idx == wx.NOT_FOUND or idx >= len(self.displayed):
+            return
+        item = self.displayed[idx]
+        channel = None
+        if item.get("type") == "channel":
+            channel = item.get("data")
+        elif item.get("type") == "epg":
+            channel = self._find_channel_for_epg(item.get("data", {}))
+        if not channel:
+            return
+        menu = wx.Menu()
+        play_item = menu.Append(wx.ID_ANY, "Play")
+        menu.Bind(wx.EVT_MENU, lambda evt: self.play_selected(), play_item)
+        if self._channel_has_catchup(channel):
+            catch_item = menu.Append(wx.ID_ANY, "Play Catch-up…")
+            menu.Bind(wx.EVT_MENU, lambda evt, ch=channel: self._open_catchup_dialog(ch), catch_item)
+        try:
+            self.channel_list.PopupMenu(menu)
+        finally:
+            menu.Destroy()
 
     def on_toggle_min_to_tray(self, event):
         if platform.system() == "Linux":
@@ -690,7 +818,11 @@ class IPTVClient(wx.Frame):
         self.on_group_select()
 
     def reload_epg_sources(self):
-        self.epg_sources = self.config.get("epgs", [])
+        base = list(self.config.get("epgs", []))
+        for epg in getattr(self, "provider_epg_sources", []):
+            if epg not in base:
+                base.append(epg)
+        self.epg_sources = base
 
     def start_epg_import_background(self):
         sources = list(self.epg_sources)
@@ -769,35 +901,143 @@ class IPTVClient(wx.Frame):
             self.epg_cache.clear()
         self.on_highlight()
 
-    def _parse_m3u_return(self, text):
+    def _parse_m3u_return(self, text, provider_info=None):
         lines = text.splitlines()
         out = []
-        meta = {}
+        meta: Dict[str, str] = {}
+        provider_info = provider_info or {}
+        provider_id = provider_info.get("provider-id")
+        provider_type = provider_info.get("provider-type")
+
+        def _parse_attrs(segment: str) -> Dict[str, str]:
+            attrs: Dict[str, str] = {}
+            if not segment:
+                return attrs
+            for key, val in re.findall(r'([A-Za-z0-9_\-]+)="([^"]*)"', segment):
+                attrs[key.lower()] = val.strip()
+            for key, val in re.findall(r'([A-Za-z0-9_\-]+)=([^",\s]+)', segment):
+                attrs.setdefault(key.lower(), val.strip())
+            return attrs
+
         for line in lines:
             s = line.strip()
             if not s:
                 continue
             if s.upper().startswith("#EXTINF"):
-                meta = {"name": "", "group": "", "tvg-id": "", "tvg-name": ""}
+                meta = {"name": "", "group": "", "tvg-id": "", "tvg-name": "", "tvg-logo": ""}
                 if "," in s:
                     meta["name"] = s.split(",", 1)[1].strip()
                 attrs_part = s.split(":", 1)[1] if ":" in s else ""
                 attr_segment = attrs_part.split(",", 1)[0]
-                for key, dst in (("group-title", "group"), ("tvg-id", "tvg-id"), ("tvg-name", "tvg-name")):
-                    m = re.search(r'%s="([^"]+)"' % key, attr_segment, flags=re.I)
-                    if not m:
-                        m = re.search(r"%s=([^,]+)" % key, attr_segment, flags=re.I)
-                    if m:
-                        meta[dst] = m.group(1).strip()
+                attrs = _parse_attrs(attr_segment)
+                meta["attrs"] = attrs
+                meta["group"] = attrs.get("group-title", meta["group"])
+                meta["tvg-id"] = attrs.get("tvg-id", meta["tvg-id"])
+                meta["tvg-name"] = attrs.get("tvg-name", meta["tvg-name"])
+                meta["tvg-logo"] = attrs.get("tvg-logo") or attrs.get("logo") or meta.get("tvg-logo", "")
+                if "tvg-rec" in attrs:
+                    meta["tvg-rec"] = attrs.get("tvg-rec")
+                if "timeshift" in attrs:
+                    meta["timeshift"] = attrs.get("timeshift")
+                if "catchup" in attrs:
+                    meta["catchup"] = attrs.get("catchup")
+                if "catchup-type" in attrs:
+                    meta["catchup-type"] = attrs.get("catchup-type")
+                if "catchup-days" in attrs:
+                    meta["catchup-days"] = attrs.get("catchup-days")
+                if "catchup-source" in attrs:
+                    meta["catchup-source"] = attrs.get("catchup-source")
+                if "catchup-offset" in attrs:
+                    meta["catchup-offset"] = attrs.get("catchup-offset")
+                if "http-user-agent" in attrs:
+                    meta["http-user-agent"] = attrs.get("http-user-agent")
+            elif s.startswith("#EXTVLCOPT"):
+                if ":" in s and "=" in s:
+                    _prefix, data = s.split(":", 1)
+                    key, value = data.split("=", 1)
+                    key = key.strip().lower()
+                    value = value.strip()
+                    if key in {"catchup-source", "catchup_url"}:
+                        meta["catchup-source"] = value
+                    elif key == "catchup-days":
+                        meta["catchup-days"] = value
+                    elif key == "catchup-type":
+                        meta["catchup-type"] = value
+                    elif key == "http-user-agent":
+                        meta["http-user-agent"] = value
+            elif s.startswith("#KODIPROP"):
+                if ":" in s and "=" in s:
+                    _prefix, data = s.split(":", 1)
+                    key, value = data.split("=", 1)
+                    key = key.strip().lower()
+                    value = value.strip()
+                    if key.endswith("catchup_days"):
+                        meta["catchup-days"] = value
+                    elif key.endswith("catchup_source"):
+                        meta["catchup-source"] = value
             elif s.startswith("#"):
                 continue
             else:
                 url = s
                 name = meta.get("name", "")
                 grp = meta.get("group", "") or extract_group(name)
-                out.append({"name": name, "group": grp, "url": url, "tvg-id": meta.get("tvg-id", ""), "tvg-name": meta.get("tvg-name", "")})
+                channel = {
+                    "name": name,
+                    "group": grp,
+                    "url": url,
+                    "tvg-id": meta.get("tvg-id", ""),
+                    "tvg-name": meta.get("tvg-name", "")
+                }
+                if provider_id:
+                    channel["provider-id"] = provider_id
+                if provider_type:
+                    channel["provider-type"] = provider_type
+                if meta.get("tvg-logo"):
+                    channel["tvg-logo"] = meta.get("tvg-logo")
+                if meta.get("tvg-rec"):
+                    channel["tvg-rec"] = meta.get("tvg-rec")
+                if meta.get("timeshift"):
+                    channel["timeshift"] = meta.get("timeshift")
+                if meta.get("catchup"):
+                    channel["catchup"] = meta.get("catchup")
+                if meta.get("catchup-type"):
+                    channel["catchup-type"] = meta.get("catchup-type")
+                if meta.get("catchup-days"):
+                    channel["catchup-days"] = meta.get("catchup-days")
+                if meta.get("catchup-source"):
+                    channel["catchup-source"] = meta.get("catchup-source")
+                if meta.get("catchup-offset"):
+                    channel["catchup-offset"] = meta.get("catchup-offset")
+                if meta.get("http-user-agent"):
+                    channel["http-user-agent"] = meta.get("http-user-agent")
+                if meta.get("attrs"):
+                    channel["_m3u-attrs"] = meta.get("attrs")
+                stream_id = self._extract_stream_id(url)
+                if stream_id:
+                    channel["stream-id"] = stream_id
+                out.append(channel)
                 meta = {}
         return out
+
+    def _extract_stream_id(self, url: str) -> str:
+        try:
+            path = urllib.parse.urlparse(url).path
+        except Exception:
+            path = ""
+        if not path:
+            return ""
+        parts = [p for p in path.split("/") if p]
+        if not parts:
+            return ""
+        last = parts[-1]
+        m = re.match(r"(\d+)", last)
+        if m:
+            return m.group(1)
+        if len(parts) >= 2:
+            m = re.match(r"(\d+)", parts[-2])
+            if m:
+                return m.group(1)
+        return ""
 
     def on_group_select(self):
         sel = self.group_list.GetSelection()
@@ -1083,6 +1323,138 @@ class IPTVClient(wx.Frame):
         except Exception:
             pass
 
+    def _find_channel_for_epg(self, show: Dict[str, str]) -> Optional[Dict[str, str]]:
+        cname = show.get("channel_name", "")
+        if not cname:
+            return None
+        canonical = canonicalize_name(cname)
+        for ch in self.all_channels:
+            if canonicalize_name(ch.get("name", "")) == canonical:
+                return ch
+        return None
+
+    def _channel_has_catchup(self, channel: Dict[str, str]) -> bool:
+        if channel.get("catchup-source") or channel.get("catchup"):
+            return True
+        if channel.get("provider-type") == "stalker":
+            pdata = channel.get("provider-data") or {}
+            return bool(pdata.get("allow_timeshift") or pdata.get("archive"))
+        return False
+
+    def _parse_epg_time(self, value: str) -> datetime.datetime:
+        dt = datetime.datetime.strptime(value, "%Y%m%d%H%M%S")
+        return dt.replace(tzinfo=datetime.timezone.utc)
+
+    def _resolve_show_url(self, channel: Dict[str, str], show: Dict[str, str]) -> tuple:
+        start_dt = self._parse_epg_time(show.get("start"))
+        end_dt = self._parse_epg_time(show.get("end"))
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        if start_dt <= now <= end_dt:
+            return self._resolve_live_url(channel), False
+
+        if end_dt < now:
+            if not self._channel_has_catchup(channel):
+                raise ProviderError("This channel does not provide catch-up streaming.")
+            if not self._within_catchup_window(channel, start_dt):
+                raise ProviderError("This programme is older than the catch-up window allows.")
+            url = self._resolve_catchup_url(channel, start_dt, end_dt)
+            if not url:
+                raise ProviderError("Unable to construct catch-up URL for this programme.")
+            return url, True
+
+        # Future programme: return live stream so playback starts when available.
+        return self._resolve_live_url(channel), False
+
+    def _within_catchup_window(self, channel: Dict[str, str], start_dt: datetime.datetime) -> bool:
+        days = channel.get("catchup-days")
+        if not days:
+            return True
+        try:
+            span = int(float(days))
+        except (TypeError, ValueError):
+            return True
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return start_dt >= now - datetime.timedelta(days=span)
+
+    def _resolve_live_url(self, channel: Dict[str, str]) -> str:
+        url = channel.get("url", "")
+        provider_type = channel.get("provider-type")
+        provider_id = channel.get("provider-id")
+
+        if provider_type == "stalker":
+            if not provider_id:
+                raise ProviderError("Stalker portal entry missing provider identifier.")
+            client = self.provider_clients.get(provider_id)
+            if not client:
+                raise ProviderError("Stalker portal client is not initialized.")
+            pdata = channel.get("provider-data") or {}
+            url = client.resolve_stream(pdata)
+            return url
+
+        return url
+
+    def _resolve_catchup_url(self, channel: Dict[str, str], start_dt: datetime.datetime, end_dt: datetime.datetime) -> str:
+        provider_type = channel.get("provider-type")
+        provider_id = channel.get("provider-id")
+        if provider_type == "stalker" and provider_id:
+            client = self.provider_clients.get(provider_id)
+            if not client:
+                raise ProviderError("Stalker portal client is not initialized.")
+            pdata = channel.get("provider-data") or {}
+            start_local = utc_to_local(start_dt)
+            duration = max(1, int((end_dt - start_dt).total_seconds() // 60))
+            start_str = start_local.strftime("%Y-%m-%d:%H-%M")
+            return client.resolve_catchup(pdata, start_str, duration)
+
+        return self._build_generic_catchup_url(channel, start_dt, end_dt)
+
+    def _build_generic_catchup_url(self, channel: Dict[str, str], start_dt: datetime.datetime, end_dt: datetime.datetime) -> str:
+        source = channel.get("catchup-source") or ""
+        if not source:
+            return ""
+        stream_id = channel.get("stream-id") or self._extract_stream_id(channel.get("url", ""))
+        if not stream_id:
+            return ""
+
+        src = source.rstrip('/')
+        if not src:
+            return ""
+        last_segment = src.rsplit('/', 1)[-1]
+        if not last_segment.isdigit():
+            src = f"{src}/{stream_id}"
+
+        start_local = utc_to_local(start_dt)
+        end_local = utc_to_local(end_dt)
+        offset = channel.get("catchup-offset")
+        try:
+            if offset:
+                hours = float(offset)
+                delta = datetime.timedelta(hours=hours)
+                start_local -= delta
+                end_local -= delta
+        except (TypeError, ValueError):
+            pass
+
+        duration = max(1, int((end_local - start_local).total_seconds() // 60))
+        start_token = start_local.strftime("%Y-%m-%d:%H-%M")
+        ctype = (channel.get("catchup-type") or channel.get("catchup") or "xc").lower()
+        if ctype in {"", "xc", "default", "catchup"}:
+            url = f"{src}/{start_token}/{duration}/"
+        elif ctype == "flussonic":
+            archive_stamp = start_local.strftime("%Y%m%d%H%M%S")
+            url = f"{src}/{archive_stamp}-{duration}.m3u8"
+        else:
+            url = f"{src}/{start_token}/{duration}/"
+
+        ua = channel.get("http-user-agent")
+        if ua:
+            if "|" in url:
+                url = f"{url}&User-Agent={urllib.parse.quote(ua)}"
+            else:
+                url = f"{url}|User-Agent={urllib.parse.quote(ua)}"
+        return url
+
     def _spawn_posix(self, exe_path_or_cmd, url):
         try:
             subprocess.Popen([exe_path_or_cmd, url], close_fds=True)
@@ -1107,17 +1479,38 @@ class IPTVClient(wx.Frame):
         if not (0 <= i < len(self.displayed)):
             return
         item = self.displayed[i]
-        url = ""
+
+        channel = None
+        show = None
         if item["type"] == "channel":
-            url = item["data"].get("url", "")
+            channel = item["data"]
         elif item["type"] == "epg":
-            chname = item["data"]["channel_name"]
-            for ch in self.all_channels:
-                if canonicalize_name(ch["name"]) == canonicalize_name(chname):
-                    url = ch.get("url", "")
-                    break
+            show = item["data"]
+            channel = self._find_channel_for_epg(show)
+            if not channel:
+                wx.MessageBox("Could not match this programme to a playlist channel.",
+                              "Not Found", wx.OK | wx.ICON_WARNING)
+                return
+        else:
+            return
+
+        try:
+            if show:
+                url, _ = self._resolve_show_url(channel, show)
+            else:
+                url = self._resolve_live_url(channel)
+        except ProviderError as err:
+            wx.MessageBox(f"Provider error: {err}", "Playback Error", wx.OK | wx.ICON_ERROR)
+            return
+        except Exception as err:
+            wx.MessageBox(f"Could not resolve stream URL:\n{err}", "Playback Error", wx.OK | wx.ICON_ERROR)
+            return
+
+        self._launch_stream(url)
+
+    def _launch_stream(self, url: str):
         if not url:
-            wx.MessageBox("Could not find stream URL for this show.", "Not Found",
+            wx.MessageBox("Could not find stream URL for this selection.", "Not Found",
                           wx.OK | wx.ICON_WARNING)
             return
 
@@ -1174,6 +1567,106 @@ class IPTVClient(wx.Frame):
 
         if not ok:
             wx.MessageBox(f"Failed to launch {self.default_player}:\n{err}", "Launch Error", wx.OK | wx.ICON_ERROR)
+
+    def _open_catchup_dialog(self, channel: Dict[str, str]):
+        programmes = self._get_catchup_programmes(channel)
+        if not programmes:
+            wx.MessageBox("No catch-up programmes are available for this channel.",
+                          "Catch-up", wx.OK | wx.ICON_INFORMATION)
+            return
+        dlg = CatchupDialog(self, channel.get("name", ""), programmes)
+        try:
+            if dlg.ShowModal() == wx.ID_OK:
+                selected = dlg.get_selection()
+                if not selected:
+                    return
+                show = {
+                    "channel_id": selected.get("channel_id", ""),
+                    "channel_name": channel.get("name", selected.get("channel_name", "")),
+                    "show_title": selected.get("title", ""),
+                    "start": selected.get("start", ""),
+                    "end": selected.get("end", "")
+                }
+                try:
+                    url, _ = self._resolve_show_url(channel, show)
+                except ProviderError as err:
+                    wx.MessageBox(f"Provider error: {err}", "Catch-up", wx.OK | wx.ICON_ERROR)
+                    return
+                except Exception as err:
+                    wx.MessageBox(f"Unable to prepare catch-up stream:\n{err}", "Catch-up", wx.OK | wx.ICON_ERROR)
+                    return
+                self._launch_stream(url)
+        finally:
+            dlg.Destroy()
+
+    def _get_catchup_programmes(self, channel: Dict[str, str]) -> List[Dict[str, str]]:
+        try:
+            db = EPGDatabase(get_db_path(), readonly=True)
+            try:
+                programmes = db.get_recent_programmes(channel, hours=72, limit=80)
+            finally:
+                db.close()
+        except Exception:
+            programmes = []
+        return programmes
+
+
+class CatchupDialog(wx.Dialog):
+    def __init__(self, parent, channel_name: str, programmes: List[Dict[str, str]]):
+        title = channel_name or "Catch-up"
+        super().__init__(parent, title=f"Catch-up: {title}", size=(520, 360))
+        self.programmes = programmes
+        panel = wx.Panel(self)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        intro = wx.StaticText(panel, label="Select a programme to play from catch-up:")
+        self.listbox = wx.ListBox(panel, style=wx.LB_SINGLE)
+        for prog in programmes:
+            self.listbox.Append(self._format_programme(prog))
+        if programmes:
+            self.listbox.SetSelection(0)
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        ok_btn = wx.Button(panel, id=wx.ID_OK, label="Play")
+        cancel_btn = wx.Button(panel, id=wx.ID_CANCEL)
+        btn_sizer.Add(ok_btn, 0, wx.ALL, 5)
+        btn_sizer.Add(cancel_btn, 0, wx.ALL, 5)
+        sizer.Add(intro, 0, wx.ALL, 10)
+        sizer.Add(self.listbox, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+        panel.SetSizer(sizer)
+        self.listbox.Bind(wx.EVT_LISTBOX_DCLICK, self._on_listbox_activate)
+        ok_btn.Bind(wx.EVT_BUTTON, self._on_ok)
+        self.SetMinSize((420, 320))
+        self.Layout()
+        self.CenterOnParent()
+
+    def _format_programme(self, prog: Dict[str, str]) -> str:
+        try:
+            start = datetime.datetime.strptime(prog.get("start", ""), "%Y%m%d%H%M%S").replace(tzinfo=datetime.timezone.utc)
+            end = datetime.datetime.strptime(prog.get("end", ""), "%Y%m%d%H%M%S").replace(tzinfo=datetime.timezone.utc)
+            start_local = utc_to_local(start)
+            end_local = utc_to_local(end)
+            window = f"{start_local.strftime('%Y-%m-%d %H:%M')} – {end_local.strftime('%H:%M')}"
+        except Exception:
+            window = prog.get("start", "")
+        title = prog.get("title", "") or "(No title)"
+        return f"{window}  |  {title}"
+
+    def _on_listbox_activate(self, _):
+        if self.programmes:
+            self.EndModal(wx.ID_OK)
+
+    def _on_ok(self, event):
+        if self.listbox.GetSelection() == wx.NOT_FOUND and self.programmes:
+            self.listbox.SetSelection(0)
+        if self.listbox.GetSelection() == wx.NOT_FOUND:
+            return
+        self.EndModal(wx.ID_OK)
+
+    def get_selection(self) -> Optional[Dict[str, str]]:
+        idx = self.listbox.GetSelection()
+        if idx == wx.NOT_FOUND or idx >= len(self.programmes):
+            return None
+        return self.programmes[idx]
 
 if __name__ == "__main__":
     app = wx.App()
