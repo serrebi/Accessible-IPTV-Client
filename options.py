@@ -10,6 +10,16 @@ import tempfile
 
 CONFIG_FILE = "iptvclient.conf"
 
+
+def _log_error(message: str):
+    """Log errors without requiring a wx.App (headless safe)."""
+    app = wx.GetApp() if hasattr(wx, "GetApp") else None
+    if app is not None:
+        wx.LogError(message)
+    else:
+        sys.stderr.write(f"{message}\n")
+
+
 def _is_writable_dir(path: str) -> bool:
     try:
         if not os.path.isdir(path):
@@ -36,30 +46,33 @@ def get_cwd_dir():
 def get_user_config_dir():
     """
     Gets the user-specific config directory, creating it if it doesn't exist.
-    This relies on a wx.App object having been created with AppName set.
+    This relies on a wx.App object having been created with AppName set, but
+    gracefully falls back when running headless or before wx.App exists.
     """
-    try:
-        # This will fail if wx.App doesn't exist, which is handled by the except block.
-        # We will set the AppName in main.py to ensure this works.
-        paths = wx.StandardPaths.Get()
-        config_dir = paths.GetUserConfigDir()
-        os.makedirs(config_dir, exist_ok=True)
-        return config_dir
-    except Exception:
-        # Fallback for headless environments or if called before wx.App is created.
-        if sys.platform == "win32":
-            path = os.path.join(os.getenv('APPDATA', os.path.expanduser('~')), "IPTVClient")
-        elif sys.platform == "darwin":
-            path = os.path.join(os.path.expanduser('~/Library/Application Support'), "IPTVClient")
-        else: # linux and other unix
-            path = os.path.join(os.getenv('XDG_CONFIG_HOME', os.path.expanduser('~/.config')), "IPTVClient")
-
+    app = wx.GetApp() if hasattr(wx, "GetApp") else None
+    if app is not None:
         try:
-            os.makedirs(path, exist_ok=True)
-            return path
+            paths = wx.StandardPaths.Get()
+            config_dir = paths.GetUserConfigDir()
+            os.makedirs(config_dir, exist_ok=True)
+            return config_dir
         except Exception:
-             # Last resort if we can't create any directory
-            return tempfile.gettempdir()
+            pass
+
+    # Fallback for headless environments or if called before wx.App is created.
+    if sys.platform == "win32":
+        path = os.path.join(os.getenv('APPDATA', os.path.expanduser('~')), "IPTVClient")
+    elif sys.platform == "darwin":
+        path = os.path.join(os.path.expanduser('~/Library/Application Support'), "IPTVClient")
+    else:  # linux and other unix
+        path = os.path.join(os.getenv('XDG_CONFIG_HOME', os.path.expanduser('~/.config')), "IPTVClient")
+
+    try:
+        os.makedirs(path, exist_ok=True)
+        return path
+    except Exception:
+        # Last resort if we can't create any directory
+        return tempfile.gettempdir()
 
 def get_config_read_candidates():
     # Priority: CWD (portable) -> App Dir (legacy) -> User Config Dir (standard)
@@ -100,14 +113,14 @@ def get_config_write_target():
         if _is_writable_dir(cwd):
             return os.path.join(cwd, CONFIG_FILE)
 
-    # Check for existing config in app_dir
-    if app_dir and app_dir != cwd and os.path.exists(os.path.join(app_dir, CONFIG_FILE)):
-        if _is_writable_dir(app_dir):
-            return os.path.join(app_dir, CONFIG_FILE)
-
     # If no existing config, prefer CWD for new portable config if writable
     if cwd and _is_writable_dir(cwd):
         return os.path.join(cwd, CONFIG_FILE)
+
+    # Check for existing config in app_dir (legacy portable installs)
+    if app_dir and app_dir != cwd and os.path.exists(os.path.join(app_dir, CONFIG_FILE)):
+        if _is_writable_dir(app_dir):
+            return os.path.join(app_dir, CONFIG_FILE)
 
     # Otherwise, fall back to the user config directory. This is the most robust location.
     return os.path.join(get_user_config_dir(), CONFIG_FILE)
@@ -132,15 +145,17 @@ def load_config() -> Dict:
                         data.setdefault(k, v)
                     return data
             except Exception as e:
-                wx.LogError(f"Failed to load config from {p}: {e}")
+                _log_error(f"Failed to load config from {p}: {e}")
                 # Do not break; try the next candidate location.
     return default
 
 def save_config(cfg: Dict):
     path = get_config_write_target()
     try:
-        # Ensure the directory exists before writing
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Ensure the directory exists before writing; skip if writing to CWD
+        dir_path = os.path.dirname(path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
         tmp_path = path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
@@ -156,7 +171,7 @@ def save_config(cfg: Dict):
                     pass
             os.rename(tmp_path, path)
     except Exception as e:
-        wx.LogError(f"Failed to save config to {path}: {e}")
+        _log_error(f"Failed to save config to {path}: {e}")
 
 def get_cache_dir():
     cache_dir = os.path.join(tempfile.gettempdir(), "iptv_cache")

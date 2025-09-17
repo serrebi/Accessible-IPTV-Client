@@ -876,6 +876,7 @@ class EPGDatabase:
         brand_text = canonicalize_name(strip_noise_words(name)).lower()
         playlist_brand_family = _reverse_brand_lookup(brand_text)
         pl_calls = extract_callsigns(" ".join([tvg_name, name, channel.get("group",""), tvg_id]))
+        pl_tokens = tokenize_channel_name(name)
 
         # HBO variant extraction (playlist side)
         pl_hbo_variant_raw = _extract_hbo_variant(" ".join([tvg_name, name, channel.get("group",""), tvg_id])) if playlist_brand_family == "hbo" else ""
@@ -895,11 +896,13 @@ class EPGDatabase:
             epg_text_norm = canonicalize_name(strip_noise_words(disp)).lower()
             epg_brand_family = _reverse_brand_lookup(epg_text_norm)
             epg_calls = extract_callsigns(" ".join([disp, ch_id]))
+            epg_tokens = tokenize_channel_name(disp)
+            token_overlap = len(pl_tokens & epg_tokens)
 
             families_align = (playlist_brand_family and epg_brand_family and playlist_brand_family == epg_brand_family)
             cs_delta, cs_reason = callsign_overlap_score(pl_calls, epg_calls)
 
-            if not (families_align or cs_delta >= 60):
+            if not (families_align or cs_delta >= 60 or token_overlap >= 1):
                 strong_us_local = False
                 if playlist_region == "us":
                     epg_markets_tmp, epg_provs_tmp, _ = _market_tokens_for("us", epg_brand_family, disp)
@@ -980,8 +983,7 @@ class EPGDatabase:
                             score -= 12
                             why.append('-hbo-variant-mismatch-ca')
 
-            epg_tokens = tokenize_channel_name(disp)
-            token_overlap = len(tokenize_channel_name(name) & epg_tokens)
+            # token_overlap already computed above; reuse for scoring
             score += min(20, token_overlap * 4)
             if token_overlap:
                 why.append(f'+tokens({token_overlap})')
@@ -1742,13 +1744,58 @@ class StalkerPortalDialog(wx.Dialog):
 def _derive_playlist_region(channel: Dict[str, str]) -> str:
     # Try group/title and tvg fields first
     g = channel.get("group") or ""
-    for tok in re.findall(r'\b[a-z]{2,3}\b', g.lower()):
+    for tok in re.findall(r'[a-z]{2,3}', g.lower()):
         if tok in group_synonyms():
             return tok
+
+    def _normalize_for_prefix(text: str) -> str:
+        return re.sub(r'[^a-z0-9]', '', (text or '').lower())
+
+    def _strip_quality_prefix(remainder: str) -> str:
+        # successively drop common quality/format tags so "ukfhd" -> ""
+        rem = remainder
+        changed = True
+        while rem and changed:
+            changed = False
+            for tag in STRIP_TAGS:
+                clean_tag = _normalize_for_prefix(tag)
+                if clean_tag and rem.startswith(clean_tag):
+                    rem = rem[len(clean_tag):]
+                    changed = True
+        return rem
+
+    # Handle compact group names like "UKSD" where region + quality tag are glued
+    compact_group = _normalize_for_prefix(g)
+    if compact_group:
+        for code, variants in group_synonyms().items():
+            for variant in variants:
+                prefix = _normalize_for_prefix(variant)
+                if prefix and compact_group.startswith(prefix):
+                    remainder = _strip_quality_prefix(compact_group[len(prefix):])
+                    if not remainder:
+                        return code
+
     # tvg-id suffixes sometimes carry region
     tid = (channel.get("tvg-id") or "").lower()
     for tok in re.findall(r'[.\-_:|/]([a-z]{2,3})', tid):
         if tok in group_synonyms():
             return tok
-    # fallback: guess from display name
-    return extract_group(channel.get("name",""))
+
+    # fallback: guess from display name / tvg-name, handling compact tags
+    name_field = channel.get("name", "")
+    for text in (name_field, channel.get("tvg-name", "")):
+        compact = _normalize_for_prefix(text)
+        if compact:
+            for code, variants in group_synonyms().items():
+                for variant in variants:
+                    prefix = _normalize_for_prefix(variant)
+                    if prefix and compact.startswith(prefix):
+                        remainder = _strip_quality_prefix(compact[len(prefix):])
+                        if not remainder:
+                            return code
+
+    # fallback to broader text search
+    if name_field:
+        return extract_group(name_field)
+    tvg_name = channel.get("tvg-name", "")
+    return extract_group(tvg_name) if tvg_name else ''
