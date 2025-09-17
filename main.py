@@ -102,7 +102,7 @@ class TrayIcon(wx.adv.TaskBarIcon):
         self.on_restore = on_restore
         self.on_exit = on_exit
         self.Bind(wx.adv.EVT_TASKBAR_LEFT_DCLICK, self.on_taskbar_activate)
-        self.Bind(wx.adv.EVT_TASKBAR_LEFT_DOWN, self.on_taskbar_activate)
+        self.Bind(wx.adv.EVT_TASKBAR_LEFT_UP, self.on_taskbar_activate)
         self.Bind(wx.EVT_MENU, self.on_menu_select)
         self.set_icon()
 
@@ -118,6 +118,12 @@ class TrayIcon(wx.adv.TaskBarIcon):
         return menu
 
     def on_taskbar_activate(self, event):
+        parent = self.parent
+        if not getattr(parent, "_tray_allow_restore", True):
+            return
+        is_shown = parent.IsShownOnScreen() if hasattr(parent, "IsShownOnScreen") else parent.IsShown()
+        if is_shown:
+            return
         self.on_restore()
 
     def on_menu_select(self, event):
@@ -183,6 +189,8 @@ class IPTVClient(wx.Frame):
         self.refresh_timer = None
         self.minimize_to_tray = bool(self.config.get("minimize_to_tray", False))
         self.tray_icon = None
+        self._tray_allow_restore = False
+        self._tray_ready_timer: Optional[wx.CallLater] = None
         self.provider_clients: Dict[str, object] = {}
         self.provider_epg_sources: List[str] = []
 
@@ -621,6 +629,8 @@ class IPTVClient(wx.Frame):
         save_config(self.config)
 
     def show_tray_icon(self):
+        self._tray_allow_restore = False
+        self._cancel_tray_ready_timer()
         if not self.tray_icon:
             self.tray_icon = TrayIcon(
                 self,
@@ -628,8 +638,11 @@ class IPTVClient(wx.Frame):
                 on_exit=self.exit_from_tray
             )
         self.Hide()
+        self._tray_ready_timer = wx.CallLater(250, self._enable_tray_restore)
 
     def restore_from_tray(self):
+        self._tray_allow_restore = False
+        self._cancel_tray_ready_timer()
         if self.tray_icon:
             try:
                 self.tray_icon.RemoveIcon()
@@ -642,6 +655,8 @@ class IPTVClient(wx.Frame):
         self.Iconize(False)
 
     def exit_from_tray(self):
+        self._tray_allow_restore = False
+        self._cancel_tray_ready_timer()
         if self.tray_icon:
             try:
                 self.tray_icon.RemoveIcon()
@@ -650,6 +665,19 @@ class IPTVClient(wx.Frame):
             self.tray_icon.Destroy()
             self.tray_icon = None
         self.Destroy()
+
+    def _enable_tray_restore(self):
+        self._tray_ready_timer = None
+        if self.tray_icon:
+            self._tray_allow_restore = True
+
+    def _cancel_tray_ready_timer(self):
+        if self._tray_ready_timer:
+            try:
+                self._tray_ready_timer.Stop()
+            except Exception:
+                pass
+            self._tray_ready_timer = None
 
     def on_minimize(self, event):
         if self.minimize_to_tray and event.IsIconized():
