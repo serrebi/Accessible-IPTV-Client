@@ -339,7 +339,7 @@ AFFILIATE_MARKETS: Dict[str, Dict[str, Dict[str, Set[str]]]] = {
 
 AFFILIATE_BRANDS: Set[str] = {
     "cbc","ctv","ctv2","citytv","global","tva","noovo","tsn","sportsnet",
-    "abc","nbc","cbs","fox","pbs","cw","mynetwork","telemundo","univision",
+    "abc","nbc","cbs","fox","fxx","pbs","cw","mynetwork","telemundo","univision",
     "bbc one","bbc two","itv","channel 4","channel 5","sky crime","sky mix","sky max",
     "ard","wdr","ndr","mdr","br","hr","rbb","swr","seven","nine","ten","sbs","tvnz 1","tvnz 2","three",
     "hbo",
@@ -459,6 +459,7 @@ def _reverse_brand_lookup(text: str) -> str:
     if "bbc one" in t: return "bbc one"
     if "bbc two" in t: return "bbc two"
     if "itv" in t: return "itv"
+    if re.search(r'\bfxx\b', t): return "fxx"
     if "citytv" in t or re.search(r'\bcity\b', t): return "citytv"
     if "ctv2" in t: return "ctv2"
     if re.search(r'\bctv\b', t): return "ctv"
@@ -852,15 +853,53 @@ class EPGDatabase:
         candidates = {}
 
         if tvg_id:
-            row = c.execute("SELECT id, group_tag, display_name FROM channels WHERE id = ?", (tvg_id,)).fetchone()
+            row = c.execute(
+                "SELECT id, group_tag, display_name FROM channels WHERE id = ? COLLATE NOCASE",
+                (tvg_id,)
+            ).fetchone()
             if row:
-                candidates[row[0]] = {'id': row[0], 'group_tag': row[1], 'score': 100, 'display_name': row[2], 'why': 'exact-id', 'ts_offset': 0}
+                candidates[row[0]] = {
+                    'id': row[0],
+                    'group_tag': row[1],
+                    'score': 100,
+                    'display_name': row[2],
+                    'why': 'exact-id',
+                    'ts_offset': 0
+                }
 
         if tvg_name:
             norm_tvg_name = canonicalize_name(strip_noise_words(tvg_name))
             rows = c.execute("SELECT id, group_tag, display_name FROM channels WHERE norm_name = ?", (norm_tvg_name,)).fetchall()
             for r in rows:
-                candidates[r[0]] = {'id': r[0], 'group_tag': r[1], 'score': 96, 'display_name': r[2], 'why': 'exact-tvg-name', 'ts_offset': 0}
+                existing = candidates.get(r[0])
+                score = 96
+                if existing and existing.get('score', 0) >= score:
+                    # Keep the stronger match (usually an exact-id hit).
+                    continue
+                candidates[r[0]] = {
+                    'id': r[0],
+                    'group_tag': r[1],
+                    'score': score,
+                    'display_name': r[2],
+                    'why': 'exact-tvg-name',
+                    'ts_offset': 0
+                }
+
+        if tvg_id:
+            wanted = tvg_id.strip().lower()
+            for k, v in list(candidates.items()):
+                if (k or '').strip().lower() == wanted:
+                    continue
+                adj = max(1, v.get('score', 0) - 60)
+                if adj == v.get('score'):
+                    continue
+                v = dict(v)
+                v['score'] = adj
+                extra = '-tvg-id-mismatch'
+                why = v.get('why', '') or ''
+                if extra not in why:
+                    v['why'] = f"{why} {extra}".strip()
+                candidates[k] = v
 
         return candidates
 
@@ -887,7 +926,24 @@ class EPGDatabase:
 
         # Drop exact-id/name candidates from the wrong region; keep only same or unknown region
         if playlist_region:
-            candidates = {k: v for k, v in candidates.items() if (v.get("group_tag") in ("", playlist_region))}
+            adjusted: Dict[str, dict] = {}
+            for k, v in candidates.items():
+                grp = v.get("group_tag") or ""
+                if grp in ("", playlist_region):
+                    adjusted[k] = v
+                    continue
+
+                # Keep strong exact matches even if the region metadata disagrees.
+                if v.get("why") in {"exact-id", "exact-tvg-name"}:
+                    lowered_score = max(1, v.get("score", 0) - 30)
+                    v = dict(v)
+                    v["score"] = lowered_score
+                    extra = "-region-mismatch"
+                    if extra not in v.get("why", ""):
+                        v["why"] = f"{v['why']} {extra}".strip()
+                    adjusted[k] = v
+                    continue
+            candidates = adjusted
         # FAST candidate set (no full channels scan)
         rows_all = self._candidate_rows(c, name, tvg_name, playlist_region)
         pl_markets, pl_provinces, _ = _market_tokens_for(playlist_region or "", playlist_brand_family, " ".join([tvg_name, name]))
@@ -989,12 +1045,19 @@ class EPGDatabase:
                 why.append(f'+tokens({token_overlap})')
 
             if score > 0:
+                existing = candidates.get(ch_id)
+                if existing and existing.get('score', 0) >= score:
+                    # Preserve stronger matches such as exact-id hits.
+                    continue
+                merged_why = " ".join(why)
+                if existing and existing.get('why') and existing['why'] not in merged_why:
+                    merged_why = f"{existing['why']} {merged_why}".strip()
                 candidates[ch_id] = {
                     'id': ch_id,
                     'group_tag': grp,
                     'score': score,
                     'display_name': disp,
-                    'why': " ".join(why),
+                    'why': merged_why,
                     'ts_offset': epg_ts if families_align else 0
                 }
 
