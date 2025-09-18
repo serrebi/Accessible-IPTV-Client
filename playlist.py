@@ -471,6 +471,7 @@ def _reverse_brand_lookup(text: str) -> str:
     if re.search(r'\bnbc\b', t): return "nbc"
     if re.search(r'\bcbs\b', t): return "cbs"
     if re.search(r'\bfox\b', t) and "fox news" not in t: return "fox"
+    if re.search(r'\bhgtv\b', t) or ("hogar" in t and "hgtv" in t): return "hgtv"
     if re.search(r'\bpbs\b', t): return "pbs"
     if re.search(r'\bcw\b', t): return "cw"
     if "my network" in t or re.search(r'\bmyn\b', t): return "mynetwork"
@@ -700,6 +701,13 @@ class EPGDatabase:
                 except Exception:
                     pass
         self._create_tables()
+        # Opportunistic repair: if we can write, reconcile any region mismatches
+        # caused by ambiguous display names (e.g., "CA" for California vs Canada).
+        if not self.readonly:
+            try:
+                self._repair_channel_regions_prefer_id()
+            except Exception:
+                pass
 
     def _create_tables(self):
         c = self.conn.cursor()
@@ -739,13 +747,38 @@ class EPGDatabase:
     def insert_channel(self, channel_id: str, display_name: str):
         name_region = extract_group(display_name)
         id_region = _detect_region_from_id(channel_id or "")
-        group_tag = name_region or id_region or ''
+        # Prefer region derived from the channel id when it contradicts the display name.
+        # This avoids false positives like "… Palm Springs CA …" (California) being tagged as Canada.
+        if id_region and name_region and id_region != name_region:
+            group_tag = id_region
+        else:
+            group_tag = name_region or id_region or ''
         norm = canonicalize_name(strip_noise_words(display_name))
         c = self.conn.cursor()
         c.execute(
             "INSERT OR REPLACE INTO channels (id, display_name, norm_name, group_tag) VALUES (?, ?, ?, ?)",
             (channel_id, display_name, norm, group_tag)
         )
+
+    def _repair_channel_regions_prefer_id(self):
+        """One-time reconciliation: if a channel's id clearly encodes a region
+        (e.g., ".us", ".ca", ".uk") but the stored group_tag differs, fix it.
+        Safe to run multiple times; only updates mismatches.
+        """
+        try:
+            c = self.conn.cursor()
+            rows = c.execute("SELECT id, group_tag FROM channels").fetchall()
+            fixes = []
+            for ch_id, grp in rows:
+                want = _detect_region_from_id(ch_id or "")
+                if want and want != (grp or ''):
+                    fixes.append((want, ch_id))
+            if fixes:
+                c.executemany("UPDATE channels SET group_tag = ? WHERE id = ?", fixes)
+                self.conn.commit()
+                _logger.debug("Repaired channel regions using id for %d rows", len(fixes))
+        except Exception as e:
+            _logger.debug("Region repair skipped/failed: %s", e)
 
     def insert_programme(self, channel_id: str, title: str, start_utc: str, end_utc: str):
         c = self.conn.cursor()
@@ -992,9 +1025,13 @@ class EPGDatabase:
                 else:
                     score -= 40
                     why.append('-other-region')
-                if playlist_brand_family == "hbo" and families_align and grp and playlist_region and grp != playlist_region:
-                    score -= 20
-                    why.append('-hbo-wrong-region')
+                if families_align and grp and playlist_region and grp != playlist_region:
+                    if playlist_brand_family == "hbo":
+                        score -= 20
+                        why.append('-hbo-wrong-region')
+                    elif playlist_brand_family == "hgtv":
+                        score -= 25
+                        why.append('-hgtv-wrong-region')
 
             epg_zone = _detect_zone(disp)
             if playlist_zone and epg_zone:
@@ -1083,7 +1120,7 @@ class EPGDatabase:
         # Sort by score
         matches = sorted(matches, key=lambda m: -m.get('score', 0))
 
-        # Probe schedule availability for top-N only and reorder with those first
+        # Probe schedule availability for top-N and reorder with region preference.
         try:
             avail = []
             for m in matches[:20]:
@@ -1093,7 +1130,22 @@ class EPGDatabase:
                 if DEBUG:
                     _logger.debug("MATCH CAND ch_id=%s score=%s grp=%s why=%s has_schedule_from_now=%s",
                                   ch_id, m.get('score'), m.get('group_tag'), _safe(m.get('why'), 300), has_any)
-            matches = [m for m, ok in avail if ok] + [m for m, ok in avail if not ok] + matches[20:]
+
+            # Keep top-by-score as anchor
+            anchor = matches[0]
+            # Region-aware priority: same region > unknown > other
+            def region_bucket(m):
+                grp = (m.get('group_tag') or '').strip().lower()
+                if grp == _playlist_region:
+                    return 0
+                if grp == '':
+                    return 1
+                return 2
+
+            ordered = sorted(avail, key=lambda t: (region_bucket(t[0]), not t[1], -t[0].get('score', 0)))
+            # Flatten and keep the anchor first if present
+            flat = [anchor] + [m for m, _ok in ordered if m is not anchor]
+            matches = flat + matches[20:]
         except Exception:
             pass
 
@@ -1807,6 +1859,11 @@ class StalkerPortalDialog(wx.Dialog):
 def _derive_playlist_region(channel: Dict[str, str]) -> str:
     # Try group/title and tvg fields first
     g = channel.get("group") or ""
+    # Prefer explicit country words anywhere in the group (e.g., "English Canada")
+    if g:
+        grp_detect = extract_group(g)
+        if grp_detect:
+            return grp_detect
     for tok in re.findall(r'[a-z]{2,3}', g.lower()):
         if tok in group_synonyms():
             return tok
