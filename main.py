@@ -1,6 +1,9 @@
 import os
 import sys
 import json
+import socket
+import tempfile
+import ctypes
 import urllib.request
 import urllib.parse
 import gzip
@@ -215,6 +218,23 @@ class IPTVClient(wx.Frame):
         
         self.Bind(wx.EVT_ICONIZE, self.on_minimize)
         self.Bind(wx.EVT_CLOSE, self.on_close)
+
+    def _channel_is_epg_exempt(self, channel: Dict[str, str]) -> bool:
+        """Detect channels that typically have no EPG (e.g., 24/7 loops).
+        We do NOT modify names; this only avoids unnecessary DB lookups/logs.
+        Rule: tvg-id empty AND name/group contains '24/7' or '24x7'.
+        """
+        try:
+            tvg_id = (channel.get("tvg-id") or channel.get("tvg_id") or "").strip()
+            if tvg_id:
+                return False
+            name = (channel.get("tvg-name") or channel.get("name") or "").lower()
+            group = (channel.get("group-title") or channel.get("group") or "").lower()
+            if "24/7" in name or "24x7" in name or "24/7" in group or "24x7" in group:
+                return True
+        except Exception:
+            pass
+        return False
 
     def start_playlist_load(self):
         """Kicks off ONLY the playlist loading thread."""
@@ -1198,6 +1218,11 @@ class IPTVClient(wx.Frame):
                 self.epg_display.SetValue("EPG is disabled in configuration.")
                 return
 
+            # If this channel is exempt (likely has no EPG), show a clear message and do not fetch.
+            if self._channel_is_epg_exempt(ch):
+                self.epg_display.SetValue("No EPG data for this channel.")
+                return
+
             key = canonicalize_name(cname)
             with self.epg_cache_lock:
                 cached = self.epg_cache.get(key)
@@ -1266,9 +1291,12 @@ class IPTVClient(wx.Frame):
             self._epg_fetch_inflight.add(key)
         try:
             try:
-                db = EPGDatabase(get_db_path(), readonly=True)
-                now_next = db.get_now_next(channel)
-                db.close()
+                if self._channel_is_epg_exempt(channel):
+                    now_next = None  # Do not query DB for exempt channels
+                else:
+                    db = EPGDatabase(get_db_path(), readonly=True)
+                    now_next = db.get_now_next(channel)
+                    db.close()
             except Exception:
                 now_next = None
         finally:
@@ -1293,7 +1321,10 @@ class IPTVClient(wx.Frame):
         if 0 <= i < len(self.displayed):
             item = self.displayed[i]
             if item["type"] == "channel" and canonicalize_name(item["data"].get("name", "")) == canonicalize_name(channel.get("name", "")):
-                msg = self._epg_msg_from_tuple(now_show, next_show)
+                if self._channel_is_epg_exempt(channel) and not (now_show or next_show):
+                    msg = "No EPG data for this channel."
+                else:
+                    msg = self._epg_msg_from_tuple(now_show, next_show)
                 if self.epg_importing:
                     msg = msg + "\n\nNote: EPG import in progress — newer program data may still arrive."
                 self.epg_display.SetValue(msg)
@@ -1341,6 +1372,9 @@ class IPTVClient(wx.Frame):
             if item["type"] != "channel":
                 return
             ch = item["data"]
+            # Skip channels that likely have no EPG to avoid repeated DB probes/log spam.
+            if self._channel_is_epg_exempt(ch):
+                return
             cname = ch.get("name", "")
             key = canonicalize_name(cname)
             # Only spawn a refresh if one isn't already running for this channel.
@@ -1483,24 +1517,68 @@ class IPTVClient(wx.Frame):
                 url = f"{url}|User-Agent={urllib.parse.quote(ua)}"
         return url
 
-    def _spawn_posix(self, exe_path_or_cmd, url):
+    def _spawn_posix(self, argv):
         try:
-            subprocess.Popen([exe_path_or_cmd, url], close_fds=True)
+            subprocess.Popen(argv, close_fds=True)
             return True, ""
         except FileNotFoundError:
-            return False, f"Executable not found: {exe_path_or_cmd}"
+            return False, f"Executable not found: {argv[0]}"
         except Exception as e:
             return False, str(e)
 
-    def _spawn_windows(self, exe_path, url):
+    def _spawn_windows(self, argv):
         """Launch player on Windows with a normal, visible window."""
         try:
-            subprocess.Popen([exe_path, url])
+            subprocess.Popen(argv)
             return True, ""
         except FileNotFoundError:
-            return False, f"Executable not found: {exe_path}"
+            return False, f"Executable not found: {argv[0]}"
         except Exception as e:
             return False, str(e)
+
+    def _mpv_ipc_path(self) -> str:
+        if platform.system() == "Windows":
+            return r"\\.\pipe\iptvclient-mpv"
+        # POSIX: use a socket in temp
+        return os.path.join(tempfile.gettempdir(), "iptvclient-mpv.sock")
+
+    def _mpv_try_send(self, url: str) -> bool:
+        """If an mpv instance with our IPC is running, send loadfile and return True."""
+        ipc = self._mpv_ipc_path()
+        payload = (json.dumps({"command": ["loadfile", url, "replace"]}) + "\n").encode("utf-8")
+        if platform.system() == "Windows":
+            try:
+                # Minimal win32 named pipe client via ctypes
+                from ctypes import wintypes
+                GENERIC_WRITE = 0x40000000
+                OPEN_EXISTING = 3
+                INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+                CreateFileW = ctypes.windll.kernel32.CreateFileW
+                CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+                CreateFileW.restype = wintypes.HANDLE
+                h = CreateFileW(ipc, GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None)
+                if h == 0 or h == INVALID_HANDLE_VALUE:
+                    return False
+                try:
+                    WriteFile = ctypes.windll.kernel32.WriteFile
+                    WriteFile.argtypes = [wintypes.HANDLE, wintypes.LPCVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+                    written = wintypes.DWORD(0)
+                    ok = WriteFile(h, payload, len(payload), ctypes.byref(written), None)
+                    return bool(ok and written.value == len(payload))
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(h)
+            except Exception:
+                return False
+        else:
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(0.25)
+                s.connect(ipc)
+                s.sendall(payload)
+                s.close()
+                return True
+            except Exception:
+                return False
 
     def play_selected(self):
         i = self.channel_list.GetSelection()
@@ -1545,6 +1623,27 @@ class IPTVClient(wx.Frame):
         player = self.default_player
         custom_path = self.config.get("custom_player_path", "")
 
+        # If using mpv, try to reuse an existing instance via IPC first.
+        if player == "MPV":
+            try:
+                if self._mpv_try_send(url):
+                    return
+            except Exception:
+                pass
+
+        # Guard against accidental double-invocation (applies to spawn path only)
+        try:
+            if not hasattr(self, "_launch_guard_lock"):
+                self._launch_guard_lock = threading.Lock()
+                self._last_launch_ts = 0.0
+            with getattr(self, "_launch_guard_lock"):
+                now = time.time()
+                if (now - getattr(self, "_last_launch_ts", 0.0)) < 0.75:
+                    return
+                self._last_launch_ts = now
+        except Exception:
+            pass
+
         win_paths = {
             "VLC": [r"C:\Program Files\VideoLAN\VLC\vlc.exe", r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"],
             "MPC": [r"C:\Program Files\MPC-HC\mpc-hc64.exe", r"C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe", r"C:\Program Files (x86)\MPC-HC\mpc-hc.exe"],
@@ -1569,28 +1668,67 @@ class IPTVClient(wx.Frame):
         mac_paths = { "VLC": ["/Applications/VLC.app/Contents/MacOS/VLC"], "QuickTime": ["/Applications/QuickTime Player.app/Contents/MacOS/QuickTime Player"], "iTunes/Apple Music": ["/Applications/Music.app/Contents/MacOS/Music", "/Applications/iTunes.app/Contents/MacOS/iTunes"], "QMPlay2": ["/Applications/QMPlay2.app/Contents/MacOS/QMPlay2"], "Audacious": ["/Applications/Audacious.app/Contents/MacOS/Audacious"], "Fauxdacious": ["/Applications/Fauxdacious.app/Contents/MacOS/Fauxdacious"] }
 
         ok, err = False, ""
+
+        def _argv_for(player_name: str, exe_or_cmd: str, is_windows: bool) -> list:
+            # Build argv with best-effort single-instance/enqueue flags where supported.
+            if player_name == "VLC":
+                # Use single-instance flags, but do NOT enqueue so the new stream replaces playback.
+                flags = ["--one-instance", "--one-instance-when-started-from-file"]
+                return [exe_or_cmd, *flags, url]
+            if player_name in ("MPC", "MPC-BE"):
+                # Keep it simple and robust: let MPC's own single-instance setting
+                # handle reuse; always pass the URL directly for predictable playback.
+                return [exe_or_cmd, url]
+            if player_name == "MPV":
+                ipc = self._mpv_ipc_path()
+                flags = [f"--input-ipc-server={ipc}", "--force-window=yes", "--idle=yes", "--no-terminal"]
+                # On POSIX, if the IPC socket path exists but connect failed above, it's likely stale; try to remove it.
+                if not is_windows and os.path.exists(ipc):
+                    try:
+                        os.unlink(ipc)
+                    except Exception:
+                        pass
+                return [exe_or_cmd, *flags, url]
+            # Default: just pass URL
+            return [exe_or_cmd, url]
         if self.default_player == "Custom" and custom_path:
             exe = custom_path
-            ok, err = self._spawn_windows(exe, url) if platform.system() == "Windows" else self._spawn_posix(exe, url)
+            # Heuristically detect known players from custom path for better flags
+            pname = os.path.basename(exe).lower()
+            detected = player
+            if "mpv" in pname:
+                detected = "MPV"
+            elif "vlc" in pname:
+                detected = "VLC"
+            elif "mpc-be" in pname or "mpcbe" in pname:
+                detected = "MPC-BE"
+            elif pname.startswith("mpc-hc") or pname.startswith("mpc"):
+                detected = "MPC"
+            argv = _argv_for(detected, exe, platform.system() == "Windows")
+            ok, err = self._spawn_windows(argv) if platform.system() == "Windows" else self._spawn_posix(argv)
         else:
             system = platform.system()
             if system == "Windows":
                 choices = win_paths.get(player, [])
                 for exe in choices:
                     if os.path.exists(exe):
-                        ok, err = self._spawn_windows(exe, url)
+                        argv = _argv_for(player, exe, True)
+                        ok, err = self._spawn_windows(argv)
                         if ok: break
                 if not ok: err = err or f"Could not locate {player} executable."
             elif system == "Darwin":
                 choices = mac_paths.get(player, [])
                 for exe in choices:
                     if os.path.exists(exe):
-                        ok, err = self._spawn_posix(exe, url)
+                        argv = _argv_for(player, exe, False)
+                        ok, err = self._spawn_posix(argv)
                         if ok: break
                 if not ok: err = err or f"Could not locate {player} app."
             else:
                 cmd = linux_players.get(player)
-                if cmd: ok, err = self._spawn_posix(cmd, url)
+                if cmd:
+                    argv = _argv_for(player, cmd, False)
+                    ok, err = self._spawn_posix(argv)
                 else: err = f"{player} is not configured for Linux."
 
         if not ok:
