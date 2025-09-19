@@ -8,6 +8,7 @@ import json
 import tracemalloc
 import sqlite3
 import urllib.request
+import urllib.parse
 import xml.etree.ElementTree as ET
 import datetime
 import logging
@@ -79,6 +80,34 @@ def _mem_mb() -> int:
 def _safe(s: str, n=200) -> str:
     s = str(s or "")
     return (s[:n] + "...") if len(s) > n else s
+
+# Redact sensitive query values when logging URLs
+_SENSITIVE_QUERY_KEYS = {
+    'username','user','login','u','password','pass','pwd','token','auth','apikey','api_key','key','secret'
+}
+
+def _sanitize_url(url: str) -> str:
+    try:
+        if not url:
+            return url
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme not in {"http", "https"}:
+            return url
+        q = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        redacted = []
+        for k, v in q:
+            if (k or '').lower() in _SENSITIVE_QUERY_KEYS:
+                redacted.append((k, '***'))
+            else:
+                redacted.append((k, v))
+        new_query = urllib.parse.urlencode(redacted)
+        return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+    except Exception:
+        # Fail open: never block logging; return a conservative redaction when in doubt
+        try:
+            return re.sub(r"(?i)(username|user|login|u|password|pass|pwd|token|auth|apikey|api_key|key|secret)=([^&\s]+)", r"\1=***", str(url))
+        except Exception:
+            return str(url)
 
 # =========================
 # Normalization & Tokenizing
@@ -1095,7 +1124,8 @@ class EPGDatabase:
                     'score': score,
                     'display_name': disp,
                     'why': merged_why,
-                    'ts_offset': epg_ts if families_align else 0
+                    'ts_offset': epg_ts if families_align else 0,
+                    'token_overlap': token_overlap
                 }
 
         out = list(candidates.values())
@@ -1120,7 +1150,7 @@ class EPGDatabase:
         # Sort by score
         matches = sorted(matches, key=lambda m: -m.get('score', 0))
 
-        # Probe schedule availability for top-N and reorder with region preference.
+        # Probe schedule availability for top-N and reorder with region/city preference.
         try:
             avail = []
             for m in matches[:20]:
@@ -1131,9 +1161,7 @@ class EPGDatabase:
                     _logger.debug("MATCH CAND ch_id=%s score=%s grp=%s why=%s has_schedule_from_now=%s",
                                   ch_id, m.get('score'), m.get('group_tag'), _safe(m.get('why'), 300), has_any)
 
-            # Keep top-by-score as anchor
-            anchor = matches[0]
-            # Region-aware priority: same region > unknown > other
+            # Region-aware bucket: same region > unknown > other
             def region_bucket(m):
                 grp = (m.get('group_tag') or '').strip().lower()
                 if grp == _playlist_region:
@@ -1142,10 +1170,18 @@ class EPGDatabase:
                     return 1
                 return 2
 
-            ordered = sorted(avail, key=lambda t: (region_bucket(t[0]), not t[1], -t[0].get('score', 0)))
-            # Flatten and keep the anchor first if present
-            flat = [anchor] + [m for m, _ok in ordered if m is not anchor]
-            matches = flat + matches[20:]
+            # Prefer schedule availability, same region, higher token_overlap, then score
+            ordered = sorted(
+                avail,
+                key=lambda t: (
+                    region_bucket(t[0]),              # 0/1/2
+                    not t[1],                          # has schedule first
+                    -int(t[0].get('token_overlap', 0)),
+                    -int(t[0].get('score', 0)),
+                )
+            )
+            # Flatten; do NOT force original top anchor ahead of better region/schedule matches
+            matches = [m for m, _ok in ordered] + matches[20:]
         except Exception:
             pass
 
@@ -1156,7 +1192,7 @@ class EPGDatabase:
 
         current_shows = []  # list of (start_int, payload)
         next_shows = []     # list of (start_int, payload)
-        score_map = {m["id"]: m.get("score", 0) for m in matches}
+        aux_map = {m["id"]: m for m in matches}
 
         # strict interval; no pre-start grace
         for m in matches[:30]:
@@ -1194,22 +1230,52 @@ class EPGDatabase:
                         'end': datetime.datetime.strptime(end, "%Y%m%d%H%M%S")
                     }))
 
-        now_show = None if not current_shows else sorted(current_shows, key=lambda x: (-score_map.get(x[1]["channel_id"], 0), x[0]))[0][1]
+        def _rank_key(start_int: int, ch_id: str):
+            md = aux_map.get(ch_id, {})
+            score = int(md.get('score', 0))
+            tok = int(md.get('token_overlap', 0))
+            grp = (md.get('group_tag') or '').strip().lower()
+            rb = 0 if grp == _playlist_region else (1 if grp == '' else 2)
+            return (-score, -tok, rb, start_int)
+
+        now_show = None if not current_shows else sorted(current_shows, key=lambda x: _rank_key(x[0], x[1]['channel_id']))[0][1]
 
         if next_shows:
-            score_map = {m['id']: m.get('score', 0) for m in matches}
-            next_shows.sort(key=lambda x: (-score_map.get(x[1]['channel_id'], 0), x[0]))
+            next_shows.sort(key=lambda x: _rank_key(x[0], x[1]['channel_id']))
             next_show = next_shows[0][1]
         else:
             next_show = None
 
         if DEBUG:
-            _logger.debug("NOW/NEXT result for '%s' -> now=%s (ch=%s) next=%s (ch=%s)",
-                          _safe(channel.get('name')),
-                          _safe(now_show['title'] if now_show else None),
-                          now_show['channel_id'] if now_show else None,
-                          _safe(next_show['title'] if next_show else None),
-                          next_show['channel_id'] if next_show else None)
+            sel_id = now_show['channel_id'] if now_show else None
+            sel_md = aux_map.get(sel_id, {}) if sel_id else {}
+            _logger.debug(
+                "NOW/NEXT result for '%s' -> now=%s (ch=%s) next=%s (ch=%s) (picked ch=%s score=%s grp=%s why=%s)",
+                _safe(channel.get('name')),
+                _safe(now_show['title'] if now_show else None),
+                sel_id,
+                _safe(next_show['title'] if next_show else None),
+                next_show['channel_id'] if next_show else None,
+                sel_id,
+                sel_md.get('score'),
+                sel_md.get('group_tag'),
+                _safe(sel_md.get('why'), 300)
+            )
+
+            # Warn if selected channel looks cross-region or lacks city token match
+            try:
+                pl_tokens = tokenize_channel_name(" ".join([channel.get('tvg-name',''), channel.get('name',''), channel.get('group','')]))
+                epg_disp = sel_md.get('display_name') or ''
+                epg_tokens = tokenize_channel_name(epg_disp)
+                # Tokens already filtered from brand/noise by tokenize_channel_name
+                cityish_overlap = len(pl_tokens & epg_tokens)
+                grp = (sel_md.get('group_tag') or '').strip().lower()
+                if _playlist_region and grp not in {_playlist_region, ''}:
+                    _logger.warning("NOW/NEXT for '%s' picked cross-region channel ch=%s (grp=%s vs expected=%s)", _safe(channel.get('name')), sel_id, grp, _playlist_region)
+                elif cityish_overlap == 0 and pl_tokens:
+                    _logger.warning("NOW/NEXT for '%s' picked ch=%s without city-token match; pl_tokens=%s epg_tokens=%s", _safe(channel.get('name')), sel_id, sorted(list(pl_tokens))[:5], sorted(list(epg_tokens))[:5])
+            except Exception:
+                pass
 
         return now_show, next_show
     
@@ -1304,13 +1370,38 @@ class EPGDatabase:
         grand_prog, grand_chan = 0, 0
 
         def _open_stream(src):
-            _logger.debug("Opening stream: %s", src)
+            _logger.debug("Opening stream: %s", _sanitize_url(src))
             if src.startswith(("http://", "https://")):
-                req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
-                resp = urllib.request.urlopen(req, timeout=300)
-                _logger.debug("HTTP GET %s | status=%s mem=%sMB", src, getattr(resp, "status", "?"), _mem_mb())
-                is_gz = resp.info().get('Content-Encoding') == 'gzip' or src.lower().endswith('.gz')
-                return gzip.GzipFile(fileobj=resp) if is_gz else resp
+                last_err = None
+                for attempt in range(3):
+                    try:
+                        req = urllib.request.Request(src, headers={
+                            "User-Agent": "Mozilla/5.0",
+                            "Accept": "application/xml, text/xml, application/gzip, */*"
+                        })
+                        resp = urllib.request.urlopen(req, timeout=300)
+                        status = getattr(resp, "status", None)
+                        ctype = resp.info().get('Content-Type', '').lower()
+                        _logger.debug("HTTP GET %s | status=%s ctype=%s mem=%sMB", _sanitize_url(src), status, ctype, _mem_mb())
+                        # Some providers return HTML error pages when busy; sniff early and retry.
+                        # Peek a small chunk without consuming the stream irreversibly.
+                        try:
+                            head = resp.peek(256) if hasattr(resp, 'peek') else b''
+                        except Exception:
+                            head = b''
+                        head_txt = head.decode('utf-8', 'ignore') if head else ''
+                        if 'another request' in head_txt.lower() or 'too many requests' in head_txt.lower():
+                            last_err = RuntimeError("Provider is busy or blocking concurrent downloads; will retry…")
+                            time.sleep(2 + attempt)
+                            continue
+                        is_gz = resp.info().get('Content-Encoding') == 'gzip' or src.lower().endswith('.gz') or 'application/gzip' in ctype
+                        return gzip.GzipFile(fileobj=resp) if is_gz else resp
+                    except Exception as e:
+                        last_err = e
+                        # brief backoff on transient HTTP/server connect issues
+                        time.sleep(1 + attempt)
+                # Exhausted retries
+                raise last_err or RuntimeError("Failed to open EPG URL")
             else: # Local file
                 is_gz = src.lower().endswith('.gz')
                 return gzip.open(src, 'rb') if is_gz else open(src, 'rb')
@@ -1319,12 +1410,29 @@ class EPGDatabase:
             t0 = time.time()
             chan_count, prog_count, inserted_since_commit, sample_ok = 0, 0, 0, 0
             stream = None
+            began_txn = False
             try:
                 stream = _open_stream(src)
                 parser = ET.XMLPullParser(['start', 'end'])
                 elem_stack: List[ET.Element] = []
-                _logger.debug("EPG START src=%s (mem=%sMB)", src, _mem_mb())
-                self.conn.execute("BEGIN IMMEDIATE")
+                _logger.debug("EPG START src=%s (mem=%sMB)", _sanitize_url(src), _mem_mb())
+                # Begin write transaction with retry/backoff to avoid transient lock errors
+                try:
+                    self.conn.execute("PRAGMA busy_timeout=15000;")
+                except Exception:
+                    pass
+                for attempt in range(6):
+                    try:
+                        self.conn.execute("BEGIN IMMEDIATE")
+                        began_txn = True
+                        break
+                    except sqlite3.OperationalError as e:
+                        if "locked" in str(e).lower() or "busy" in str(e).lower():
+                            time.sleep(0.5 * (attempt + 1))
+                            continue
+                        raise
+                if not began_txn:
+                    raise RuntimeError("database is locked (could not start write transaction)")
 
                 # *** DEFINITIVE MEMORY LEAK FIX ***
                 # Read stream in chunks and feed to the pull parser
@@ -1365,13 +1473,13 @@ class EPGDatabase:
 
                             if st_utc and en_utc and ch_id:
                                 if DEBUG and sample_ok < 8:
-                                    _logger.debug("EPG SAMPLE OK src=%s ...", src); sample_ok += 1
+                                    _logger.debug("EPG SAMPLE OK src=%s ...", _sanitize_url(src)); sample_ok += 1
                                 self.insert_programme(ch_id, title_txt, st_utc, en_utc)
                                 prog_count += 1
                                 inserted_since_commit += 1
                                 if inserted_since_commit >= BATCH:
                                     self.commit()
-                                    _logger.debug("EPG COMMIT src=%s progs+%d total=%d mem=%sMB", src, BATCH, prog_count, _mem_mb())
+                                    _logger.debug("EPG COMMIT src=%s progs+%d total=%d mem=%sMB", _sanitize_url(src), BATCH, prog_count, _mem_mb())
                                     inserted_since_commit = 0
                         # Clear processed nodes and detach them from their parent so
                         # completed <programme>/<channel> elements don't accumulate.
@@ -1385,15 +1493,29 @@ class EPGDatabase:
                 
                 parser.close() # Finalize
                 self.commit()
-                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                try:
+                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                except Exception:
+                    pass
                 _logger.debug("EPG DONE src=%s channels=%d progs=%d elapsed=%.1fs mem=%sMB",
-                              src, chan_count, prog_count, time.time() - t0, _mem_mb())
+                              _sanitize_url(src), chan_count, prog_count, time.time() - t0, _mem_mb())
 
             except Exception as e:
-                _logger.exception("EPG ERROR src=%s : %s", src, e)
+                _logger.exception("EPG ERROR src=%s : %s", _sanitize_url(src), e)
                 try: wx.LogError(f"Failed to import EPG source {src}: {e}")
                 except Exception: pass
             finally:
+                # Ensure no lingering transaction if an error occurred before commit
+                try:
+                    if began_txn:
+                        try:
+                            self.conn.rollback()
+                        except sqlite3.ProgrammingError:
+                            pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 if stream:
                     try: stream.close()
                     except Exception: pass
@@ -1404,8 +1526,11 @@ class EPGDatabase:
                 try: progress_callback(idx + 1, total)
                 except Exception: pass
         
-        self.prune_old_programmes(days=14)
-        self.commit()
+        try:
+            self.prune_old_programmes(days=14)
+            self.commit()
+        except Exception as e:
+            _logger.debug("EPG maintenance skipped due to lock or error: %s", e)
         current, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
         try:
