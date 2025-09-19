@@ -8,6 +8,7 @@ import json
 import tracemalloc
 import sqlite3
 import urllib.request
+import urllib.error
 import urllib.parse
 import xml.etree.ElementTree as ET
 import datetime
@@ -15,6 +16,8 @@ import logging
 import logging.handlers
 import tempfile
 import random
+import hashlib
+from http.client import IncompleteRead
 from providers import generate_provider_id
 from typing import Dict, List, Optional, Tuple, Set
 
@@ -409,7 +412,9 @@ def _detect_region_from_id(ch_id: str) -> str:
     return ''
 
 _TS_REGEXES = [
-    re.compile(r'(?<!\w)\+(\d{1,2})\s*(?:h|hr|hour|hours)?(?!\w)', re.I),
+    # +1, + 1, +2h, +2 hours, etc.
+    re.compile(r'(?<!\w)\+\s*(\d{1,2})\s*(?:h|hr|hour|hours)?(?!\w)', re.I),
+    # plus1, plus 1
     re.compile(r'\bplus\s*(\d{1,2})\b', re.I),
 ]
 def _detect_timeshift(text: str) -> int:
@@ -1072,17 +1077,30 @@ class EPGDatabase:
                     why.append('-zone')
 
             epg_ts = _detect_timeshift(" ".join([disp, ch_id]))
-            if playlist_ts and epg_ts:
-                ts_delta = abs(playlist_ts - epg_ts)
-                if ts_delta == 0:
-                    score += 5
-                    why.append('+timeshift-match')
-                elif ts_delta <= 2:
-                    score += 3
-                    why.append('+timeshift-close')
-                else:
-                    score -= 5 * ts_delta
-                    why.append('-timeshift-far')
+            # Timeshift-aware scoring: strongly prefer exact +N matches; penalize mismatches
+            if playlist_ts or epg_ts:
+                if playlist_ts and epg_ts:
+                    ts_delta = abs(playlist_ts - epg_ts)
+                    if ts_delta == 0:
+                        score += 22
+                        why.append('+timeshift-match')
+                    elif ts_delta == 1:
+                        score += 9
+                        why.append('+timeshift-close(1)')
+                    elif ts_delta == 2:
+                        score += 5
+                        why.append('+timeshift-close(2)')
+                    else:
+                        score -= 10 * ts_delta
+                        why.append('-timeshift-far')
+                elif playlist_ts and not epg_ts:
+                    # Playlist expects +N but EPG candidate looks like base; discourage
+                    score -= 15
+                    why.append('-timeshift-missing-epg')
+                elif epg_ts and not playlist_ts:
+                    # Playlist base matched to a +N channel; mild penalty
+                    score -= 8
+                    why.append('-timeshift-extra-epg')
 
             # ---- HBO variant-aware boosting ----
             if playlist_brand_family == "hbo" and epg_brand_family == "hbo":
@@ -1194,35 +1212,24 @@ class EPGDatabase:
         next_shows = []     # list of (start_int, payload)
         aux_map = {m["id"]: m for m in matches}
 
-        # strict interval; no pre-start grace
+        # strict interval; evaluate each candidate's own EPG at real 'now'
         for m in matches[:30]:
             ch_id = m['id']
-            ts_offset = m.get('ts_offset') or 0
-            if ts_offset:
-                try:
-                    now_adj_dt = now + datetime.timedelta(hours=ts_offset)
-                except Exception:
-                    now_adj_dt = now
-            else:
-                now_adj_dt = now
-            now_adj = now_adj_dt.strftime("%Y%m%d%H%M%S")
-            now_adj_int = int(now_adj)
-
             rows = c.execute(
                 "SELECT title, start, end FROM programmes WHERE channel_id = ? AND end > ? ORDER BY start ASC LIMIT 6",
-                (ch_id, now_adj)
+                (ch_id, now_str)
             ).fetchall()
             for title, start, end in rows:
                 st_i = int(start); en_i = int(end)
                 # Current if st <= now <= en, OR if within small grace after start
-                if st_i <= now_adj_int < en_i:
+                if st_i <= now_int < en_i:
                     current_shows.append((st_i, {
                         'channel_id': ch_id,
                         'title': title,
                         'start': datetime.datetime.strptime(start, "%Y%m%d%H%M%S"),
                         'end': datetime.datetime.strptime(end, "%Y%m%d%H%M%S")
                     }))
-                elif st_i > now_adj_int:
+                elif st_i > now_int:
                     next_shows.append((st_i, {
                         'channel_id': ch_id,
                         'title': title,
@@ -1395,6 +1402,16 @@ class EPGDatabase:
                             time.sleep(2 + attempt)
                             continue
                         is_gz = resp.info().get('Content-Encoding') == 'gzip' or src.lower().endswith('.gz') or 'application/gzip' in ctype
+
+                        # For .gz sources, prefer robust path: download to temp with resume then parse.
+                        use_robust_gz = src.lower().endswith('.gz') and os.getenv('EPG_GZ_DOWNLOAD', '1').strip() not in {'0', 'false', 'False'}
+                        if is_gz and use_robust_gz:
+                            try:
+                                resp.close()
+                            except Exception:
+                                pass
+                            temp_path = _http_download_gz_with_resume(src)
+                            return _TempGzipStream(temp_path)
                         return gzip.GzipFile(fileobj=resp) if is_gz else resp
                     except Exception as e:
                         last_err = e
@@ -1406,119 +1423,290 @@ class EPGDatabase:
                 is_gz = src.lower().endswith('.gz')
                 return gzip.open(src, 'rb') if is_gz else open(src, 'rb')
 
-        for idx, src in enumerate(xml_sources):
-            t0 = time.time()
-            chan_count, prog_count, inserted_since_commit, sample_ok = 0, 0, 0, 0
-            stream = None
-            began_txn = False
-            try:
-                stream = _open_stream(src)
-                parser = ET.XMLPullParser(['start', 'end'])
-                elem_stack: List[ET.Element] = []
-                _logger.debug("EPG START src=%s (mem=%sMB)", _sanitize_url(src), _mem_mb())
-                # Begin write transaction with retry/backoff to avoid transient lock errors
+        class _TempGzipStream:
+            """File-like wrapper that deletes the temp gz on close."""
+            def __init__(self, temp_path: str):
+                self._path = temp_path
+                self._f = gzip.open(temp_path, 'rb')
+            def read(self, *a, **kw):
+                return self._f.read(*a, **kw)
+            def close(self):
                 try:
-                    self.conn.execute("PRAGMA busy_timeout=15000;")
-                except Exception:
-                    pass
-                for attempt in range(6):
+                    self._f.close()
+                finally:
                     try:
-                        self.conn.execute("BEGIN IMMEDIATE")
-                        began_txn = True
-                        break
-                    except sqlite3.OperationalError as e:
-                        if "locked" in str(e).lower() or "busy" in str(e).lower():
-                            time.sleep(0.5 * (attempt + 1))
-                            continue
-                        raise
-                if not began_txn:
-                    raise RuntimeError("database is locked (could not start write transaction)")
+                        keep = os.getenv('EPG_KEEP_TEMP_GZ', '0').strip() in {'1', 'true', 'True'}
+                        if not keep:
+                            os.remove(self._path)
+                    except Exception:
+                        pass
+            def __getattr__(self, name):
+                return getattr(self._f, name)
 
-                # *** DEFINITIVE MEMORY LEAK FIX ***
-                # Read stream in chunks and feed to the pull parser
-                while True:
-                    chunk = stream.read(65536) # 64KB chunk
-                    if not chunk:
-                        break
-                    parser.feed(chunk)
-                    for event, elem in parser.read_events():
-                        if event == 'start':
-                            elem_stack.append(elem)
-                            continue
-                        # event == 'end'
+        def _http_download_gz_with_resume(url: str, max_attempts: int = 4, chunk_size: int = 1 << 16) -> str:
+            """Download a gzip file to a temp path with HTTP Range resume and verify integrity.
+
+            Returns the absolute temp file path once a full, verifiable gzip is present.
+            Raises on failure after retries.
+            """
+            # Stable name in temp dir so we can resume within this process
+            h = hashlib.md5(url.encode('utf-8', 'ignore')).hexdigest()
+            temp_dir = tempfile.gettempdir()
+            temp_path = os.path.join(temp_dir, f"epg_{h}.xml.gz")
+
+            def _verify_gzip_ok(path: str) -> bool:
+                try:
+                    with gzip.open(path, 'rb') as gzf:
+                        while gzf.read(1 << 18):  # 256KB chunks
+                            pass
+                    return True
+                except Exception as ve:
+                    # Treat common gzip truncation/CRC errors as not-ok; others bubble to retry
+                    msg = str(ve).lower()
+                    if any(t in msg for t in (
+                        'end-of-stream marker', 'compressed file ended', 'unexpected end of data', 'crc check failed'
+                    )):
+                        return False
+                    return False
+
+            attempts = 0
+            last_err = None
+            while attempts < max_attempts:
+                attempts += 1
+                try:
+                    existing = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+                    # If existing file doesn't look like gzip, start over
+                    if existing > 0:
                         try:
-                            elem_stack.pop()
-                        except IndexError:
-                            elem_stack = []
-                        parent = elem_stack[-1] if elem_stack else None
-                        tag = elem.tag.rsplit('}', 1)[-1]
-                        if tag == 'channel':
-                            ch_id = elem.get("id", "")
-                            dn_elem = elem.find("./display-name")
-                            disp = dn_elem.text.strip() if dn_elem is not None and dn_elem.text else ""
-                            if ch_id or disp:
-                                self.insert_channel(ch_id, disp)
-                                chan_count += 1
-                        elif tag == 'programme':
-                            ch_id = elem.get("channel", "")
-                            title_elem = elem.find("./title")
-                            title_txt = title_elem.text.strip() if title_elem is not None and title_elem.text else ""
-                            st_raw = elem.get("start", "")
-                            en_raw = elem.get("stop") or elem.get("end", "")
-
-                            st_utc = _parse_xmltv_to_utc_str(st_raw)
-                            en_utc = _parse_xmltv_to_utc_str(en_raw) if en_raw else None
-                            if not en_utc and st_utc:
-                                en_utc = _calc_end_from_length_or_duration(st_utc, elem)
-
-                            if st_utc and en_utc and ch_id:
-                                if DEBUG and sample_ok < 8:
-                                    _logger.debug("EPG SAMPLE OK src=%s ...", _sanitize_url(src)); sample_ok += 1
-                                self.insert_programme(ch_id, title_txt, st_utc, en_utc)
-                                prog_count += 1
-                                inserted_since_commit += 1
-                                if inserted_since_commit >= BATCH:
-                                    self.commit()
-                                    _logger.debug("EPG COMMIT src=%s progs+%d total=%d mem=%sMB", _sanitize_url(src), BATCH, prog_count, _mem_mb())
-                                    inserted_since_commit = 0
-                        # Clear processed nodes and detach them from their parent so
-                        # completed <programme>/<channel> elements don't accumulate.
-                        if tag in {'channel', 'programme'}:
+                            with open(temp_path, 'rb') as _chk:
+                                sig = _chk.read(2)
+                            if sig != b'\x1f\x8b':
+                                os.remove(temp_path)
+                                existing = 0
+                        except Exception:
                             try:
-                                elem.clear()
-                                if parent is not None:
-                                    parent.remove(elem)
+                                os.remove(temp_path)
                             except Exception:
                                 pass
-                
-                parser.close() # Finalize
-                self.commit()
-                try:
-                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                except Exception:
-                    pass
-                _logger.debug("EPG DONE src=%s channels=%d progs=%d elapsed=%.1fs mem=%sMB",
-                              _sanitize_url(src), chan_count, prog_count, time.time() - t0, _mem_mb())
+                            existing = 0
+                    headers = {
+                        "User-Agent": "Mozilla/5.0",
+                        "Accept": "application/gzip, application/xml, text/xml, */*",
+                    }
+                    mode = 'ab' if existing > 0 else 'wb'
+                    if existing > 0:
+                        headers['Range'] = f'bytes={existing}-'
+                    req = urllib.request.Request(url, headers=headers)
+                    try:
+                        resp = urllib.request.urlopen(req, timeout=300)
+                    except urllib.error.HTTPError as he:
+                        # 416 Range Not Satisfiable: our resume position is beyond EOF or server rejects Range.
+                        if he.code == 416:
+                            try:
+                                if os.path.exists(temp_path):
+                                    os.remove(temp_path)
+                            except Exception:
+                                pass
+                            last_err = he
+                            # Backoff a touch and retry a clean 200 (no Range)
+                            time.sleep(0.3 * attempts)
+                            continue
+                        last_err = he
+                        time.sleep(0.5 * attempts)
+                        continue
+                    status = getattr(resp, 'status', None) or getattr(resp, 'code', None)
+                    if status == 200 and existing > 0:
+                        # Server ignored Range; start fresh
+                        mode = 'wb'
+                    with open(temp_path, mode) as out:
+                        while True:
+                            try:
+                                chunk = resp.read(chunk_size)
+                                if not chunk:
+                                    break
+                                out.write(chunk)
+                            except IncompleteRead as ire:
+                                # Partial read; keep what we have, retry and resume
+                                last_err = ire
+                                break
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    # Verify gzip integrity; if ok, return path
+                    if _verify_gzip_ok(temp_path):
+                        return temp_path
+                    else:
+                        # Not complete (or corrupt); brief backoff and retry with Range
+                        last_err = last_err or RuntimeError('gzip verify failed; resuming download')
+                        time.sleep(0.5 * attempts)
+                        continue
+                except Exception as e:
+                    last_err = e
+                    time.sleep(0.5 * attempts)
+                    continue
+            # Retries exhausted; bubble a helpful error
+            raise last_err or RuntimeError('Failed to download gzip with resume')
 
-            except Exception as e:
-                _logger.exception("EPG ERROR src=%s : %s", _sanitize_url(src), e)
-                try: wx.LogError(f"Failed to import EPG source {src}: {e}")
-                except Exception: pass
-            finally:
-                # Ensure no lingering transaction if an error occurred before commit
+        def _is_transient_stream_error(err: Exception) -> bool:
+            msg = str(err).lower()
+            # gzip truncation/HTTP partials and a few common transient parse/IO issues
+            hints = (
+                'end-of-stream marker',
+                'compressed file ended',
+                'unexpected end of data',
+                'crc check failed',
+                'incomplete read',
+                'connection reset',
+                'timed out',
+                'no element found',
+            )
+            try:
+                if isinstance(err, IncompleteRead):
+                    return True
+            except Exception:
+                pass
+            return any(h in msg for h in hints)
+
+        for idx, src in enumerate(xml_sources):
+            t0 = time.time()
+            attempts_left = 3
+            while attempts_left > 0:
+                chan_count, prog_count, inserted_since_commit, sample_ok = 0, 0, 0, 0
+                stream = None
+                began_txn = False
                 try:
-                    if began_txn:
+                    stream = _open_stream(src)
+                    parser = ET.XMLPullParser(['start', 'end'])
+                    elem_stack: List[ET.Element] = []
+                    _logger.debug("EPG START src=%s (mem=%sMB)", _sanitize_url(src), _mem_mb())
+                    # Begin write transaction with retry/backoff to avoid transient lock errors
+                    try:
+                        self.conn.execute("PRAGMA busy_timeout=15000;")
+                    except Exception:
+                        pass
+                    for attempt in range(6):
                         try:
-                            self.conn.rollback()
-                        except sqlite3.ProgrammingError:
-                            pass
+                            self.conn.execute("BEGIN IMMEDIATE")
+                            began_txn = True
+                            break
+                        except sqlite3.OperationalError as e:
+                            if "locked" in str(e).lower() or "busy" in str(e).lower():
+                                time.sleep(0.5 * (attempt + 1))
+                                continue
+                            raise
+                    if not began_txn:
+                        raise RuntimeError("database is locked (could not start write transaction)")
+
+                    # Stream and parse
+                    while True:
+                        chunk = stream.read(65536) # 64KB chunk
+                        if not chunk:
+                            break
+                        parser.feed(chunk)
+                        for event, elem in parser.read_events():
+                            if event == 'start':
+                                elem_stack.append(elem)
+                                continue
+                            # event == 'end'
+                            try:
+                                elem_stack.pop()
+                            except IndexError:
+                                elem_stack = []
+                            parent = elem_stack[-1] if elem_stack else None
+                            tag = elem.tag.rsplit('}', 1)[-1]
+                            if tag == 'channel':
+                                ch_id = elem.get("id", "")
+                                dn_elem = elem.find("./display-name")
+                                disp = dn_elem.text.strip() if dn_elem is not None and dn_elem.text else ""
+                                if ch_id or disp:
+                                    self.insert_channel(ch_id, disp)
+                                    chan_count += 1
+                            elif tag == 'programme':
+                                ch_id = elem.get("channel", "")
+                                title_elem = elem.find("./title")
+                                title_txt = title_elem.text.strip() if title_elem is not None and title_elem.text else ""
+                                st_raw = elem.get("start", "")
+                                en_raw = elem.get("stop") or elem.get("end", "")
+
+                                st_utc = _parse_xmltv_to_utc_str(st_raw)
+                                en_utc = _parse_xmltv_to_utc_str(en_raw) if en_raw else None
+                                if not en_utc and st_utc:
+                                    en_utc = _calc_end_from_length_or_duration(st_utc, elem)
+
+                                if st_utc and en_utc and ch_id:
+                                    if DEBUG and sample_ok < 8:
+                                        _logger.debug("EPG SAMPLE OK src=%s ...", _sanitize_url(src)); sample_ok += 1
+                                    self.insert_programme(ch_id, title_txt, st_utc, en_utc)
+                                    prog_count += 1
+                                    inserted_since_commit += 1
+                                    if inserted_since_commit >= BATCH:
+                                        self.commit()
+                                        _logger.debug("EPG COMMIT src=%s progs+%d total=%d mem=%sMB", _sanitize_url(src), BATCH, prog_count, _mem_mb())
+                                        inserted_since_commit = 0
+                            # Clear processed nodes and detach them from their parent so
+                            # completed <programme>/<channel> elements don't accumulate.
+                            if tag in {'channel', 'programme'}:
+                                try:
+                                    elem.clear()
+                                    if parent is not None:
+                                        parent.remove(elem)
+                                except Exception:
+                                    pass
+
+                    parser.close() # Finalize
+                    self.commit()
+                    try:
+                        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    except Exception:
+                        pass
+                    _logger.debug("EPG DONE src=%s channels=%d progs=%d elapsed=%.1fs mem=%sMB",
+                                  _sanitize_url(src), chan_count, prog_count, time.time() - t0, _mem_mb())
+
+                    # success; exit retry loop for this source
+                    break
+
+                except Exception as e:
+                    # If the error looks like a transient/truncated gzip/HTTP read, retry a few times
+                    if _is_transient_stream_error(e) and attempts_left > 1:
+                        _logger.warning(
+                            "EPG transient error for %s: %s — retrying (%d left)",
+                            _sanitize_url(src), e, attempts_left - 1
+                        )
+                        try:
+                            # rollback any partial transaction for a clean retry
+                            if began_txn:
+                                self.conn.rollback()
                         except Exception:
                             pass
-                except Exception:
-                    pass
-                if stream:
-                    try: stream.close()
+                        try:
+                            if stream:
+                                stream.close()
+                        except Exception:
+                            pass
+                        time.sleep(1.0)
+                        attempts_left -= 1
+                        continue
+                    # Non-transient or out of retries: log and move on
+                    _logger.exception("EPG ERROR src=%s : %s", _sanitize_url(src), e)
+                    try: wx.LogError(f"Failed to import EPG source {src}: {e}")
                     except Exception: pass
+                    break
+                finally:
+                    # Ensure no lingering transaction if an error occurred before commit
+                    try:
+                        if began_txn:
+                            try:
+                                self.conn.rollback()
+                            except sqlite3.ProgrammingError:
+                                pass
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    if stream:
+                        try: stream.close()
+                        except Exception: pass
 
             grand_chan += chan_count
             grand_prog += prog_count

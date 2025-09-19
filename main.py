@@ -813,6 +813,12 @@ class IPTVClient(wx.Frame):
                         return
                     if txt != self.filter_box.GetValue().strip().lower():
                         return
+                    # Preserve current selection to avoid scroll jumps while appending
+                    try:
+                        cur_sel = self.channel_list.GetSelection()
+                        cur_count = self.channel_list.GetCount()
+                    except Exception:
+                        cur_sel, cur_count = wx.NOT_FOUND, 0
                     if results:
                         add_items = []
                         for r in results:
@@ -821,10 +827,18 @@ class IPTVClient(wx.Frame):
                             add_items.append(label)
                         if add_items:
                             self.channel_list.AppendItems(add_items)
-                    if self.displayed:
-                        self.channel_list.SetSelection(0)
-                        self.channel_list.SetFocus()
-                        self.on_highlight()
+                    # Only auto-select the first item if the list was previously empty
+                    # and nothing is selected. Do NOT steal focus or jump the list.
+                    try:
+                        if cur_count == 0 and cur_sel in (-1, wx.NOT_FOUND) and self.channel_list.GetCount() > 0:
+                            # Leave selection empty to avoid scroll jump; user can choose.
+                            # If desired later, we can make this opt-in via a setting.
+                            pass
+                        elif cur_sel not in (-1, wx.NOT_FOUND) and cur_sel < self.channel_list.GetCount():
+                            # Reinstate prior selection to keep view position stable.
+                            self.channel_list.SetSelection(cur_sel)
+                    except Exception:
+                        pass
                 wx.CallAfter(update_ui)
             threading.Thread(target=lambda: epg_search(my_token), daemon=True).start()
         finally:
