@@ -4,7 +4,12 @@ import json
 import hashlib
 import datetime
 import re
-import wx
+try:
+    import wx  # type: ignore
+    _HAS_WX = True
+except ModuleNotFoundError:  # wxPython optional for headless helpers
+    wx = None  # type: ignore
+    _HAS_WX = False
 from typing import Dict
 import tempfile
 
@@ -13,11 +18,19 @@ CONFIG_FILE = "iptvclient.conf"
 
 def _log_error(message: str):
     """Log errors without requiring a wx.App (headless safe)."""
-    app = wx.GetApp() if hasattr(wx, "GetApp") else None
-    if app is not None:
-        wx.LogError(message)
-    else:
-        sys.stderr.write(f"{message}\n")
+    app = None
+    if _HAS_WX and hasattr(wx, "GetApp"):
+        try:
+            app = wx.GetApp()
+        except Exception:
+            app = None
+    if _HAS_WX and app is not None:
+        try:
+            wx.LogError(message)
+            return
+        except Exception:
+            pass
+    sys.stderr.write(f"{message}\n")
 
 
 def _is_writable_dir(path: str) -> bool:
@@ -49,8 +62,13 @@ def get_user_config_dir():
     This relies on a wx.App object having been created with AppName set, but
     gracefully falls back when running headless or before wx.App exists.
     """
-    app = wx.GetApp() if hasattr(wx, "GetApp") else None
-    if app is not None:
+    app = None
+    if _HAS_WX and hasattr(wx, "GetApp"):
+        try:
+            app = wx.GetApp()
+        except Exception:
+            app = None
+    if _HAS_WX and app is not None:
         try:
             paths = wx.StandardPaths.Get()
             config_dir = paths.GetUserConfigDir()
@@ -394,25 +412,33 @@ def utc_to_local(dt):
             dt = dt
     return dt.astimezone()
 
-class CustomPlayerDialog(wx.Dialog):
-    def __init__(self, parent, initial_path):
-        super().__init__(parent, title="Select Custom Player")
-        self.path = initial_path or ""
-        sizer = wx.BoxSizer(wx.VERTICAL)
-        self.txt = wx.TextCtrl(self, value=self.path)
-        browse = wx.Button(self, label="Browse...")
-        btns = self.CreateButtonSizer(wx.OK|wx.CANCEL)
-        sizer.Add(wx.StaticText(self, label="Enter player executable or path:"), 0, wx.ALL, 5)
-        sizer.Add(self.txt, 0, wx.EXPAND|wx.ALL, 5)
-        sizer.Add(browse, 0, wx.ALL, 5)
-        sizer.Add(btns, 0, wx.ALL|wx.ALIGN_RIGHT, 5)
-        self.SetSizerAndFit(sizer)
-        browse.Bind(wx.EVT_BUTTON, self.on_browse)
+if _HAS_WX:
+    class CustomPlayerDialog(wx.Dialog):  # type: ignore[misc]
+        def __init__(self, parent, initial_path):
+            super().__init__(parent, title="Select Custom Player")
+            self.path = initial_path or ""
+            sizer = wx.BoxSizer(wx.VERTICAL)
+            self.txt = wx.TextCtrl(self, value=self.path)
+            browse = wx.Button(self, label="Browse...")
+            btns = self.CreateButtonSizer(wx.OK | wx.CANCEL)
+            sizer.Add(wx.StaticText(self, label="Enter player executable or path:"), 0, wx.ALL, 5)
+            sizer.Add(self.txt, 0, wx.EXPAND | wx.ALL, 5)
+            sizer.Add(browse, 0, wx.ALL, 5)
+            sizer.Add(btns, 0, wx.ALL | wx.ALIGN_RIGHT, 5)
+            self.SetSizerAndFit(sizer)
+            browse.Bind(wx.EVT_BUTTON, self.on_browse)
 
-    def on_browse(self, _):
-        with wx.FileDialog(self, "Select Player Executable", style=wx.FD_OPEN) as dlg:
-            if dlg.ShowModal() == wx.ID_OK:
-                self.txt.SetValue(dlg.GetPath())
+        def on_browse(self, _):
+            with wx.FileDialog(self, "Select Player Executable", style=wx.FD_OPEN) as dlg:
+                if dlg.ShowModal() == wx.ID_OK:
+                    self.txt.SetValue(dlg.GetPath())
 
-    def GetPath(self):
-        return self.txt.GetValue()
+        def GetPath(self):
+            return self.txt.GetValue()
+else:
+    class CustomPlayerDialog:  # type: ignore[too-many-ancestors]
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("CustomPlayerDialog requires wxPython. Install wxPython to use this dialog.")
+
+        def GetPath(self):
+            return ""

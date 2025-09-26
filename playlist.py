@@ -1,7 +1,6 @@
 import os
 import re
 import io
-import wx
 import gzip
 import time
 import json
@@ -21,22 +20,46 @@ from http.client import IncompleteRead
 from providers import generate_provider_id
 from typing import Dict, List, Optional, Tuple, Set
 
+import sys
 
-class _FieldAccessible(wx.Accessible):
-    def __init__(self, label: str, description: str):
-        super().__init__()
-        self._label = label
-        self._description = description
+try:
+    import wx  # type: ignore
+    WX_AVAILABLE = True
+except ModuleNotFoundError:
+    wx = None  # type: ignore
+    WX_AVAILABLE = False
 
-    def GetName(self, childId):
-        if childId in (0, wx.ACC_SELF):
-            return wx.ACC_OK, self._label
-        return wx.ACC_NOT_IMPLEMENTED, None
 
-    def GetDescription(self, childId):
-        if childId in (0, wx.ACC_SELF):
-            return wx.ACC_OK, self._description
-        return wx.ACC_NOT_IMPLEMENTED, None
+def _log_wx_error(message: str):
+    if WX_AVAILABLE and hasattr(wx, "LogError"):
+        try:
+            wx.LogError(message)
+            return
+        except Exception:
+            pass
+    sys.stderr.write(f"{message}\n")
+
+
+if WX_AVAILABLE:
+    class _FieldAccessible(wx.Accessible):  # type: ignore[misc]
+        def __init__(self, label: str, description: str):
+            super().__init__()
+            self._label = label
+            self._description = description
+
+        def GetName(self, childId):
+            if childId in (0, wx.ACC_SELF):
+                return wx.ACC_OK, self._label
+            return wx.ACC_NOT_IMPLEMENTED, None
+
+        def GetDescription(self, childId):
+            if childId in (0, wx.ACC_SELF):
+                return wx.ACC_OK, self._description
+            return wx.ACC_NOT_IMPLEMENTED, None
+else:
+    class _FieldAccessible:  # type: ignore[misc]
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("_FieldAccessible requires wxPython. Install wxPython to use GUI dialogs.")
 
 # =========================
 # Debug logging (rotating file) + memory helpers
@@ -293,10 +316,9 @@ MATCH_DEBUG = bool(os.environ.get("EPG_MATCH_DEBUG")) or DEBUG
 
 ZONE_SYNONYMS = {
     "east": {"east", "e", "eastern"},
-    "west": {"west", "w", "western"},
+    "west": {"west", "w", "western", "pacific", "p", "pt", "pst", "pdt", "pac"},
     "central": {"central", "c", "ct", "ctr"},
     "mountain": {"mountain", "mtn"},
-    "pacific": {"pacific", "p", "pt", "pst", "pdt", "pac"},
     "atlantic": {"atlantic", "atl"},
 }
 
@@ -400,11 +422,31 @@ def _detect_region_from_id(ch_id: str) -> str:
         return ''
     s = ch_id.lower()
     parts = re.split(r'[.\-_:|/]+', s)
+
+    def _token_variants(token: str):
+        token = token.strip()
+        if not token:
+            return []
+        # Strip common wrappers like parentheses before normalization
+        token_core = token.strip('()[]{}')
+        cleaned = re.sub(r'[^a-z]', '', token_core)
+        out = []
+        if cleaned:
+            out.append(cleaned)
+        # Also try trimming trailing digits only (e.g., "us2" -> "us")
+        trimmed = re.sub(r'\d+$', '', token_core)
+        trimmed = re.sub(r'[^a-z]', '', trimmed)
+        if trimmed and trimmed not in out:
+            out.append(trimmed)
+        return out
+
     for token in (list(reversed(parts)) + parts):
-        code = _norm_country(token)
-        if code:
-            return code
-    m = re.search(r'([a-z]{2,3})$', s)
+        for candidate in _token_variants(token):
+            code = _norm_country(candidate)
+            if code:
+                return code
+
+    m = re.search(r'([a-z]{2,3})', s)
     if m:
         code = _norm_country(m.group(1))
         if code:
@@ -463,7 +505,7 @@ def extract_callsigns(text: str) -> Set[str]:
                 if m2:
                     core = m2.group(1)
             if core and core[0] in _CALLSIGN_PREFIXES:
-                if core not in {"NEWS","SPORT","LIVE","PLUS","MAX"} and len(core) >= 3:
+                if core not in {"NEWS","SPORT","LIVE","PLUS","MAX","WEST","EAST"} and len(core) >= 3:
                     out.add(core)
     return out
 
@@ -976,6 +1018,14 @@ class EPGDatabase:
         name = (channel.get("name") or "").strip()
 
         playlist_region = _derive_playlist_region(channel)
+        if playlist_region != "us":
+            for text in (tvg_name, name, channel.get("group", "")):
+                lowered = (text or "").lower()
+                if not lowered:
+                    continue
+                if re.search(r'\bus\s*[:\-]', lowered) or 'usa' in lowered or 'united states' in lowered:
+                    playlist_region = "us"
+                    break
         playlist_zone = _detect_zone(" ".join([channel.get("group",""), tvg_name, name]))
         playlist_brand_key = _brand_key(name)
         playlist_ts = _detect_timeshift(" ".join([tvg_name, name]))
@@ -1247,11 +1297,17 @@ class EPGDatabase:
 
         now_show = None if not current_shows else sorted(current_shows, key=lambda x: _rank_key(x[0], x[1]['channel_id']))[0][1]
 
+        next_show = None
         if next_shows:
-            next_shows.sort(key=lambda x: _rank_key(x[0], x[1]['channel_id']))
-            next_show = next_shows[0][1]
-        else:
-            next_show = None
+            if now_show:
+                sel_channel = now_show['channel_id']
+                same_channel = [item for item in next_shows if item[1]['channel_id'] == sel_channel]
+                if same_channel:
+                    same_channel.sort(key=lambda x: x[0])
+                    next_show = same_channel[0][1]
+            if next_show is None:
+                next_shows.sort(key=lambda x: _rank_key(x[0], x[1]['channel_id']))
+                next_show = next_shows[0][1]
 
         if DEBUG:
             sel_id = now_show['channel_id'] if now_show else None
@@ -1689,8 +1745,7 @@ class EPGDatabase:
                         continue
                     # Non-transient or out of retries: log and move on
                     _logger.exception("EPG ERROR src=%s : %s", _sanitize_url(src), e)
-                    try: wx.LogError(f"Failed to import EPG source {src}: {e}")
-                    except Exception: pass
+                    _log_wx_error(f"Failed to import EPG source {src}: {e}")
                     break
                 finally:
                     # Ensure no lingering transaction if an error occurred before commit
@@ -1734,452 +1789,496 @@ class EPGDatabase:
 # EPG Import/Manager UI
 # =========================
 
-class EPGImportDialog(wx.Dialog):
-    def __init__(self, parent, total_sources):
-        super().__init__(parent, title="Importing EPG", size=(400, 150))
-        self.total_sources = total_sources
-        self._build_ui()
-        self.CenterOnParent()
-        self.Layout()
+if WX_AVAILABLE:
+    class EPGImportDialog(wx.Dialog):  # type: ignore[misc]
+        def __init__(self, parent, total_sources):
+            super().__init__(parent, title="Importing EPG", size=(400, 150))
+            self.total_sources = total_sources
+            self._build_ui()
+            self.CenterOnParent()
+            self.Layout()
 
-    def _build_ui(self):
-        panel = wx.Panel(self)
-        vbox = wx.BoxSizer(wx.VERTICAL)
-        self.label = wx.StaticText(panel, label="Importing EPG data…")
-        self.gauge = wx.Gauge(panel, range=max(1, self.total_sources))
-        vbox.Add(self.label, 0, wx.ALL, 8)
-        vbox.Add(self.gauge, 0, wx.EXPAND | wx.ALL, 8)
-        panel.SetSizer(vbox)
+        def _build_ui(self):
+            panel = wx.Panel(self)
+            vbox = wx.BoxSizer(wx.VERTICAL)
+            self.label = wx.StaticText(panel, label="Importing EPG data…")
+            self.gauge = wx.Gauge(panel, range=max(1, self.total_sources))
+            vbox.Add(self.label, 0, wx.ALL, 8)
+            vbox.Add(self.gauge, 0, wx.EXPAND | wx.ALL, 8)
+            panel.SetSizer(vbox)
 
-    def set_progress(self, value, total):
-        try:
-            self.gauge.SetRange(max(1, total))
-            self.gauge.SetValue(min(value, total))
-        except Exception:
-            pass
+        def set_progress(self, value, total):
+            try:
+                self.gauge.SetRange(max(1, total))
+                self.gauge.SetValue(min(value, total))
+            except Exception:
+                pass
+else:
+    class EPGImportDialog:  # type: ignore[misc]
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("EPGImportDialog requires wxPython. Install wxPython to use GUI dialogs.")
 
-class EPGManagerDialog(wx.Dialog):
-    def __init__(self, parent, epg_sources):
-        super().__init__(parent, title="EPG Manager", size=(600, 300))
-        self.epg_sources = epg_sources.copy()
-        self._build_ui()
-        self.CenterOnParent()
-        self.Layout()
-
-    def _build_ui(self):
-        panel = wx.Panel(self)
-        main_sizer = wx.BoxSizer(wx.VERTICAL)
-        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.add_file_btn = wx.Button(panel, label="Add File")
-        self.add_url_btn = wx.Button(panel, label="Add URL")
-        self.remove_btn = wx.Button(panel, label="Remove Selected")
-        for btn in (self.add_file_btn, self.add_url_btn, self.remove_btn):
-            btn_sizer.Add(btn, 0, wx.ALL, 2)
-        main_sizer.Add(btn_sizer, 0, wx.EXPAND)
-        self.lb = wx.ListBox(panel, style=wx.LB_SINGLE)
-        for src in self.epg_sources:
-            self.lb.Append(src)
-        if self.epg_sources:
-            self.lb.SetSelection(0)
-        main_sizer.Add(self.lb, 1, wx.EXPAND | wx.ALL, 5)
-        ok_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        ok_btn = wx.Button(panel, id=wx.ID_OK)
-        cancel_btn = wx.Button(panel, id=wx.ID_CANCEL)
-        ok_sizer.Add(ok_btn, 0, wx.ALL, 5)
-        ok_sizer.Add(cancel_btn, 0, wx.ALL, 5)
-        main_sizer.Add(ok_sizer, 0, wx.ALIGN_RIGHT)
-        panel.SetSizer(main_sizer)
-        self.add_file_btn.Bind(wx.EVT_BUTTON, self.OnAddFile)
-        self.add_url_btn.Bind(wx.EVT_BUTTON, self.OnAddURL)
-        self.remove_btn.Bind(wx.EVT_BUTTON, self.OnRemove)
-
-    def OnAddFile(self, _):
-        with wx.FileDialog(self, "Choose EPG XML file", wildcard="XML files (*.xml)|*.xml|GZip XML (*.gz)|*.gz|All files (*.*)|*.*") as dlg:
-            if dlg.ShowModal() == wx.ID_OK:
-                path = dlg.GetPath()
-                self.epg_sources.append(path)
-                self.lb.Append(path)
-
-    def OnAddURL(self, _):
-        with wx.TextEntryDialog(self, "Enter EPG XML URL") as dlg:
-            if dlg.ShowModal() == wx.ID_OK:
-                url = dlg.GetValue().strip()
-                if url:
-                    self.epg_sources.append(url)
-                    self.lb.Append(url)
-
-    def OnRemove(self, _):
-        i = self.lb.GetSelection()
-        if i != wx.NOT_FOUND:
-            self.epg_sources.pop(i)
-            self.lb.Delete(i)
-
-    def GetResult(self):
-        return self.epg_sources
-
-class PlaylistManagerDialog(wx.Dialog):
-    def __init__(self, parent, playlist_sources):
-        super().__init__(parent, title="Playlist Manager", size=(600, 300))
-        self.playlist_sources = playlist_sources.copy()
-        self._build_ui()
-        self.CenterOnParent()
-        self.Layout()
-
-    def _build_ui(self):
-        panel = wx.Panel(self)
-        main_sizer = wx.BoxSizer(wx.VERTICAL)
-        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.add_file_btn = wx.Button(panel, label="Add File")
-        self.add_url_btn = wx.Button(panel, label="Add URL")
-        self.add_xtream_btn = wx.Button(panel, label="Add Xtream Codes")
-        self.add_stalker_btn = wx.Button(panel, label="Add Stalker Portal")
-        self.remove_btn = wx.Button(panel, label="Remove Selected")
-        for btn in (self.add_file_btn, self.add_url_btn, self.add_xtream_btn, self.add_stalker_btn, self.remove_btn):
-            btn_sizer.Add(btn, 0, wx.ALL, 2)
-        main_sizer.Add(btn_sizer, 0, wx.EXPAND)
-        self.lb = wx.ListBox(panel, style=wx.LB_SINGLE)
-        for src in self.playlist_sources:
-            self.lb.Append(self._format_source_label(src))
-        if self.playlist_sources:
-            self.lb.SetSelection(0)
-        main_sizer.Add(self.lb, 1, wx.EXPAND | wx.ALL, 5)
-        ok_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        ok_btn = wx.Button(panel, id=wx.ID_OK)
-        cancel_btn = wx.Button(panel, id=wx.ID_CANCEL)
-        ok_sizer.Add(ok_btn, 0, wx.ALL, 5)
-        ok_sizer.Add(cancel_btn, 0, wx.ALL, 5)
-        main_sizer.Add(ok_sizer, 0, wx.ALIGN_RIGHT)
-        panel.SetSizer(main_sizer)
-        self.add_file_btn.Bind(wx.EVT_BUTTON, self.OnAddFile)
-        self.add_url_btn.Bind(wx.EVT_BUTTON, self.OnAddURL)
-        self.add_xtream_btn.Bind(wx.EVT_BUTTON, self.OnAddXtream)
-        self.add_stalker_btn.Bind(wx.EVT_BUTTON, self.OnAddStalker)
-        self.remove_btn.Bind(wx.EVT_BUTTON, self.OnRemove)
-
-    def OnAddFile(self, _):
-        with wx.FileDialog(self, "Choose M3U file", wildcard="M3U files (*.m3u;*.m3u8)|*.m3u;*.m3u8|All files (*.*)|*.*") as dlg:
-            if dlg.ShowModal() == wx.ID_OK:
-                path = dlg.GetPath()
-                self.playlist_sources.append(path)
-                self.lb.Append(self._format_source_label(path))
-
-    def OnAddURL(self, _):
-        with wx.TextEntryDialog(self, "Enter M3U URL") as dlg:
-            if dlg.ShowModal() == wx.ID_OK:
-                url = dlg.GetValue().strip()
-                if url:
-                    self.playlist_sources.append(url)
-                    self.lb.Append(self._format_source_label(url))
-
-    def OnAddXtream(self, _):
-        dlg = XtreamCodesDialog(self)
-        if dlg.ShowModal() == wx.ID_OK:
-            data = dlg.get_data()
-            if data:
-                data.setdefault("id", generate_provider_id())
-                self.playlist_sources.append(data)
-                self.lb.Append(self._format_source_label(data))
-        dlg.Destroy()
-
-    def OnAddStalker(self, _):
-        dlg = StalkerPortalDialog(self)
-        if dlg.ShowModal() == wx.ID_OK:
-            data = dlg.get_data()
-            if data:
-                data.setdefault("id", generate_provider_id())
-                self.playlist_sources.append(data)
-                self.lb.Append(self._format_source_label(data))
-        dlg.Destroy()
-
-    def OnRemove(self, _):
-        i = self.lb.GetSelection()
-        if i != wx.NOT_FOUND:
-            self.playlist_sources.pop(i)
-            self.lb.Delete(i)
-
-    def _format_source_label(self, src):
-        if isinstance(src, dict):
-            stype = (src.get("type") or "").lower()
-            name = src.get("name") or src.get("username") or src.get("base_url") or "Provider"
-            if stype == "xtream":
-                return f"Xtream Codes – {name}"
-            if stype == "stalker":
-                return f"Stalker Portal – {name}"
-            return f"Provider – {name}"
-        return src
-
-    def GetResult(self):
-        return self.playlist_sources
-
-
-class XtreamCodesDialog(wx.Dialog):
-    STREAM_TYPES = ["m3u_plus", "m3u", "enigma2"]
-    OUTPUT_TYPES = ["ts", "m3u8", "rtmp"]
-
-    def __init__(self, parent):
-        super().__init__(parent, title="Add Xtream Codes Account")
-        self._build_ui()
-        self.CenterOnParent()
-
-    def _build_ui(self):
-        outer = wx.BoxSizer(wx.VERTICAL)
-        panel = wx.Panel(self)
-        grid = wx.FlexGridSizer(0, 2, 6, 10)
-        grid.AddGrowableCol(1, 1)
-
-        def add_row(label, ctrl, hint=None):
-            text = wx.StaticText(panel, label=f"{label}:")
-            text.SetName(f"{label} label")
-            if hasattr(text, "SetAccessibleName"):
-                text.SetAccessibleName(f"{label} label")
-            ctrl.SetName(label)
-            if hasattr(ctrl, "SetAccessibleName"):
-                ctrl.SetAccessibleName(label)
-            desc = hint or f"{label} field"
-            if hasattr(ctrl, "SetAccessibleDescription"):
-                ctrl.SetAccessibleDescription(desc)
-            if hint:
-                ctrl.SetToolTip(hint)
-            if hasattr(ctrl, "SetHelpText") and not isinstance(ctrl, wx.ComboBox):
-                ctrl.SetHelpText(desc)
-            # Only editable text controls support SetHint without assertions on Windows.
-            if isinstance(ctrl, wx.TextCtrl) and hint and hasattr(ctrl, "SetHint"):
-                try:
-                    ctrl.SetHint(hint)
-                except Exception:
-                    pass
-            if hasattr(ctrl, "SetAccessible"):
-                acc = _FieldAccessible(label, desc)
-                ctrl.SetAccessible(acc)
-                ctrl._field_accessible = acc
-            grid.Add(text, 0, wx.ALIGN_RIGHT | wx.ALIGN_CENTER_VERTICAL)
-            grid.Add(ctrl, 1, wx.EXPAND)
-
-        self.name_ctrl = wx.TextCtrl(panel)
-        self.url_ctrl = wx.TextCtrl(panel)
-        self.user_ctrl = wx.TextCtrl(panel)
-        self.pass_ctrl = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
-        self.stream_ctrl = wx.ComboBox(panel, choices=self.STREAM_TYPES, value="m3u_plus", style=wx.CB_READONLY)
-        self.output_ctrl = wx.ComboBox(panel, choices=self.OUTPUT_TYPES, value="ts", style=wx.CB_READONLY)
-        self.auto_epg_ctrl = wx.CheckBox(panel, label="Automatically add XMLTV URL")
-        self.auto_epg_ctrl.SetName("Automatically add XMLTV URL")
-        if hasattr(self.auto_epg_ctrl, "SetAccessibleName"):
-            self.auto_epg_ctrl.SetAccessibleName("Automatically add XMLTV URL")
-        self.auto_epg_ctrl.SetToolTip("Include the provider's XMLTV guide automatically")
-        self.auto_epg_ctrl.SetValue(True)
-
-        add_row("Display name", self.name_ctrl, "Optional nickname for this Xtream Codes account")
-        add_row("Portal base URL", self.url_ctrl, "Base URL of the Xtream Codes server")
-        add_row("Username", self.user_ctrl, "Xtream Codes username")
-        add_row("Password", self.pass_ctrl, "Xtream Codes password")
-        add_row("Playlist type", self.stream_ctrl, "Select the playlist format to download")
-        add_row("Stream output", self.output_ctrl, "Preferred stream container format")
-        grid.Add(wx.StaticText(panel, label=""))
-        grid.Add(self.auto_epg_ctrl)
-
-        panel.SetSizer(grid)
-        outer.Add(panel, 1, wx.ALL | wx.EXPAND, 12)
-
-        btn_sizer = wx.StdDialogButtonSizer()
-        self.ok_btn = wx.Button(self, wx.ID_OK, "Add")
-        self.cancel_btn = wx.Button(self, wx.ID_CANCEL)
-        btn_sizer.AddButton(self.ok_btn)
-        btn_sizer.AddButton(self.cancel_btn)
-        btn_sizer.Realize()
-        outer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 12)
-
-        self.ok_btn.Bind(wx.EVT_BUTTON, self._on_ok)
-        self.ok_btn.SetDefault()
-        self.cancel_btn.Bind(wx.EVT_BUTTON, self._on_cancel)
-
-        self.SetSizerAndFit(outer)
-        self.SetEscapeId(wx.ID_CANCEL)
-        self.Bind(wx.EVT_CLOSE, self._on_close)
-
-    def _on_ok(self, event):
-        if not self.user_ctrl.GetValue().strip() or not self.pass_ctrl.GetValue().strip() or not self.url_ctrl.GetValue().strip():
-            wx.MessageBox("Username, password, and URL are required.", "Validation", wx.OK | wx.ICON_WARNING)
-            return
-        self.EndModal(wx.ID_OK)
-
-    def _on_cancel(self, event):
-        if self.IsModal():
-            self.EndModal(wx.ID_CANCEL)
-        else:
-            self.Destroy()
-
-    def _on_close(self, event):
-        self._on_cancel(event)
-
-    def get_data(self):
-        url = self.url_ctrl.GetValue().strip()
-        username = self.user_ctrl.GetValue().strip()
-        password = self.pass_ctrl.GetValue().strip()
-        if not url or not username or not password:
+        def set_progress(self, *_args, **_kwargs):
             return None
-        return {
-            "type": "xtream",
-            "name": self.name_ctrl.GetValue().strip(),
-            "base_url": url,
-            "username": username,
-            "password": password,
-            "stream_type": self.stream_ctrl.GetValue() or "m3u_plus",
-            "output": self.output_ctrl.GetValue() or "ts",
-            "auto_epg": self.auto_epg_ctrl.GetValue()
-        }
+
+if WX_AVAILABLE:
+    class EPGManagerDialog(wx.Dialog):  # type: ignore[misc]
+        def __init__(self, parent, epg_sources):
+            super().__init__(parent, title="EPG Manager", size=(600, 300))
+            self.epg_sources = epg_sources.copy()
+            self._build_ui()
+            self.CenterOnParent()
+            self.Layout()
+
+        def _build_ui(self):
+            panel = wx.Panel(self)
+            main_sizer = wx.BoxSizer(wx.VERTICAL)
+            btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+            self.add_file_btn = wx.Button(panel, label="Add File")
+            self.add_url_btn = wx.Button(panel, label="Add URL")
+            self.remove_btn = wx.Button(panel, label="Remove Selected")
+            for btn in (self.add_file_btn, self.add_url_btn, self.remove_btn):
+                btn_sizer.Add(btn, 0, wx.ALL, 2)
+            main_sizer.Add(btn_sizer, 0, wx.EXPAND)
+            self.lb = wx.ListBox(panel, style=wx.LB_SINGLE)
+            for src in self.epg_sources:
+                self.lb.Append(src)
+            if self.epg_sources:
+                self.lb.SetSelection(0)
+            main_sizer.Add(self.lb, 1, wx.EXPAND | wx.ALL, 5)
+            ok_sizer = wx.BoxSizer(wx.HORIZONTAL)
+            ok_btn = wx.Button(panel, id=wx.ID_OK)
+            cancel_btn = wx.Button(panel, id=wx.ID_CANCEL)
+            ok_sizer.Add(ok_btn, 0, wx.ALL, 5)
+            ok_sizer.Add(cancel_btn, 0, wx.ALL, 5)
+            main_sizer.Add(ok_sizer, 0, wx.ALIGN_RIGHT)
+            panel.SetSizer(main_sizer)
+            self.add_file_btn.Bind(wx.EVT_BUTTON, self.OnAddFile)
+            self.add_url_btn.Bind(wx.EVT_BUTTON, self.OnAddURL)
+            self.remove_btn.Bind(wx.EVT_BUTTON, self.OnRemove)
+
+        def OnAddFile(self, _):
+            with wx.FileDialog(self, "Choose EPG XML file", wildcard="XML files (*.xml)|*.xml|GZip XML (*.gz)|*.gz|All files (*.*)|*.*") as dlg:
+                if dlg.ShowModal() == wx.ID_OK:
+                    path = dlg.GetPath()
+                    self.epg_sources.append(path)
+                    self.lb.Append(path)
+
+        def OnAddURL(self, _):
+            with wx.TextEntryDialog(self, "Enter EPG XML URL") as dlg:
+                if dlg.ShowModal() == wx.ID_OK:
+                    url = dlg.GetValue().strip()
+                    if url:
+                        self.epg_sources.append(url)
+                        self.lb.Append(url)
+
+        def OnRemove(self, _):
+            i = self.lb.GetSelection()
+            if i != wx.NOT_FOUND:
+                self.epg_sources.pop(i)
+                self.lb.Delete(i)
+
+        def GetResult(self):
+            return self.epg_sources
+else:
+    class EPGManagerDialog:  # type: ignore[misc]
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("EPGManagerDialog requires wxPython. Install wxPython to use GUI dialogs.")
+
+        def GetResult(self):
+            return []
+
+if WX_AVAILABLE:
+    class PlaylistManagerDialog(wx.Dialog):  # type: ignore[misc]
+        def __init__(self, parent, playlist_sources):
+            super().__init__(parent, title="Playlist Manager", size=(600, 300))
+            self.playlist_sources = playlist_sources.copy()
+            self._build_ui()
+            self.CenterOnParent()
+            self.Layout()
+
+        def _build_ui(self):
+            panel = wx.Panel(self)
+            main_sizer = wx.BoxSizer(wx.VERTICAL)
+            btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+            self.add_file_btn = wx.Button(panel, label="Add File")
+            self.add_url_btn = wx.Button(panel, label="Add URL")
+            self.add_xtream_btn = wx.Button(panel, label="Add Xtream Codes")
+            self.add_stalker_btn = wx.Button(panel, label="Add Stalker Portal")
+            self.remove_btn = wx.Button(panel, label="Remove Selected")
+            for btn in (self.add_file_btn, self.add_url_btn, self.add_xtream_btn, self.add_stalker_btn, self.remove_btn):
+                btn_sizer.Add(btn, 0, wx.ALL, 2)
+            main_sizer.Add(btn_sizer, 0, wx.EXPAND)
+            self.lb = wx.ListBox(panel, style=wx.LB_SINGLE)
+            for src in self.playlist_sources:
+                self.lb.Append(self._format_source_label(src))
+            if self.playlist_sources:
+                self.lb.SetSelection(0)
+            main_sizer.Add(self.lb, 1, wx.EXPAND | wx.ALL, 5)
+            ok_sizer = wx.BoxSizer(wx.HORIZONTAL)
+            ok_btn = wx.Button(panel, id=wx.ID_OK)
+            cancel_btn = wx.Button(panel, id=wx.ID_CANCEL)
+            ok_sizer.Add(ok_btn, 0, wx.ALL, 5)
+            ok_sizer.Add(cancel_btn, 0, wx.ALL, 5)
+            main_sizer.Add(ok_sizer, 0, wx.ALIGN_RIGHT)
+            panel.SetSizer(main_sizer)
+            self.add_file_btn.Bind(wx.EVT_BUTTON, self.OnAddFile)
+            self.add_url_btn.Bind(wx.EVT_BUTTON, self.OnAddURL)
+            self.add_xtream_btn.Bind(wx.EVT_BUTTON, self.OnAddXtream)
+            self.add_stalker_btn.Bind(wx.EVT_BUTTON, self.OnAddStalker)
+            self.remove_btn.Bind(wx.EVT_BUTTON, self.OnRemove)
+
+        def OnAddFile(self, _):
+            with wx.FileDialog(self, "Choose M3U file", wildcard="M3U files (*.m3u;*.m3u8)|*.m3u;*.m3u8|All files (*.*)|*.*") as dlg:
+                if dlg.ShowModal() == wx.ID_OK:
+                    path = dlg.GetPath()
+                    self.playlist_sources.append(path)
+                    self.lb.Append(self._format_source_label(path))
+
+        def OnAddURL(self, _):
+            with wx.TextEntryDialog(self, "Enter M3U URL") as dlg:
+                if dlg.ShowModal() == wx.ID_OK:
+                    url = dlg.GetValue().strip()
+                    if url:
+                        self.playlist_sources.append(url)
+                        self.lb.Append(self._format_source_label(url))
+
+        def OnAddXtream(self, _):
+            dlg = XtreamCodesDialog(self)
+            if dlg.ShowModal() == wx.ID_OK:
+                data = dlg.get_data()
+                if data:
+                    data.setdefault("id", generate_provider_id())
+                    self.playlist_sources.append(data)
+                    self.lb.Append(self._format_source_label(data))
+            dlg.Destroy()
+
+        def OnAddStalker(self, _):
+            dlg = StalkerPortalDialog(self)
+            if dlg.ShowModal() == wx.ID_OK:
+                data = dlg.get_data()
+                if data:
+                    data.setdefault("id", generate_provider_id())
+                    self.playlist_sources.append(data)
+                    self.lb.Append(self._format_source_label(data))
+            dlg.Destroy()
+
+        def OnRemove(self, _):
+            i = self.lb.GetSelection()
+            if i != wx.NOT_FOUND:
+                self.playlist_sources.pop(i)
+                self.lb.Delete(i)
+
+        def _format_source_label(self, src):
+            if isinstance(src, dict):
+                stype = (src.get("type") or "").lower()
+                name = src.get("name") or src.get("username") or src.get("base_url") or "Provider"
+                if stype == "xtream":
+                    return f"Xtream Codes – {name}"
+                if stype == "stalker":
+                    return f"Stalker Portal – {name}"
+                return f"Provider – {name}"
+            return src
+
+        def GetResult(self):
+            return self.playlist_sources
+else:
+    class PlaylistManagerDialog:  # type: ignore[misc]
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("PlaylistManagerDialog requires wxPython. Install wxPython to use GUI dialogs.")
+
+        def GetResult(self):
+            return []
 
 
-class StalkerPortalDialog(wx.Dialog):
-    def __init__(self, parent):
-        super().__init__(parent, title="Add Stalker Portal Account")
-        self._build_ui()
-        self.CenterOnParent()
+if WX_AVAILABLE:
+    class XtreamCodesDialog(wx.Dialog):
+        STREAM_TYPES = ["m3u_plus", "m3u", "enigma2"]
+        OUTPUT_TYPES = ["ts", "m3u8", "rtmp"]
 
-    def _build_ui(self):
-        outer = wx.BoxSizer(wx.VERTICAL)
-        panel = wx.Panel(self)
-        grid = wx.FlexGridSizer(0, 2, 6, 10)
-        grid.AddGrowableCol(1, 1)
+        def __init__(self, parent):
+            super().__init__(parent, title="Add Xtream Codes Account")
+            self._build_ui()
+            self.CenterOnParent()
 
-        def add_row(label, ctrl, hint=None):
-            text = wx.StaticText(panel, label=f"{label}:")
-            text.SetName(f"{label} label")
-            if hasattr(text, "SetAccessibleName"):
-                text.SetAccessibleName(f"{label} label")
-            ctrl.SetName(label)
-            if hasattr(ctrl, "SetAccessibleName"):
-                ctrl.SetAccessibleName(label)
-            desc = hint or f"{label} field"
-            if hasattr(ctrl, "SetAccessibleDescription"):
-                ctrl.SetAccessibleDescription(desc)
-            if hint:
-                ctrl.SetToolTip(hint)
-            if hasattr(ctrl, "SetHelpText") and not isinstance(ctrl, wx.ComboBox):
-                ctrl.SetHelpText(desc)
-            if isinstance(ctrl, wx.TextCtrl) and hint and hasattr(ctrl, "SetHint"):
-                try:
-                    ctrl.SetHint(hint)
-                except Exception:
-                    pass
-            if hasattr(ctrl, "SetAccessible"):
-                acc = _FieldAccessible(label, desc)
-                ctrl.SetAccessible(acc)
-                ctrl._field_accessible = acc
-            grid.Add(text, 0, wx.ALIGN_RIGHT | wx.ALIGN_CENTER_VERTICAL)
-            grid.Add(ctrl, 1, wx.EXPAND)
+        def _build_ui(self):
+            outer = wx.BoxSizer(wx.VERTICAL)
+            panel = wx.Panel(self)
+            grid = wx.FlexGridSizer(0, 2, 6, 10)
+            grid.AddGrowableCol(1, 1)
 
-        self.name_ctrl = wx.TextCtrl(panel)
-        self.url_ctrl = wx.TextCtrl(panel)
-        self.user_ctrl = wx.TextCtrl(panel)
-        self.pass_ctrl = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
-        self.mac_ctrl = wx.TextCtrl(panel)
-        self.auto_epg_ctrl = wx.CheckBox(panel, label="Attempt to add provider XMLTV")
-        self.auto_epg_ctrl.SetName("Attempt to add provider XMLTV")
-        if hasattr(self.auto_epg_ctrl, "SetAccessibleName"):
-            self.auto_epg_ctrl.SetAccessibleName("Attempt to add provider XMLTV")
-        self.auto_epg_ctrl.SetToolTip("Try to add the portal's XMLTV guide automatically")
-        self.auto_epg_ctrl.SetValue(True)
+            def add_row(label, ctrl, hint=None):
+                text = wx.StaticText(panel, label=f"{label}:")
+                text.SetName(f"{label} label")
+                if hasattr(text, "SetAccessibleName"):
+                    text.SetAccessibleName(f"{label} label")
+                ctrl.SetName(label)
+                if hasattr(ctrl, "SetAccessibleName"):
+                    ctrl.SetAccessibleName(label)
+                desc = hint or f"{label} field"
+                if hasattr(ctrl, "SetAccessibleDescription"):
+                    ctrl.SetAccessibleDescription(desc)
+                if hint:
+                    ctrl.SetToolTip(hint)
+                if hasattr(ctrl, "SetHelpText") and not isinstance(ctrl, wx.ComboBox):
+                    ctrl.SetHelpText(desc)
+                # Only editable text controls support SetHint without assertions on Windows.
+                if isinstance(ctrl, wx.TextCtrl) and hint and hasattr(ctrl, "SetHint"):
+                    try:
+                        ctrl.SetHint(hint)
+                    except Exception:
+                        pass
+                if hasattr(ctrl, "SetAccessible"):
+                    acc = _FieldAccessible(label, desc)
+                    ctrl.SetAccessible(acc)
+                    ctrl._field_accessible = acc
+                grid.Add(text, 0, wx.ALIGN_RIGHT | wx.ALIGN_CENTER_VERTICAL)
+                grid.Add(ctrl, 1, wx.EXPAND)
 
-        self.mac_ctrl.SetValue(self._default_mac())
+            self.name_ctrl = wx.TextCtrl(panel)
+            self.url_ctrl = wx.TextCtrl(panel)
+            self.user_ctrl = wx.TextCtrl(panel)
+            self.pass_ctrl = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+            self.stream_ctrl = wx.ComboBox(panel, choices=self.STREAM_TYPES, value="m3u_plus", style=wx.CB_READONLY)
+            self.output_ctrl = wx.ComboBox(panel, choices=self.OUTPUT_TYPES, value="ts", style=wx.CB_READONLY)
+            self.auto_epg_ctrl = wx.CheckBox(panel, label="Automatically add XMLTV URL")
+            self.auto_epg_ctrl.SetName("Automatically add XMLTV URL")
+            if hasattr(self.auto_epg_ctrl, "SetAccessibleName"):
+                self.auto_epg_ctrl.SetAccessibleName("Automatically add XMLTV URL")
+            self.auto_epg_ctrl.SetToolTip("Include the provider's XMLTV guide automatically")
+            self.auto_epg_ctrl.SetValue(True)
 
-        self.mac_btn = wx.Button(panel, label="Randomise MAC")
-        self.mac_btn.Bind(wx.EVT_BUTTON, self._on_random_mac)
+            add_row("Display name", self.name_ctrl, "Optional nickname for this Xtream Codes account")
+            add_row("Portal base URL", self.url_ctrl, "Base URL of the Xtream Codes server")
+            add_row("Username", self.user_ctrl, "Xtream Codes username")
+            add_row("Password", self.pass_ctrl, "Xtream Codes password")
+            add_row("Playlist type", self.stream_ctrl, "Select the playlist format to download")
+            add_row("Stream output", self.output_ctrl, "Preferred stream container format")
+            grid.Add(wx.StaticText(panel, label=""))
+            grid.Add(self.auto_epg_ctrl)
 
-        add_row("Display name", self.name_ctrl, "Optional nickname for this portal account")
-        add_row("Portal base URL", self.url_ctrl, "Base URL of the Stalker/Ministra portal")
-        add_row("Username", self.user_ctrl, "Portal account username")
-        add_row("Password", self.pass_ctrl, "Portal account password")
-        add_row("MAC address", self.mac_ctrl, "MAC address presented to the portal")
-        grid.Add(wx.StaticText(panel, label=""))
-        grid.Add(self.mac_btn)
-        grid.Add(wx.StaticText(panel, label=""))
-        grid.Add(self.auto_epg_ctrl)
+            panel.SetSizer(grid)
+            outer.Add(panel, 1, wx.ALL | wx.EXPAND, 12)
 
-        panel.SetSizer(grid)
-        outer.Add(panel, 1, wx.ALL | wx.EXPAND, 12)
+            btn_sizer = wx.StdDialogButtonSizer()
+            self.ok_btn = wx.Button(self, wx.ID_OK, "Add")
+            self.cancel_btn = wx.Button(self, wx.ID_CANCEL)
+            btn_sizer.AddButton(self.ok_btn)
+            btn_sizer.AddButton(self.cancel_btn)
+            btn_sizer.Realize()
+            outer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 12)
 
-        btn_sizer = wx.StdDialogButtonSizer()
-        self.ok_btn = wx.Button(self, wx.ID_OK, "Add")
-        self.cancel_btn = wx.Button(self, wx.ID_CANCEL)
-        btn_sizer.AddButton(self.ok_btn)
-        btn_sizer.AddButton(self.cancel_btn)
-        btn_sizer.Realize()
-        outer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 12)
+            self.ok_btn.Bind(wx.EVT_BUTTON, self._on_ok)
+            self.ok_btn.SetDefault()
+            self.cancel_btn.Bind(wx.EVT_BUTTON, self._on_cancel)
 
-        self.ok_btn.Bind(wx.EVT_BUTTON, self._on_ok)
-        self.ok_btn.SetDefault()
-        self.cancel_btn.Bind(wx.EVT_BUTTON, self._on_cancel)
+            self.SetSizerAndFit(outer)
+            self.SetEscapeId(wx.ID_CANCEL)
+            self.Bind(wx.EVT_CLOSE, self._on_close)
 
-        self.SetSizerAndFit(outer)
-        self.SetEscapeId(wx.ID_CANCEL)
-        self.Bind(wx.EVT_CLOSE, self._on_close)
+        def _on_ok(self, event):
+            if not self.user_ctrl.GetValue().strip() or not self.pass_ctrl.GetValue().strip() or not self.url_ctrl.GetValue().strip():
+                wx.MessageBox("Username, password, and URL are required.", "Validation", wx.OK | wx.ICON_WARNING)
+                return
+            self.EndModal(wx.ID_OK)
 
-    def _sanitize_mac(self, value: str) -> str:
-        value = value.replace('-', ':').replace('.', '')
-        value = value.upper()
-        if ':' not in value and len(value) == 12:
-            value = ':'.join(value[i:i+2] for i in range(0, 12, 2))
-        return value
+        def _on_cancel(self, event):
+            if self.IsModal():
+                self.EndModal(wx.ID_CANCEL)
+            else:
+                self.Destroy()
 
-    def _default_mac(self) -> str:
-        prefix = [0x00, 0x1A, 0x79]
-        suffix = [random.randint(0x00, 0xFF) for _ in range(3)]
-        return ':'.join(f"{b:02X}" for b in prefix + suffix)
+        def _on_close(self, event):
+            self._on_cancel(event)
 
-    def _on_random_mac(self, _):
-        self.mac_ctrl.SetValue(self._default_mac())
+        def get_data(self):
+            url = self.url_ctrl.GetValue().strip()
+            username = self.user_ctrl.GetValue().strip()
+            password = self.pass_ctrl.GetValue().strip()
+            if not url or not username or not password:
+                return None
+            return {
+                "type": "xtream",
+                "name": self.name_ctrl.GetValue().strip(),
+                "base_url": url,
+                "username": username,
+                "password": password,
+                "stream_type": self.stream_ctrl.GetValue() or "m3u_plus",
+                "output": self.output_ctrl.GetValue() or "ts",
+                "auto_epg": self.auto_epg_ctrl.GetValue()
+            }
 
-    def _on_ok(self, event):
-        if not self.user_ctrl.GetValue().strip() or not self.pass_ctrl.GetValue().strip() or not self.url_ctrl.GetValue().strip():
-            wx.MessageBox("Portal URL, username, and password are required.", "Validation", wx.OK | wx.ICON_WARNING)
-            return
-        mac = self._sanitize_mac(self.mac_ctrl.GetValue().strip())
-        if len(mac.split(':')) != 6:
-            wx.MessageBox("MAC address must contain six octets (e.g., 00:1A:79:12:34:56).", "Validation", wx.OK | wx.ICON_WARNING)
-            return
-        self.mac_ctrl.SetValue(mac)
-        self.EndModal(wx.ID_OK)
 
-    def _on_cancel(self, event):
-        if self.IsModal():
-            self.EndModal(wx.ID_CANCEL)
-        else:
-            self.Destroy()
+    class StalkerPortalDialog(wx.Dialog):
+        def __init__(self, parent):
+            super().__init__(parent, title="Add Stalker Portal Account")
+            self._build_ui()
+            self.CenterOnParent()
 
-    def _on_close(self, event):
-        self._on_cancel(event)
+        def _build_ui(self):
+            outer = wx.BoxSizer(wx.VERTICAL)
+            panel = wx.Panel(self)
+            grid = wx.FlexGridSizer(0, 2, 6, 10)
+            grid.AddGrowableCol(1, 1)
 
-    def get_data(self):
-        url = self.url_ctrl.GetValue().strip()
-        username = self.user_ctrl.GetValue().strip()
-        password = self.pass_ctrl.GetValue().strip()
-        if not url or not username or not password:
+            def add_row(label, ctrl, hint=None):
+                text = wx.StaticText(panel, label=f"{label}:")
+                text.SetName(f"{label} label")
+                if hasattr(text, "SetAccessibleName"):
+                    text.SetAccessibleName(f"{label} label")
+                ctrl.SetName(label)
+                if hasattr(ctrl, "SetAccessibleName"):
+                    ctrl.SetAccessibleName(label)
+                desc = hint or f"{label} field"
+                if hasattr(ctrl, "SetAccessibleDescription"):
+                    ctrl.SetAccessibleDescription(desc)
+                if hint:
+                    ctrl.SetToolTip(hint)
+                if hasattr(ctrl, "SetHelpText") and not isinstance(ctrl, wx.ComboBox):
+                    ctrl.SetHelpText(desc)
+                if isinstance(ctrl, wx.TextCtrl) and hint and hasattr(ctrl, "SetHint"):
+                    try:
+                        ctrl.SetHint(hint)
+                    except Exception:
+                        pass
+                if hasattr(ctrl, "SetAccessible"):
+                    acc = _FieldAccessible(label, desc)
+                    ctrl.SetAccessible(acc)
+                    ctrl._field_accessible = acc
+                grid.Add(text, 0, wx.ALIGN_RIGHT | wx.ALIGN_CENTER_VERTICAL)
+                grid.Add(ctrl, 1, wx.EXPAND)
+
+            self.name_ctrl = wx.TextCtrl(panel)
+            self.url_ctrl = wx.TextCtrl(panel)
+            self.user_ctrl = wx.TextCtrl(panel)
+            self.pass_ctrl = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+            self.mac_ctrl = wx.TextCtrl(panel)
+            self.auto_epg_ctrl = wx.CheckBox(panel, label="Attempt to add provider XMLTV")
+            self.auto_epg_ctrl.SetName("Attempt to add provider XMLTV")
+            if hasattr(self.auto_epg_ctrl, "SetAccessibleName"):
+                self.auto_epg_ctrl.SetAccessibleName("Attempt to add provider XMLTV")
+            self.auto_epg_ctrl.SetToolTip("Try to add the portal's XMLTV guide automatically")
+            self.auto_epg_ctrl.SetValue(True)
+
+            self.mac_ctrl.SetValue(self._default_mac())
+
+            self.mac_btn = wx.Button(panel, label="Randomise MAC")
+            self.mac_btn.Bind(wx.EVT_BUTTON, self._on_random_mac)
+
+            add_row("Display name", self.name_ctrl, "Optional nickname for this portal account")
+            add_row("Portal base URL", self.url_ctrl, "Base URL of the Stalker/Ministra portal")
+            add_row("Username", self.user_ctrl, "Portal account username")
+            add_row("Password", self.pass_ctrl, "Portal account password")
+            add_row("MAC address", self.mac_ctrl, "MAC address presented to the portal")
+            grid.Add(wx.StaticText(panel, label=""))
+            grid.Add(self.mac_btn)
+            grid.Add(wx.StaticText(panel, label=""))
+            grid.Add(self.auto_epg_ctrl)
+
+            panel.SetSizer(grid)
+            outer.Add(panel, 1, wx.ALL | wx.EXPAND, 12)
+
+            btn_sizer = wx.StdDialogButtonSizer()
+            self.ok_btn = wx.Button(self, wx.ID_OK, "Add")
+            self.cancel_btn = wx.Button(self, wx.ID_CANCEL)
+            btn_sizer.AddButton(self.ok_btn)
+            btn_sizer.AddButton(self.cancel_btn)
+            btn_sizer.Realize()
+            outer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 12)
+
+            self.ok_btn.Bind(wx.EVT_BUTTON, self._on_ok)
+            self.ok_btn.SetDefault()
+            self.cancel_btn.Bind(wx.EVT_BUTTON, self._on_cancel)
+
+            self.SetSizerAndFit(outer)
+            self.SetEscapeId(wx.ID_CANCEL)
+            self.Bind(wx.EVT_CLOSE, self._on_close)
+
+        def _sanitize_mac(self, value: str) -> str:
+            value = value.replace('-', ':').replace('.', '')
+            value = value.upper()
+            if ':' not in value and len(value) == 12:
+                value = ':'.join(value[i:i+2] for i in range(0, 12, 2))
+            return value
+
+        def _default_mac(self) -> str:
+            prefix = [0x00, 0x1A, 0x79]
+            suffix = [random.randint(0x00, 0xFF) for _ in range(3)]
+            return ':'.join(f"{b:02X}" for b in prefix + suffix)
+
+        def _on_random_mac(self, _):
+            self.mac_ctrl.SetValue(self._default_mac())
+
+        def _on_ok(self, event):
+            if not self.user_ctrl.GetValue().strip() or not self.pass_ctrl.GetValue().strip() or not self.url_ctrl.GetValue().strip():
+                wx.MessageBox("Portal URL, username, and password are required.", "Validation", wx.OK | wx.ICON_WARNING)
+                return
+            mac = self._sanitize_mac(self.mac_ctrl.GetValue().strip())
+            if len(mac.split(':')) != 6:
+                wx.MessageBox("MAC address must contain six octets (e.g., 00:1A:79:12:34:56).", "Validation", wx.OK | wx.ICON_WARNING)
+                return
+            self.mac_ctrl.SetValue(mac)
+            self.EndModal(wx.ID_OK)
+
+        def _on_cancel(self, event):
+            if self.IsModal():
+                self.EndModal(wx.ID_CANCEL)
+            else:
+                self.Destroy()
+
+        def _on_close(self, event):
+            self._on_cancel(event)
+
+        def get_data(self):
+            url = self.url_ctrl.GetValue().strip()
+            username = self.user_ctrl.GetValue().strip()
+            password = self.pass_ctrl.GetValue().strip()
+            if not url or not username or not password:
+                return None
+            return {
+                "type": "stalker",
+                "name": self.name_ctrl.GetValue().strip(),
+                "base_url": url,
+                "username": username,
+                "password": password,
+                "mac": self.mac_ctrl.GetValue().strip(),
+                "auto_epg": self.auto_epg_ctrl.GetValue()
+            }
+else:
+    class XtreamCodesDialog:  # type: ignore[misc]
+        STREAM_TYPES: List[str] = []
+        OUTPUT_TYPES: List[str] = []
+
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("XtreamCodesDialog requires wxPython. Install wxPython to use GUI dialogs.")
+
+        def get_data(self):
             return None
-        return {
-            "type": "stalker",
-            "name": self.name_ctrl.GetValue().strip(),
-            "base_url": url,
-            "username": username,
-            "password": password,
-            "mac": self.mac_ctrl.GetValue().strip(),
-            "auto_epg": self.auto_epg_ctrl.GetValue()
-        }
+
+    class StalkerPortalDialog:  # type: ignore[misc]
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("StalkerPortalDialog requires wxPython. Install wxPython to use GUI dialogs.")
+
+        def get_data(self):
+            return None
 
 # =========================
 # Helpers for region + playlist
 # =========================
 
 def _derive_playlist_region(channel: Dict[str, str]) -> str:
-    # Try group/title and tvg fields first
-    g = channel.get("group") or ""
-    # Prefer explicit country words anywhere in the group (e.g., "English Canada")
-    if g:
-        grp_detect = extract_group(g)
-        if grp_detect:
-            return grp_detect
-    for tok in re.findall(r'[a-z]{2,3}', g.lower()):
-        if tok in group_synonyms():
-            return tok
+    votes: Dict[str, int] = {}
+    order: Dict[str, int] = {}
+    order_counter = 0
+
+    def _add_vote(code: str, weight: int):
+        nonlocal order_counter
+        if not code:
+            return
+        votes[code] = votes.get(code, 0) + weight
+        if code not in order:
+            order[code] = order_counter
+            order_counter += 1
 
     def _normalize_for_prefix(text: str) -> str:
         return re.sub(r'[^a-z0-9]', '', (text or '').lower())
@@ -2197,38 +2296,56 @@ def _derive_playlist_region(channel: Dict[str, str]) -> str:
                     changed = True
         return rem
 
-    # Handle compact group names like "UKSD" where region + quality tag are glued
-    compact_group = _normalize_for_prefix(g)
-    if compact_group:
+    def _votes_from_prefix(text: str, weight: int):
+        compact = _normalize_for_prefix(text)
+        if not compact:
+            return
         for code, variants in group_synonyms().items():
             for variant in variants:
                 prefix = _normalize_for_prefix(variant)
-                if prefix and compact_group.startswith(prefix):
-                    remainder = _strip_quality_prefix(compact_group[len(prefix):])
+                if prefix and compact.startswith(prefix):
+                    remainder = _strip_quality_prefix(compact[len(prefix):])
                     if not remainder:
-                        return code
+                        _add_vote(code, weight)
+                        return
 
-    # tvg-id suffixes sometimes carry region
+    def _votes_from_text(text: str, base_weight: int):
+        if not text:
+            return
+        lowered = text.lower()
+        m = re.match(r'\s*([a-z]{2,3})\s*[:\-]', lowered)
+        if m and m.group(1) in group_synonyms():
+            _add_vote(m.group(1), base_weight + 3)
+        lead = re.match(r'\s*([a-z]{2,3})\b', lowered)
+        if lead and lead.group(1) in group_synonyms():
+            _add_vote(lead.group(1), base_weight + 2)
+        if 'usa' in lowered:
+            _add_vote('us', base_weight + 2)
+        _votes_from_prefix(text, base_weight + 2)
+        _add_vote(extract_group(text), base_weight)
+
+    g = channel.get("group") or ""
+    if g:
+        _add_vote(extract_group(g), 4)
+        for tok in re.findall(r'\b[a-z]{2,3}\b', g.lower()):
+            if tok in group_synonyms():
+                _add_vote(tok, 3)
+        _votes_from_prefix(g, 5)
+
     tid = (channel.get("tvg-id") or "").lower()
     for tok in re.findall(r'[.\-_:|/]([a-z]{2,3})', tid):
         if tok in group_synonyms():
-            return tok
+            _add_vote(tok, 6)
 
-    # fallback: guess from display name / tvg-name, handling compact tags
-    name_field = channel.get("name", "")
-    for text in (name_field, channel.get("tvg-name", "")):
-        compact = _normalize_for_prefix(text)
-        if compact:
-            for code, variants in group_synonyms().items():
-                for variant in variants:
-                    prefix = _normalize_for_prefix(variant)
-                    if prefix and compact.startswith(prefix):
-                        remainder = _strip_quality_prefix(compact[len(prefix):])
-                        if not remainder:
-                            return code
+    _votes_from_text(channel.get("tvg-name", ""), 6)
+    _votes_from_text(channel.get("name", ""), 7)
 
-    # fallback to broader text search
-    if name_field:
-        return extract_group(name_field)
-    tvg_name = channel.get("tvg-name", "")
-    return extract_group(tvg_name) if tvg_name else ''
+    if not votes:
+        return ''
+
+    best_score = max(votes.values())
+    tied = [code for code, score in votes.items() if score == best_score]
+    if len(tied) == 1:
+        return tied[0]
+    tied.sort(key=lambda code: order.get(code, 1_000_000))
+    return tied[0]

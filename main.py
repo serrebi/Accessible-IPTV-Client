@@ -7,7 +7,6 @@ import ctypes
 import urllib.request
 import urllib.parse
 import gzip
-import io
 import sqlite3
 import threading
 from typing import Dict, List, Optional
@@ -20,6 +19,7 @@ import platform
 import time
 import signal
 import subprocess
+import hashlib
 
 import wx.adv
 
@@ -36,6 +36,9 @@ from providers import (
     StalkerPortalClient, StalkerPortalConfig,
     ProviderError, generate_provider_id
 )
+
+
+_M3U_ATTR_RE = re.compile(r'([A-Za-z0-9_\-]+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^",\s]+))')
 
 def set_linux_env():
     if platform.system() != "Linux":
@@ -173,7 +176,7 @@ class IPTVClient(wx.Frame):
     PLAYER_MENU_ATTRS = dict(PLAYER_KEYS)
 
     _CACHE_SHOW_STALE_SECS = 600
-    _CACHE_REFRESH_AFTER_SECS = 30
+    _CACHE_REFRESH_AFTER_SECS = 180
 
     def __init__(self):
         super().__init__(None, title="Accessible IPTV Client", size=(800, 600))
@@ -340,8 +343,17 @@ class IPTVClient(wx.Frame):
                         )
                         client = XtreamCodesClient(cfg)
                         text = client.fetch_playlist()
+                        text_hash = self._playlist_text_hash(text)
+                        cache_key = provider_id or f"xtream:{cfg.base_url}:{cfg.username}"
+                        parsed_cache = self._parsed_cache_path_for_key(f"provider:{cache_key}")
                         provider_meta = {"provider-type": "xtream", "provider-id": provider_id}
-                        results[idx] = {"kind": "m3u", "text": text, "provider": provider_meta}
+                        results[idx] = {
+                            "kind": "m3u",
+                            "text": text,
+                            "provider": provider_meta,
+                            "hash": text_hash,
+                            "cache_path": parsed_cache
+                        }
                         with provider_lock:
                             provider_clients_local[provider_id] = client
                             if cfg.auto_epg:
@@ -376,6 +388,7 @@ class IPTVClient(wx.Frame):
                 # Plain playlist path or URL
                 if isinstance(src, str) and src.startswith(("http://", "https://")):
                     cache_path = get_cache_path_for_url(src)
+                    parsed_cache = self._parsed_cache_path_for_key(src)
                     valid_caches.add(cache_path)
                     download = True
                     if os.path.exists(cache_path):
@@ -397,16 +410,32 @@ class IPTVClient(wx.Frame):
                     else:
                         with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
                             text = f.read()
-                    results[idx] = {"kind": "m3u", "text": text, "provider": None}
+                    text_hash = self._playlist_text_hash(text)
+                    results[idx] = {
+                        "kind": "m3u",
+                        "text": text,
+                        "provider": None,
+                        "hash": text_hash,
+                        "cache_path": parsed_cache
+                    }
                 elif isinstance(src, str) and os.path.exists(src):
                     with open(src, "r", encoding="utf-8", errors="ignore") as f:
                         text = f.read()
-                    results[idx] = {"kind": "m3u", "text": text, "provider": None}
+                    text_hash = self._playlist_text_hash(text)
+                    cache_key = f"file:{os.path.abspath(src)}"
+                    parsed_cache = self._parsed_cache_path_for_key(cache_key)
+                    results[idx] = {
+                        "kind": "m3u",
+                        "text": text,
+                        "provider": None,
+                        "hash": text_hash,
+                        "cache_path": parsed_cache
+                    }
                 else:
                     results[idx] = None
             except Exception as e:
                 results[idx] = {"error": str(e)}
-        
+
         threads = []
         for idx, src in enumerate(playlist_sources):
             t = threading.Thread(target=fetch_playlist, args=(idx, src), daemon=True)
@@ -428,7 +457,17 @@ class IPTVClient(wx.Frame):
                 text = result.get("text")
                 if not text:
                     continue
-                channels = self._parse_m3u_return(text, provider_info=result.get("provider"))
+                cache_path = result.get("cache_path")
+                text_hash = result.get("hash")
+                provider_meta = result.get("provider")
+                channels = None
+                if cache_path and text_hash:
+                    # Reuse a parsed playlist snapshot when the raw text hasn't changed.
+                    channels = self._load_cached_playlist(cache_path, text_hash, provider_meta)
+                if channels is None:
+                    channels = self._parse_m3u_return(text, provider_info=provider_meta)
+                    if cache_path and text_hash:
+                        self._store_cached_playlist(cache_path, text_hash, channels, provider_meta)
 
             for ch in channels or []:
                 key = (ch.get("name", ""), ch.get("url", ""), ch.get("provider-id", ""))
@@ -918,11 +957,12 @@ class IPTVClient(wx.Frame):
 
     def finish_import_background(self):
         self.epg_importing = False
-        # Stop polling for incremental updates
-        wx.CallAfter(self._stop_epg_poll_timer)
+        # Stop import-specific polling and restart steady refresh timer
+        self._stop_epg_poll_timer()
         with self.epg_cache_lock:
             self.epg_cache.clear()
         self.on_highlight()
+        self._start_epg_poll_timer()
 
     def show_manager(self, _):
         dlg = PlaylistManagerDialog(self, self.playlist_sources)
@@ -958,128 +998,239 @@ class IPTVClient(wx.Frame):
     def finish_import(self):
         # legacy-sounding API; ensure poll timer is stopped here too.
         self.epg_importing = False
-        wx.CallAfter(self._stop_epg_poll_timer)
+        self._stop_epg_poll_timer()
         with self.epg_cache_lock:
             self.epg_cache.clear()
         self.on_highlight()
+        self._start_epg_poll_timer()
 
     def _parse_m3u_return(self, text, provider_info=None):
-        lines = text.splitlines()
-        out = []
-        meta: Dict[str, str] = {}
         provider_info = provider_info or {}
         provider_id = provider_info.get("provider-id")
         provider_type = provider_info.get("provider-type")
 
-        def _parse_attrs(segment: str) -> Dict[str, str]:
-            attrs: Dict[str, str] = {}
-            if not segment:
-                return attrs
-            for key, val in re.findall(r'([A-Za-z0-9_\-]+)="([^"]*)"', segment):
-                attrs[key.lower()] = val.strip()
-            for key, val in re.findall(r'([A-Za-z0-9_\-]+)=([^",\s]+)', segment):
-                attrs.setdefault(key.lower(), val.strip())
-            return attrs
+        out: List[Dict[str, str]] = []
+        append = out.append
+        extract_group_local = extract_group
+        stream_id_for = self._extract_stream_id
+        attr_iter = _M3U_ATTR_RE.finditer
 
-        for line in lines:
-            s = line.strip()
+        # Per-channel metadata, reset after each URL
+        name = ""
+        group = ""
+        tvg_id = ""
+        tvg_name = ""
+        tvg_logo = ""
+        tvg_rec = ""
+        timeshift = ""
+        catchup = ""
+        catchup_type = ""
+        catchup_days = ""
+        catchup_source = ""
+        catchup_offset = ""
+        http_user_agent = ""
+
+        for raw_line in text.splitlines():
+            s = raw_line.strip()
             if not s:
                 continue
-            if s.upper().startswith("#EXTINF"):
-                meta = {"name": "", "group": "", "tvg-id": "", "tvg-name": "", "tvg-logo": ""}
-                if "," in s:
-                    meta["name"] = s.split(",", 1)[1].strip()
-                attrs_part = s.split(":", 1)[1] if ":" in s else ""
-                attr_segment = attrs_part.split(",", 1)[0]
-                attrs = _parse_attrs(attr_segment)
-                meta["attrs"] = attrs
-                meta["group"] = attrs.get("group-title", meta["group"])
-                meta["tvg-id"] = attrs.get("tvg-id", meta["tvg-id"])
-                meta["tvg-name"] = attrs.get("tvg-name", meta["tvg-name"])
-                meta["tvg-logo"] = attrs.get("tvg-logo") or attrs.get("logo") or meta.get("tvg-logo", "")
-                if "tvg-rec" in attrs:
-                    meta["tvg-rec"] = attrs.get("tvg-rec")
-                if "timeshift" in attrs:
-                    meta["timeshift"] = attrs.get("timeshift")
-                if "catchup" in attrs:
-                    meta["catchup"] = attrs.get("catchup")
-                if "catchup-type" in attrs:
-                    meta["catchup-type"] = attrs.get("catchup-type")
-                if "catchup-days" in attrs:
-                    meta["catchup-days"] = attrs.get("catchup-days")
-                if "catchup-source" in attrs:
-                    meta["catchup-source"] = attrs.get("catchup-source")
-                if "catchup-offset" in attrs:
-                    meta["catchup-offset"] = attrs.get("catchup-offset")
-                if "http-user-agent" in attrs:
-                    meta["http-user-agent"] = attrs.get("http-user-agent")
-            elif s.startswith("#EXTVLCOPT"):
-                if ":" in s and "=" in s:
-                    _prefix, data = s.split(":", 1)
-                    key, value = data.split("=", 1)
-                    key = key.strip().lower()
-                    value = value.strip()
-                    if key in {"catchup-source", "catchup_url"}:
-                        meta["catchup-source"] = value
-                    elif key == "catchup-days":
-                        meta["catchup-days"] = value
-                    elif key == "catchup-type":
-                        meta["catchup-type"] = value
-                    elif key == "http-user-agent":
-                        meta["http-user-agent"] = value
-            elif s.startswith("#KODIPROP"):
-                if ":" in s and "=" in s:
-                    _prefix, data = s.split(":", 1)
-                    key, value = data.split("=", 1)
-                    key = key.strip().lower()
-                    value = value.strip()
-                    if key.endswith("catchup_days"):
-                        meta["catchup-days"] = value
-                    elif key.endswith("catchup_source"):
-                        meta["catchup-source"] = value
-            elif s.startswith("#"):
+
+            if s[0] == '#':
+                upper_prefix = s[:10].upper()
+                if upper_prefix.startswith("#EXTINF"):
+                    name = ""
+                    group = ""
+                    tvg_id = ""
+                    tvg_name = ""
+                    tvg_logo = ""
+                    tvg_rec = ""
+                    timeshift = ""
+                    catchup = ""
+                    catchup_type = ""
+                    catchup_days = ""
+                    catchup_source = ""
+                    catchup_offset = ""
+                    http_user_agent = ""
+
+                    comma_idx = s.find(',')
+                    info_part = s if comma_idx == -1 else s[:comma_idx]
+                    if comma_idx != -1:
+                        name = s[comma_idx + 1:].strip()
+
+                    colon_idx = info_part.find(':')
+                    attr_segment = info_part[colon_idx + 1:] if colon_idx != -1 else ""
+                    if attr_segment:
+                        attrs: Dict[str, str] = {}
+                        for match in attr_iter(attr_segment):
+                            key = match.group(1).lower()
+                            value = match.group(2) or match.group(3) or match.group(4) or ""
+                            if key not in attrs:
+                                attrs[key] = value.strip()
+                        if attrs:
+                            group = attrs.get("group-title", "")
+                            tvg_id = attrs.get("tvg-id", "")
+                            tvg_name = attrs.get("tvg-name", "")
+                            tvg_logo = attrs.get("tvg-logo") or attrs.get("logo") or ""
+                            tvg_rec = attrs.get("tvg-rec", "")
+                            timeshift = attrs.get("timeshift", "")
+                            catchup = attrs.get("catchup", "")
+                            catchup_type = attrs.get("catchup-type", "")
+                            catchup_days = attrs.get("catchup-days", "")
+                            catchup_source = attrs.get("catchup-source", "")
+                            catchup_offset = attrs.get("catchup-offset", "")
+                            http_user_agent = attrs.get("http-user-agent", "")
+                    continue
+
+                if upper_prefix.startswith("#EXTVLCOPT"):
+                    colon_idx = s.find(':')
+                    if colon_idx != -1:
+                        data = s[colon_idx + 1:]
+                        eq_idx = data.find('=')
+                        if eq_idx != -1:
+                            key = data[:eq_idx].strip().lower()
+                            value = data[eq_idx + 1:].strip()
+                            if key in {"catchup-source", "catchup_url"}:
+                                catchup_source = value
+                            elif key == "catchup-days":
+                                catchup_days = value
+                            elif key == "catchup-type":
+                                catchup_type = value
+                            elif key == "http-user-agent":
+                                http_user_agent = value
+                    continue
+
+                if upper_prefix.startswith("#KODIPROP"):
+                    colon_idx = s.find(':')
+                    if colon_idx != -1:
+                        data = s[colon_idx + 1:]
+                        eq_idx = data.find('=')
+                        if eq_idx != -1:
+                            key = data[:eq_idx].strip().lower()
+                            value = data[eq_idx + 1:].strip()
+                            if key.endswith("catchup_days"):
+                                catchup_days = value
+                            elif key.endswith("catchup_source"):
+                                catchup_source = value
+                    continue
+
+                # Other comment/directive lines are ignored
                 continue
-            else:
-                url = s
-                name = meta.get("name", "")
-                grp = meta.get("group", "") or extract_group(name)
-                channel = {
-                    "name": name,
-                    "group": grp,
-                    "url": url,
-                    "tvg-id": meta.get("tvg-id", ""),
-                    "tvg-name": meta.get("tvg-name", "")
-                }
-                if provider_id:
-                    channel["provider-id"] = provider_id
-                if provider_type:
-                    channel["provider-type"] = provider_type
-                if meta.get("tvg-logo"):
-                    channel["tvg-logo"] = meta.get("tvg-logo")
-                if meta.get("tvg-rec"):
-                    channel["tvg-rec"] = meta.get("tvg-rec")
-                if meta.get("timeshift"):
-                    channel["timeshift"] = meta.get("timeshift")
-                if meta.get("catchup"):
-                    channel["catchup"] = meta.get("catchup")
-                if meta.get("catchup-type"):
-                    channel["catchup-type"] = meta.get("catchup-type")
-                if meta.get("catchup-days"):
-                    channel["catchup-days"] = meta.get("catchup-days")
-                if meta.get("catchup-source"):
-                    channel["catchup-source"] = meta.get("catchup-source")
-                if meta.get("catchup-offset"):
-                    channel["catchup-offset"] = meta.get("catchup-offset")
-                if meta.get("http-user-agent"):
-                    channel["http-user-agent"] = meta.get("http-user-agent")
-                if meta.get("attrs"):
-                    channel["_m3u-attrs"] = meta.get("attrs")
-                stream_id = self._extract_stream_id(url)
+
+            url = s
+            grp_value = group or extract_group_local(name)
+            channel = {
+                "name": name,
+                "group": grp_value,
+                "url": url,
+                "tvg-id": tvg_id,
+                "tvg-name": tvg_name,
+            }
+            if provider_id:
+                channel["provider-id"] = provider_id
+            if provider_type:
+                channel["provider-type"] = provider_type
+            if tvg_logo:
+                channel["tvg-logo"] = tvg_logo
+            if tvg_rec:
+                channel["tvg-rec"] = tvg_rec
+            if timeshift:
+                channel["timeshift"] = timeshift
+            if catchup:
+                channel["catchup"] = catchup
+            if catchup_type:
+                channel["catchup-type"] = catchup_type
+            if catchup_days:
+                channel["catchup-days"] = catchup_days
+            if catchup_source:
+                channel["catchup-source"] = catchup_source
+            if catchup_offset:
+                channel["catchup-offset"] = catchup_offset
+            if http_user_agent:
+                channel["http-user-agent"] = http_user_agent
+
+            if provider_type == "xtream" or catchup_source:
+                stream_id = stream_id_for(url)
                 if stream_id:
                     channel["stream-id"] = stream_id
-                out.append(channel)
-                meta = {}
+
+            append(channel)
+
+            # Clear state after emitting the channel entry
+            name = ""
+            group = ""
+            tvg_id = ""
+            tvg_name = ""
+            tvg_logo = ""
+            tvg_rec = ""
+            timeshift = ""
+            catchup = ""
+            catchup_type = ""
+            catchup_days = ""
+            catchup_source = ""
+            catchup_offset = ""
+            http_user_agent = ""
+
         return out
+
+    def _playlist_text_hash(self, text: str) -> str:
+        if not text:
+            return ""
+        return hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+    def _parsed_cache_path_for_key(self, key: str) -> str:
+        digest = hashlib.sha1(key.encode("utf-8", "surrogatepass")).hexdigest()
+        cache_dir = get_cache_dir()
+        os.makedirs(cache_dir, exist_ok=True)
+        return os.path.join(cache_dir, f"parsed_{digest}.json")
+
+    def _load_cached_playlist(
+        self,
+        cache_path: str,
+        text_hash: str,
+        provider_meta: Optional[Dict[str, str]] = None,
+    ) -> Optional[List[Dict[str, str]]]:
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("hash") != text_hash:
+                return None
+            channels = data.get("channels")
+            if not isinstance(channels, list):
+                return None
+            if provider_meta:
+                pid = provider_meta.get("provider-id")
+                ptype = provider_meta.get("provider-type")
+                if pid or ptype:
+                    for ch in channels:
+                        if pid:
+                            ch["provider-id"] = pid
+                        if ptype:
+                            ch["provider-type"] = ptype
+            return channels
+        except Exception:
+            return None
+
+    def _store_cached_playlist(
+        self,
+        cache_path: str,
+        text_hash: str,
+        channels: List[Dict[str, str]],
+        provider_meta: Optional[Dict[str, str]] = None,
+    ) -> None:
+        payload = {"hash": text_hash, "channels": channels}
+        if provider_meta:
+            payload["provider"] = provider_meta
+        tmp_path = cache_path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, separators=(",", ":"))
+            os.replace(tmp_path, cache_path)
+        except Exception:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
 
     def _extract_stream_id(self, url: str) -> str:
         try:
@@ -1216,6 +1367,50 @@ class IPTVClient(wx.Frame):
         except Exception:
             return "?"
 
+    def _utc_now(self) -> datetime.datetime:
+        try:
+            return datetime.datetime.now(datetime.timezone.utc)
+        except Exception:
+            return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+
+    def _ensure_utc_dt(self, value: Optional[datetime.datetime]) -> Optional[datetime.datetime]:
+        if not isinstance(value, datetime.datetime):
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=datetime.timezone.utc)
+        return value.astimezone(datetime.timezone.utc)
+
+    def _epg_cache_needs_refresh(self, now_show, next_show, cached_at: Optional[datetime.datetime]) -> bool:
+        now_utc = self._utc_now()
+
+        cached_utc = None
+        if isinstance(cached_at, datetime.datetime):
+            if cached_at.tzinfo is None:
+                try:
+                    # Assume legacy entries were stored as local time; best-effort convert to UTC.
+                    cached_utc = cached_at.replace(tzinfo=datetime.timezone.utc)
+                except Exception:
+                    cached_utc = None
+            else:
+                cached_utc = cached_at.astimezone(datetime.timezone.utc)
+
+        if cached_utc is None:
+            return True
+
+        if (now_utc - cached_utc).total_seconds() >= self._CACHE_REFRESH_AFTER_SECS:
+            return True
+
+        if now_show:
+            end_utc = self._ensure_utc_dt(now_show.get('end'))
+            if end_utc and now_utc >= end_utc - datetime.timedelta(seconds=15):
+                return True
+        if not now_show and next_show:
+            start_utc = self._ensure_utc_dt(next_show.get('start'))
+            if start_utc and now_utc >= start_utc - datetime.timedelta(seconds=15):
+                return True
+
+        return False
+
     def on_highlight(self):
         # Allow viewing cached or currently available EPG even while an import is running.
         i = self.channel_list.GetSelection()
@@ -1232,6 +1427,8 @@ class IPTVClient(wx.Frame):
                 self.epg_display.SetValue("EPG is disabled in configuration.")
                 return
 
+            self._start_epg_poll_timer()
+
             # If this channel is exempt (likely has no EPG), show a clear message and do not fetch.
             if self._channel_is_epg_exempt(ch):
                 self.epg_display.SetValue("No EPG data for this channel.")
@@ -1242,13 +1439,14 @@ class IPTVClient(wx.Frame):
                 cached = self.epg_cache.get(key)
             if cached:
                 now_show, next_show, ts = cached
-                # If cached data is stale, refresh in background but still show it immediately.
-                if (datetime.datetime.now() - ts).total_seconds() >= self._CACHE_SHOW_STALE_SECS:
-                    # Only spawn refresh if not already inflight
+                needs_refresh = self._epg_cache_needs_refresh(now_show, next_show, ts)
+                if needs_refresh:
                     with self._epg_inflight_lock:
                         if key not in self._epg_fetch_inflight:
                             threading.Thread(target=self._fetch_and_cache_epg, args=(ch, cname), daemon=True).start()
                 msg = self._epg_msg_from_tuple(now_show, next_show)
+                if needs_refresh:
+                    msg += "\n\nUpdating EPG..."
                 # If an import is running, indicate that data may still be arriving.
                 if self.epg_importing:
                     msg = msg + "\n\nNote: EPG import in progress — newer program data may still arrive."
@@ -1327,7 +1525,7 @@ class IPTVClient(wx.Frame):
             now_show, next_show = now_next
             
         with self.epg_cache_lock:
-            self.epg_cache[canonicalize_name(cname)] = (now_show, next_show, datetime.datetime.now())
+            self.epg_cache[canonicalize_name(cname)] = (now_show, next_show, self._utc_now())
         wx.CallAfter(self._update_epg_display_if_selected, channel, now_show, next_show)
 
     def _update_epg_display_if_selected(self, channel, now_show, next_show):
@@ -1391,6 +1589,14 @@ class IPTVClient(wx.Frame):
                 return
             cname = ch.get("name", "")
             key = canonicalize_name(cname)
+            with self.epg_cache_lock:
+                cached = self.epg_cache.get(key)
+            if cached:
+                now_show, next_show, ts = cached
+                if not self._epg_cache_needs_refresh(now_show, next_show, ts):
+                    return
+            else:
+                now_show = next_show = ts = None
             # Only spawn a refresh if one isn't already running for this channel.
             with self._epg_inflight_lock:
                 already = key in self._epg_fetch_inflight

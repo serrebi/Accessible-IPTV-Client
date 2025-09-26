@@ -5,7 +5,7 @@ A vibe coded, accessible, keyboard-first IPTV player that works well with screen
 ## What It Can Do
 
 - Works with popular screen readers: NVDA, JAWS, Narrator, and Orca
-- Opens standard M3U and M3U Plus playlists, and also supports StockerPortal and XtreamCodes.
+- Opens standard M3U and M3U Plus playlists, and also supports Stalker Portal and XtreamCodes.
 - Lets you add or remove playlist sources at any time
 - Groups channels by category for quicker browsing
 - Built‑in search across channel names (and EPG when available)
