@@ -30,7 +30,7 @@ A vibe coded, accessible, keyboard-first IPTV player that works well with screen
 2) Open a terminal and run:
 
    - `pip3 install --upgrade pip`
-   - `pip3 install wxpython`
+   - `pip3 install -r requirements.txt`
 
 3) Clone this repository and switch into the project folder. Make sure your terminal is in that folder, then start the app:
 

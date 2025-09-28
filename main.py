@@ -801,6 +801,7 @@ class IPTVClient(wx.Frame):
 
     def apply_filter(self):
         txt = self.filter_box.GetValue().strip().lower()
+        self._populate_token += 1
         self.displayed = []
         self.channel_list.Freeze()
         try:
@@ -815,9 +816,11 @@ class IPTVClient(wx.Frame):
 
             items = []
             for ch in source:
-                if txt in ch.get("name", "").lower():
-                    self.displayed.append({"type": "channel", "data": ch})
-                    items.append(ch.get("name", ""))
+                name = (ch.get("name") or "")
+                if txt and txt not in name.lower():
+                    continue
+                self.displayed.append({"type": "channel", "data": ch})
+                items.append(name)
 
             if items:
                 self.channel_list.AppendItems(items)
@@ -861,6 +864,12 @@ class IPTVClient(wx.Frame):
                     if results:
                         add_items = []
                         for r in results:
+                            chan_name = r.get('channel_name') or ""
+                            show_name = r.get('show_title') or ""
+                            chan_lower = chan_name.lower()
+                            show_lower = show_name.lower()
+                            if txt and txt not in chan_lower and txt not in show_lower:
+                                continue
                             label = f"{r['channel_name']} - {r['show_title']} ({self._fmt_time(r['start'])}–{self._fmt_time(r['end'])})"
                             self.displayed.append({"type": "epg", "data": r})
                             add_items.append(label)
@@ -1399,6 +1408,11 @@ class IPTVClient(wx.Frame):
 
         if (now_utc - cached_utc).total_seconds() >= self._CACHE_REFRESH_AFTER_SECS:
             return True
+
+        if not now_show and not next_show:
+            # No guide yet; re-query soon so a subsequent provider import can populate it.
+            if (now_utc - cached_utc).total_seconds() >= 30:
+                return True
 
         if now_show:
             end_utc = self._ensure_utc_dt(now_show.get('end'))

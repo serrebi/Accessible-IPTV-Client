@@ -1065,6 +1065,8 @@ class EPGDatabase:
         rows_all = self._candidate_rows(c, name, tvg_name, playlist_region)
         pl_markets, pl_provinces, _ = _market_tokens_for(playlist_region or "", playlist_brand_family, " ".join([tvg_name, name]))
 
+        playlist_text_lower = " ".join(filter(None, [tvg_name, name, channel.get("group", "")])).lower()
+
         for ch_id, disp, grp in rows_all:
             epg_text_norm = canonicalize_name(strip_noise_words(disp)).lower()
             epg_brand_family = _reverse_brand_lookup(epg_text_norm)
@@ -1172,6 +1174,21 @@ class EPGDatabase:
                         else:
                             score -= 12
                             why.append('-hbo-variant-mismatch-ca')
+
+            epg_lower = disp.lower()
+            if 'sky mix' in playlist_text_lower and 'sky sports mix' in epg_lower:
+                score -= 60
+                why.append('-sky-mix-vs-sports-mismatch')
+            elif 'sky sports mix' in playlist_text_lower and 'sky mix' in epg_lower and 'sky sports mix' not in epg_lower:
+                score -= 60
+                why.append('-sky-sports-vs-mix-mismatch')
+            if 'sky mix' in playlist_text_lower:
+                if 'sky mix' in epg_lower:
+                    score += 35
+                    why.append('+sky-mix-match')
+                else:
+                    score -= 35
+                    why.append('-sky-mix-mismatch')
 
             # token_overlap already computed above; reuse for scoring
             score += min(20, token_overlap * 4)
@@ -1641,18 +1658,18 @@ class EPGDatabase:
                         self.conn.execute("PRAGMA busy_timeout=15000;")
                     except Exception:
                         pass
-                    for attempt in range(6):
+                    for attempt in range(10):
                         try:
                             self.conn.execute("BEGIN IMMEDIATE")
                             began_txn = True
                             break
                         except sqlite3.OperationalError as e:
                             if "locked" in str(e).lower() or "busy" in str(e).lower():
-                                time.sleep(0.5 * (attempt + 1))
+                                time.sleep(0.75 * (attempt + 1))
                                 continue
                             raise
                     if not began_txn:
-                        raise RuntimeError("database is locked (could not start write transaction)")
+                        raise sqlite3.OperationalError("database is locked (could not start write transaction)")
 
                     # Stream and parse
                     while True:
@@ -1724,6 +1741,28 @@ class EPGDatabase:
 
                 except Exception as e:
                     # If the error looks like a transient/truncated gzip/HTTP read, retry a few times
+                    msg_lower = str(e).lower()
+                    lockish = ('locked' in msg_lower or 'busy' in msg_lower) and attempts_left > 1
+                    if lockish:
+                        _logger.warning(
+                            "EPG database lock for %s — retrying after backoff (%d left)",
+                            _sanitize_url(src), attempts_left - 1
+                        )
+                        try:
+                            if began_txn:
+                                self.conn.rollback()
+                        except Exception:
+                            pass
+                        try:
+                            if stream:
+                                stream.close()
+                        except Exception:
+                            pass
+                        stream = None
+                        time.sleep(1.5 * (4 - attempts_left))
+                        attempts_left -= 1
+                        continue
+
                     if _is_transient_stream_error(e) and attempts_left > 1:
                         _logger.warning(
                             "EPG transient error for %s: %s — retrying (%d left)",
