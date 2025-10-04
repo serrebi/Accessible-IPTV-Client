@@ -16,6 +16,7 @@ import logging.handlers
 import tempfile
 import random
 import hashlib
+import threading
 from http.client import IncompleteRead
 from providers import generate_provider_id
 from typing import Dict, List, Optional, Tuple, Set
@@ -134,6 +135,21 @@ def _sanitize_url(url: str) -> str:
             return re.sub(r"(?i)(username|user|login|u|password|pass|pwd|token|auth|apikey|api_key|key|secret)=([^&\s]+)", r"\1=***", str(url))
         except Exception:
             return str(url)
+
+# Ensure only one thread mutates a temp gzip download at a time to avoid
+# truncation races when multiple imports target the same source URL.
+_DOWNLOAD_LOCKS: Dict[str, threading.Lock] = {}
+_DOWNLOAD_LOCKS_GUARD = threading.Lock()
+
+
+def _acquire_download_lock(path_key: str) -> threading.Lock:
+    with _DOWNLOAD_LOCKS_GUARD:
+        lock = _DOWNLOAD_LOCKS.get(path_key)
+        if lock is None:
+            lock = threading.Lock()
+            _DOWNLOAD_LOCKS[path_key] = lock
+    lock.acquire()
+    return lock
 
 # =========================
 # Normalization & Tokenizing
@@ -739,7 +755,7 @@ PRAGMA_IMPORT = [
     "PRAGMA mmap_size=268435456;",   # 256MB
     "PRAGMA cache_size=-131072;",    # ~128MB
     "PRAGMA wal_autocheckpoint=0;",  # we'll checkpoint manually
-    "PRAGMA busy_timeout=5000;",
+    "PRAGMA busy_timeout=20000;",
 ]
 
 PRAGMA_READONLY = [
@@ -759,10 +775,11 @@ class EPGDatabase:
         self._open()
 
     def _open(self):
+        timeout = 30.0
         if self.readonly:
             # Open as read-only, shared cache; set reader-friendly pragmas
             uri = f"file:{self.db_path}?mode=ro&cache=shared"
-            self.conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+            self.conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=timeout)
             for p in PRAGMA_READONLY:
                 try:
                     self.conn.execute(p)
@@ -770,7 +787,11 @@ class EPGDatabase:
                     pass
         else:
             # Writer/normal
-            self.conn = sqlite3.connect(self.db_path, check_same_thread=not self.for_threading)
+            self.conn = sqlite3.connect(
+                self.db_path,
+                check_same_thread=not self.for_threading,
+                timeout=timeout
+            )
             for p in PRAGMA_IMPORT:
                 try:
                     self.conn.execute(p)
@@ -819,6 +840,15 @@ class EPGDatabase:
             self.conn.close()
         except Exception:
             pass
+
+    def reopen(self):
+        """Close and reopen the underlying SQLite connection, reapplying pragmas."""
+        try:
+            if hasattr(self, "conn"):
+                self.conn.close()
+        except Exception:
+            pass
+        self._open()
 
     def insert_channel(self, channel_id: str, display_name: str):
         name_region = extract_group(display_name)
@@ -1483,8 +1513,7 @@ class EPGDatabase:
                                 resp.close()
                             except Exception:
                                 pass
-                            temp_path = _http_download_gz_with_resume(src)
-                            return _TempGzipStream(temp_path)
+                            return _http_download_gz_with_resume(src)
                         return gzip.GzipFile(fileobj=resp) if is_gz else resp
                     except Exception as e:
                         last_err = e
@@ -1498,12 +1527,17 @@ class EPGDatabase:
 
         class _TempGzipStream:
             """File-like wrapper that deletes the temp gz on close."""
-            def __init__(self, temp_path: str):
+            def __init__(self, temp_path: str, owning_lock: Optional[threading.Lock] = None):
                 self._path = temp_path
+                self._lock = owning_lock
+                self._lock_released = False
                 self._f = gzip.open(temp_path, 'rb')
             def read(self, *a, **kw):
                 return self._f.read(*a, **kw)
             def close(self):
+                if getattr(self, '_f', None) is None:
+                    self._release_lock()
+                    return
                 try:
                     self._f.close()
                 finally:
@@ -1513,19 +1547,35 @@ class EPGDatabase:
                             os.remove(self._path)
                     except Exception:
                         pass
+                    self._f = None
+                    self._release_lock()
             def __getattr__(self, name):
                 return getattr(self._f, name)
+            def _release_lock(self):
+                if self._lock and not self._lock_released:
+                    try:
+                        self._lock.release()
+                    except RuntimeError:
+                        pass
+                    self._lock_released = True
+            def __del__(self):
+                try:
+                    self.close()
+                except Exception:
+                    self._release_lock()
 
-        def _http_download_gz_with_resume(url: str, max_attempts: int = 4, chunk_size: int = 1 << 16) -> str:
+        def _http_download_gz_with_resume(url: str, max_attempts: int = 4, chunk_size: int = 1 << 16) -> _TempGzipStream:
             """Download a gzip file to a temp path with HTTP Range resume and verify integrity.
 
-            Returns the absolute temp file path once a full, verifiable gzip is present.
-            Raises on failure after retries.
+            Returns an open `_TempGzipStream` guarded by a per-source lock once
+            a full, verifiable gzip is present. Raises on failure after retries.
             """
             # Stable name in temp dir so we can resume within this process
             h = hashlib.md5(url.encode('utf-8', 'ignore')).hexdigest()
             temp_dir = tempfile.gettempdir()
             temp_path = os.path.join(temp_dir, f"epg_{h}.xml.gz")
+            lock = _acquire_download_lock(temp_path)
+            success = False
 
             def _verify_gzip_ok(path: str) -> bool:
                 try:
@@ -1544,82 +1594,101 @@ class EPGDatabase:
 
             attempts = 0
             last_err = None
-            while attempts < max_attempts:
-                attempts += 1
-                try:
-                    existing = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
-                    # If existing file doesn't look like gzip, start over
-                    if existing > 0:
-                        try:
-                            with open(temp_path, 'rb') as _chk:
-                                sig = _chk.read(2)
-                            if sig != b'\x1f\x8b':
-                                os.remove(temp_path)
-                                existing = 0
-                        except Exception:
-                            try:
-                                os.remove(temp_path)
-                            except Exception:
-                                pass
-                            existing = 0
-                    headers = {
-                        "User-Agent": "Mozilla/5.0",
-                        "Accept": "application/gzip, application/xml, text/xml, */*",
-                    }
-                    mode = 'ab' if existing > 0 else 'wb'
-                    if existing > 0:
-                        headers['Range'] = f'bytes={existing}-'
-                    req = urllib.request.Request(url, headers=headers)
+            try:
+                while attempts < max_attempts:
+                    attempts += 1
                     try:
-                        resp = urllib.request.urlopen(req, timeout=300)
-                    except urllib.error.HTTPError as he:
-                        # 416 Range Not Satisfiable: our resume position is beyond EOF or server rejects Range.
-                        if he.code == 416:
+                        existing = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+                        # If existing file doesn't look like gzip, start over
+                        if existing > 0:
                             try:
-                                if os.path.exists(temp_path):
+                                with open(temp_path, 'rb') as _chk:
+                                    sig = _chk.read(2)
+                                if sig != b'\x1f\x8b':
                                     os.remove(temp_path)
+                                    existing = 0
                             except Exception:
-                                pass
-                            last_err = he
-                            # Backoff a touch and retry a clean 200 (no Range)
-                            time.sleep(0.3 * attempts)
-                            continue
-                        last_err = he
-                        time.sleep(0.5 * attempts)
-                        continue
-                    status = getattr(resp, 'status', None) or getattr(resp, 'code', None)
-                    if status == 200 and existing > 0:
-                        # Server ignored Range; start fresh
-                        mode = 'wb'
-                    with open(temp_path, mode) as out:
+                                try:
+                                    os.remove(temp_path)
+                                except Exception:
+                                    pass
+                                existing = 0
+                        headers_base = {
+                            "User-Agent": "Mozilla/5.0",
+                            "Accept": "application/gzip, application/xml, text/xml, */*",
+                        }
+                        mode = 'ab' if existing > 0 else 'wb'
+                        use_range = existing > 0
+                        resp = None
                         while True:
+                            headers = headers_base.copy()
+                            if use_range:
+                                headers['Range'] = f'bytes={existing}-'
+                            req = urllib.request.Request(url, headers=headers)
                             try:
-                                chunk = resp.read(chunk_size)
-                                if not chunk:
-                                    break
-                                out.write(chunk)
-                            except IncompleteRead as ire:
-                                # Partial read; keep what we have, retry and resume
-                                last_err = ire
+                                resp = urllib.request.urlopen(req, timeout=300)
+                            except urllib.error.HTTPError as he:
+                                if he.code == 416 and use_range:
+                                    _logger.debug("EPG HTTP 416 for %s, retrying without Range", _sanitize_url(url))
+                                    try:
+                                        if os.path.exists(temp_path):
+                                            os.remove(temp_path)
+                                    except Exception:
+                                        pass
+                                    use_range = False
+                                    existing = 0
+                                    mode = 'wb'
+                                    continue
+                                last_err = he
+                                resp = None
+                            if resp is None:
+                                time.sleep(0.5 * attempts)
                                 break
-                    try:
-                        resp.close()
-                    except Exception:
-                        pass
-                    # Verify gzip integrity; if ok, return path
-                    if _verify_gzip_ok(temp_path):
-                        return temp_path
-                    else:
+                            status = getattr(resp, 'status', None) or getattr(resp, 'code', None)
+                            if status == 200 and use_range:
+                                # Server ignored range request entirely; restart clean.
+                                mode = 'wb'
+                                use_range = False
+                                existing = 0
+                            break
+                        if resp is None:
+                            continue
+                        with open(temp_path, mode) as out:
+                            while True:
+                                try:
+                                    chunk = resp.read(chunk_size)
+                                    if not chunk:
+                                        break
+                                    out.write(chunk)
+                                except IncompleteRead as ire:
+                                    # Partial read; keep what we have, retry and resume
+                                    last_err = ire
+                                    break
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                        # Verify gzip integrity; if ok, return locked stream
+                        if _verify_gzip_ok(temp_path):
+                            stream = _TempGzipStream(temp_path, lock)
+                            success = True
+                            return stream
                         # Not complete (or corrupt); brief backoff and retry with Range
                         last_err = last_err or RuntimeError('gzip verify failed; resuming download')
                         time.sleep(0.5 * attempts)
                         continue
-                except Exception as e:
-                    last_err = e
-                    time.sleep(0.5 * attempts)
-                    continue
-            # Retries exhausted; bubble a helpful error
-            raise last_err or RuntimeError('Failed to download gzip with resume')
+                    except Exception as e:
+                        last_err = e
+                        time.sleep(0.5 * attempts)
+                        continue
+                # Retries exhausted; bubble a helpful error
+                raise last_err or RuntimeError('Failed to download gzip with resume')
+            finally:
+                if not success:
+                    try:
+                        lock.release()
+                    except RuntimeError:
+                        pass
 
         def _is_transient_stream_error(err: Exception) -> bool:
             msg = str(err).lower()
@@ -1669,7 +1738,30 @@ class EPGDatabase:
                                 continue
                             raise
                     if not began_txn:
-                        raise sqlite3.OperationalError("database is locked (could not start write transaction)")
+                        _logger.warning(
+                            "EPG database was locked when starting import for %s; reopening connection and retrying",
+                            _sanitize_url(src)
+                        )
+                        try:
+                            self.reopen()
+                        except Exception as reopen_err:
+                            _logger.debug("EPG reopen attempt failed: %s", reopen_err)
+                        try:
+                            self.conn.execute("PRAGMA busy_timeout=20000;")
+                        except Exception:
+                            pass
+                        for retry in range(5):
+                            try:
+                                self.conn.execute("BEGIN IMMEDIATE")
+                                began_txn = True
+                                break
+                            except sqlite3.OperationalError as e:
+                                if "locked" in str(e).lower() or "busy" in str(e).lower():
+                                    time.sleep(1.0 * (retry + 1))
+                                    continue
+                                raise
+                        if not began_txn:
+                            raise sqlite3.OperationalError("database is locked (could not start write transaction)")
 
                     # Stream and parse
                     while True:
@@ -1789,7 +1881,7 @@ class EPGDatabase:
                 finally:
                     # Ensure no lingering transaction if an error occurred before commit
                     try:
-                        if began_txn:
+                        if getattr(self.conn, "in_transaction", False):
                             try:
                                 self.conn.rollback()
                             except sqlite3.ProgrammingError:
