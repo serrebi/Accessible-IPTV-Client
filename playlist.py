@@ -1,4 +1,4 @@
-import os
+﻿import os
 import re
 import io
 import gzip
@@ -151,6 +151,84 @@ def _acquire_download_lock(path_key: str) -> threading.Lock:
     lock.acquire()
     return lock
 
+# Cross-process EPG import lock (best-effort, file-based)
+def _import_lock_paths(db_path: str) -> Tuple[str, str]:
+    base_dir = os.path.dirname(db_path) or tempfile.gettempdir()
+    fname = os.path.splitext(os.path.basename(db_path))[0]
+    return (
+        os.path.join(base_dir, f"{fname}.import.lock"),
+        os.path.join(base_dir, f"{fname}.import.pid"),
+    )
+
+def _try_acquire_import_lock(db_path: str, max_wait_sec: int = 90) -> bool:
+    lock_path, pid_path = _import_lock_paths(db_path)
+    deadline = time.time() + max_wait_sec
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, b"locked")
+            finally:
+                os.close(fd)
+            try:
+                with open(pid_path, 'w', encoding='utf-8') as pf:
+                    pf.write(str(os.getpid()))
+            except Exception:
+                pass
+            _logger.debug("EPG import lock acquired: %s", lock_path)
+            return True
+        except FileExistsError:
+            try:
+                age = time.time() - os.stat(lock_path).st_mtime
+            except Exception:
+                age = 0
+            if age > 2 * 60 * 60:  # 2 hours
+                try:
+                    os.remove(lock_path)
+                except Exception:
+                    pass
+                try:
+                    if os.path.exists(pid_path):
+                        os.remove(pid_path)
+                except Exception:
+                    pass
+                continue
+            if time.time() >= deadline:
+                # Silent negative result; caller decides whether to wait/log.
+                return False
+            time.sleep(1.0)
+        except Exception:
+            return True
+
+def _release_import_lock(db_path: str):
+    lock_path, pid_path = _import_lock_paths(db_path)
+    try:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+    except Exception:
+        pass
+    try:
+        if os.path.exists(pid_path):
+            os.remove(pid_path)
+    except Exception:
+        pass
+
+def _wait_for_import_lock(db_path: str, poll_sec: int = 10, log_every: int = 30):
+    """Block until the crossâ€‘process import lock can be acquired.
+
+    No user-facing popups; emits periodic debug logs only.
+    """
+    waited = 0
+    while True:
+        if _try_acquire_import_lock(db_path, max_wait_sec=poll_sec):
+            return
+        waited += poll_sec
+        if waited % max(log_every, poll_sec) == 0:
+            try:
+                _logger.debug("EPG import waiting for lock; waited=%ss", waited)
+            except Exception:
+                pass
+
 # =========================
 # Normalization & Tokenizing
 # =========================
@@ -171,29 +249,29 @@ def group_synonyms():
     return {
         "us": ["us","usa","u.s.","u.s","us.","united states","united states of america","america"],
         "ca": ["ca","can","canada","car"],
-        "mx": ["mx","mex","mexico","méxico"],
+        "mx": ["mx","mex","mexico","mÃ©xico"],
         "uk": ["uk","u.k.","gb","gbr","great britain","britain","united kingdom","england","scotland","wales","northern ireland"],
-        "ie": ["ie","irl","ireland","eire","éire"],
+        "ie": ["ie","irl","ireland","eire","Ã©ire"],
         "de": ["de","ger","deu","germany","deutschland"],
-        "at": ["at","aut","austria","österreich","oesterreich"],
+        "at": ["at","aut","austria","Ã¶sterreich","oesterreich"],
         "ch": ["ch","che","switzerland","schweiz","suisse","svizzera"],
         "nl": ["nl","nld","netherlands","holland","nederland"],
-        "be": ["be","bel","belgium","belgie","belgië","belgique"],
-        "lu": ["lu","lux","luxembourg","letzebuerg","lëtzebuerg"],
+        "be": ["be","bel","belgium","belgie","belgiÃ«","belgique"],
+        "lu": ["lu","lux","luxembourg","letzebuerg","lÃ«tzebuerg"],
         "se": ["se","swe","sweden","svenska","sverige"],
         "no": ["no","nor","norway","norge","noreg"],
         "dk": ["dk","dnk","denmark","danmark"],
         "fi": ["fi","fin","finland","suomi"],
-        "is": ["is","isl","iceland","ísland"],
-        "fr": ["fr","fra","france","français","française"],
+        "is": ["is","isl","iceland","Ã­sland"],
+        "fr": ["fr","fra","france","franÃ§ais","franÃ§aise"],
         "it": ["it","ita","italy","italia"],
-        "es": ["es","esp","spain","españa","espana","español"],
-        "pt": ["pt","prt","portugal","português"],
-        "gr": ["gr","grc","greece","ελλάδα","ellada"],
+        "es": ["es","esp","spain","espaÃ±a","espana","espaÃ±ol"],
+        "pt": ["pt","prt","portugal","portuguÃªs"],
+        "gr": ["gr","grc","greece","ÎµÎ»Î»Î¬Î´Î±","ellada"],
         "mt": ["mt","mlt","malta"],
         "cy": ["cy","cyp","cyprus"],
         "pl": ["pl","pol","poland","polska"],
-        "cz": ["cz","cze","czech","czechia","cesko","česko"],
+        "cz": ["cz","cze","czech","czechia","cesko","Äesko"],
         "sk": ["sk","svk","slovakia","slovensko"],
         "hu": ["hu","hun","hungary","magyar"],
         "si": ["si","svn","slovenia","slovenija"],
@@ -201,20 +279,20 @@ def group_synonyms():
         "rs": ["rs","srb","serbia","srbija"],
         "ba": ["ba","bih","bosnia","bosnia and herzegovina","bosna","hercegovina"],
         "mk": ["mk","mkd","north macedonia","macedonia"],
-        "ro": ["ro","rou","romania","românia"],
-        "bg": ["bg","bgr","bulgaria","българия","balgariya"],
+        "ro": ["ro","rou","romania","romÃ¢nia"],
+        "bg": ["bg","bgr","bulgaria","Ð±ÑŠÐ»Ð³Ð°Ñ€Ð¸Ñ","balgariya"],
         "ua": ["ua","ukr","ukraine","ukraina"],
         "by": ["by","blr","belarus"],
-        "ru": ["ru","rus","russia","россия","rossiya"],
+        "ru": ["ru","rus","russia","Ñ€Ð¾ÑÑÐ¸Ñ","rossiya"],
         "ee": ["ee","est","estonia","eesti"],
         "lv": ["lv","lva","latvia","latvija"],
         "lt": ["lt","ltu","lithuania","lietuva"],
-        "al": ["al","alb","albania","shqipëri","shqiperia"],
+        "al": ["al","alb","albania","shqipÃ«ri","shqiperia"],
         "me": ["me","mne","montenegro","crna gora"],
         "xk": ["xk","kosovo"],
-        "tr": ["tr","tur","turkey","türkiye","turkiye"],
+        "tr": ["tr","tur","turkey","tÃ¼rkiye","turkiye"],
         "ma": ["ma","mar","morocco","maroc"],
-        "dz": ["dz","dza","algeria","algérie"],
+        "dz": ["dz","dza","algeria","algÃ©rie"],
         "tn": ["tn","tun","tunisia","tunisie"],
         "eg": ["eg","egypt","misr"],
         "il": ["il","isr","israel"],
@@ -230,7 +308,7 @@ def group_synonyms():
         "cn": ["cn","chn","china"],
         "hk": ["hk","hkg","hong kong"],
         "tw": ["tw","twn","taiwan"],
-        "jp": ["jp","jpn","japan","日本"],
+        "jp": ["jp","jpn","japan","æ—¥æœ¬"],
         "kr": ["kr","kor","korea","south korea"],
         "sg": ["sg","sgp","singapore"],
         "my": ["my","mys","malaysia"],
@@ -244,7 +322,7 @@ def group_synonyms():
         "ar": ["ar","arg","argentina"],
         "cl": ["cl","chl","chile"],
         "co": ["co","col","colombia"],
-        "pe": ["pe","per","peru","perú"],
+        "pe": ["pe","per","peru","perÃº"],
         "uy": ["uy","ury","uruguay"],
         "py": ["py","pry","paraguay"],
         "bo": ["bo","bolivia"],
@@ -259,7 +337,7 @@ def group_synonyms():
         "et": ["et","eth","ethiopia"],
         "tz": ["tz","tza","tanzania"],
         "ug": ["ug","uga","uganda"],
-        "ci": ["ci","civ","côte d’ivoire","ivory coast"],
+        "ci": ["ci","civ","cÃ´te dâ€™ivoire","ivory coast"],
         "sn": ["sn","sen","senegal"],
     }
 
@@ -376,18 +454,18 @@ AFFILIATE_MARKETS: Dict[str, Dict[str, Dict[str, Set[str]]]] = {
     "ca": {
         "cbc": {"vancouver-bc": _mk("vancouver","bc"), "calgary-ab": _mk("calgary","ab"), "edmonton-ab": _mk("edmonton","ab"),
                 "saskatoon-sk": _mk("saskatoon","sk"), "regina-sk": _mk("regina","sk"), "winnipeg-mb": _mk("winnipeg","mb"),
-                "ottawa-on": _mk("ottawa","on"), "toronto-on": _mk("toronto","on"), "montreal-qc": _mk("montreal","montréal","qc"),
+                "ottawa-on": _mk("ottawa","on"), "toronto-on": _mk("toronto","on"), "montreal-qc": _mk("montreal","montrÃ©al","qc"),
                 "halifax-ns": _mk("halifax","ns"), "stjohns-nl": _mk("st johns","st. johns","nl")},
         "ctv": {"vancouver-bc": _mk("vancouver","bc"), "calgary-ab": _mk("calgary","ab"), "edmonton-ab": _mk("edmonton","ab"),
                 "saskatoon-sk": _mk("saskatoon","sk"), "regina-sk": _mk("regina","sk"), "winnipeg-mb": _mk("winnipeg","mb"),
                 "ottawa-on": _mk("ottawa","on"), "toronto-on": _mk("toronto","on"), "london-on": _mk("london","on"),
-                "montreal-qc": _mk("montreal","montréal","qc"), "halifax-ns": _mk("halifax","ns")},
+                "montreal-qc": _mk("montreal","montrÃ©al","qc"), "halifax-ns": _mk("halifax","ns")},
         "ctv2": {"vancouver-bc": _mk("vancouver","bc"), "ottawa-on": _mk("ottawa","on"), "london-on": _mk("london","on"), "windsor-on": _mk("windsor","on")},
         "citytv": {"vancouver-bc": _mk("vancouver","bc"), "calgary-ab": _mk("calgary","ab"), "edmonton-ab": _mk("edmonton","ab"),
-                   "winnipeg-mb": _mk("winnipeg","mb"), "toronto-on": _mk("toronto","on"), "montreal-qc": _mk("montreal","montréal","qc")},
+                   "winnipeg-mb": _mk("winnipeg","mb"), "toronto-on": _mk("toronto","on"), "montreal-qc": _mk("montreal","montrÃ©al","qc")},
         "global": {"vancouver-bc": _mk("vancouver","bc","british columbia","global bc"), "calgary-ab": _mk("calgary","ab"),
                    "edmonton-ab": _mk("edmonton","ab"), "saskatoon-sk": _mk("saskatoon","sk"), "regina-sk": _mk("regina","sk"),
-                   "winnipeg-mb": _mk("winnipeg","mb"), "toronto-on": _mk("toronto","on"), "montreal-qc": _mk("montreal","montréal","qc"),
+                   "winnipeg-mb": _mk("winnipeg","mb"), "toronto-on": _mk("toronto","on"), "montreal-qc": _mk("montreal","montrÃ©al","qc"),
                    "halifax-ns": _mk("halifax","ns")},
         "tsn": {"tsn1-west": _mk("tsn1","west","bc","ab","pacific","mountain"), "tsn2-central": _mk("central"),
                 "tsn3-prairies": _mk("prairies","mb","sk"), "tsn4-ontario": _mk("ontario","on","toronto"),
@@ -396,8 +474,8 @@ AFFILIATE_MARKETS: Dict[str, Dict[str, Dict[str, Set[str]]]] = {
                       "prairies": _mk("prairies","sk","mb"), "ontario": _mk("ontario","on","toronto"),
                       "east": _mk("east","qc","montreal","atlantic"), "one": _mk("sn1","sportsnet one","one"),
                       "360": _mk("sportsnet 360","sn360","360")},
-        "tva": {"montreal-qc": _mk("montreal","montréal","qc")},
-        "noovo": {"montreal-qc": _mk("montreal","montréal","qc")},
+        "tva": {"montreal-qc": _mk("montreal","montrÃ©al","qc")},
+        "noovo": {"montreal-qc": _mk("montreal","montrÃ©al","qc")},
         "hbo": {},
     },
     "us": {"abc": {}, "nbc": {}, "cbs": {}, "fox": {}, "pbs": {}, "cw": {}, "mynetwork": {}, "telemundo": {}, "univision": {}, "hbo": {}},
@@ -854,7 +932,7 @@ class EPGDatabase:
         name_region = extract_group(display_name)
         id_region = _detect_region_from_id(channel_id or "")
         # Prefer region derived from the channel id when it contradicts the display name.
-        # This avoids false positives like "… Palm Springs CA …" (California) being tagged as Canada.
+        # This avoids false positives like "â€¦ Palm Springs CA â€¦" (California) being tagged as Canada.
         if id_region and name_region and id_region != name_region:
             group_tag = id_region
         else:
@@ -1468,6 +1546,8 @@ class EPGDatabase:
     # Streaming importer with detailed debug
     # =========================
     def import_epg_xml(self, xml_sources: List[str], progress_callback=None):
+        # Block until we can import; avoid user-facing warnings.
+        _wait_for_import_lock(self.db_path)
         if DEBUG and tracemalloc.is_tracing(): tracemalloc.stop()
         tracemalloc.start()
 
@@ -1501,7 +1581,7 @@ class EPGDatabase:
                             head = b''
                         head_txt = head.decode('utf-8', 'ignore') if head else ''
                         if 'another request' in head_txt.lower() or 'too many requests' in head_txt.lower():
-                            last_err = RuntimeError("Provider is busy or blocking concurrent downloads; will retry…")
+                            last_err = RuntimeError("Provider is busy or blocking concurrent downloads; will retryâ€¦")
                             time.sleep(2 + attempt)
                             continue
                         is_gz = resp.info().get('Content-Encoding') == 'gzip' or src.lower().endswith('.gz') or 'application/gzip' in ctype
@@ -1851,6 +1931,15 @@ class EPGDatabase:
                         except Exception:
                             pass
                         stream = None
+                        # Reopen connection to clear any lingering writer locks
+                        try:
+                            self.reopen()
+                            try:
+                                self.conn.execute("PRAGMA busy_timeout=30000;")
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
                         time.sleep(1.5 * (4 - attempts_left))
                         attempts_left -= 1
                         continue
@@ -1876,7 +1965,7 @@ class EPGDatabase:
                         continue
                     # Non-transient or out of retries: log and move on
                     _logger.exception("EPG ERROR src=%s : %s", _sanitize_url(src), e)
-                    _log_wx_error(f"Failed to import EPG source {src}: {e}")
+                    _log_wx_error(f"Failed to import EPG source {_sanitize_url(src)}: {e}")
                     break
                 finally:
                     # Ensure no lingering transaction if an error occurred before commit
@@ -1914,6 +2003,11 @@ class EPGDatabase:
             _logger.info("EPG SUMMARY total_added ch=%d pg=%d | db_final ch=%s pg=%s | mem=%sMB peak_trace=%sKB",
                          grand_chan, grand_prog, row_c[0] if row_c else '?', row_p[0] if row_p else '?', _mem_mb(), int(peak/1024))
         except Exception as e: _logger.debug("EPG SUMMARY failed to query DB counts: %s", e)
+        # Release cross-process import lock
+        try:
+            _release_import_lock(self.db_path)
+        except Exception:
+            pass
 
 
 # =========================
@@ -1932,7 +2026,7 @@ if WX_AVAILABLE:
         def _build_ui(self):
             panel = wx.Panel(self)
             vbox = wx.BoxSizer(wx.VERTICAL)
-            self.label = wx.StaticText(panel, label="Importing EPG data…")
+            self.label = wx.StaticText(panel, label="Importing EPG dataâ€¦")
             self.gauge = wx.Gauge(panel, range=max(1, self.total_sources))
             vbox.Add(self.label, 0, wx.ALL, 8)
             vbox.Add(self.gauge, 0, wx.EXPAND | wx.ALL, 8)
@@ -2105,10 +2199,10 @@ if WX_AVAILABLE:
                 stype = (src.get("type") or "").lower()
                 name = src.get("name") or src.get("username") or src.get("base_url") or "Provider"
                 if stype == "xtream":
-                    return f"Xtream Codes – {name}"
+                    return f"Xtream Codes â€“ {name}"
                 if stype == "stalker":
-                    return f"Stalker Portal – {name}"
-                return f"Provider – {name}"
+                    return f"Stalker Portal â€“ {name}"
+                return f"Provider â€“ {name}"
             return src
 
         def GetResult(self):
@@ -2480,3 +2574,5 @@ def _derive_playlist_region(channel: Dict[str, str]) -> str:
         return tied[0]
     tied.sort(key=lambda code: order.get(code, 1_000_000))
     return tied[0]
+
+

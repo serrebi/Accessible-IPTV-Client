@@ -14,6 +14,7 @@ from typing import Dict
 import tempfile
 
 CONFIG_FILE = "iptvclient.conf"
+_CONFIG_PATH = None  # Path of config last loaded/saved
 
 
 def _log_error(message: str):
@@ -93,15 +94,19 @@ def get_user_config_dir():
         return tempfile.gettempdir()
 
 def get_config_read_candidates():
-    # Priority: CWD (portable) -> App Dir (legacy) -> User Config Dir (standard)
+    # Revised priority to ensure the app-local config file is honored:
+    # 1) App Dir (next to the code/executable)
+    # 2) CWD (portable override when explicitly run from that folder)
+    # 3) User Config Dir (standard per-user location)
     candidates = []
-    cwd = get_cwd_dir()
-    if cwd:
-        candidates.append(os.path.join(cwd, CONFIG_FILE))
 
     app_dir = get_app_dir()
     if app_dir:
         candidates.append(os.path.join(app_dir, CONFIG_FILE))
+
+    cwd = get_cwd_dir()
+    if cwd:
+        candidates.append(os.path.join(cwd, CONFIG_FILE))
 
     user_dir = get_user_config_dir()
     if user_dir:
@@ -117,33 +122,29 @@ def get_config_read_candidates():
     return unique_candidates
 
 def get_config_write_target():
-    # Priority for writing:
-    # 1. If a config file exists in CWD, attempt to write there first (portable mode).
-    # 2. If a config file exists in app dir, attempt to write there (legacy portable).
-    # 3. If CWD is writable, write a new config there (for new portable instances).
-    # 4. As a final, reliable default, write to the user config directory.
+    # Prefer writing back to the file that was loaded, to avoid surprises.
+    global _CONFIG_PATH
+    if _CONFIG_PATH:
+        try:
+            parent = os.path.dirname(_CONFIG_PATH)
+            if parent and _is_writable_dir(parent):
+                return _CONFIG_PATH
+        except Exception:
+            pass
+
+    # Otherwise, prefer App Dir, then CWD, then user config dir
+    app_dir = get_app_dir()
+    if app_dir and _is_writable_dir(app_dir):
+        return os.path.join(app_dir, CONFIG_FILE)
 
     cwd = get_cwd_dir()
-    app_dir = get_app_dir()
-
-    # Check for existing config in CWD
-    if cwd and os.path.exists(os.path.join(cwd, CONFIG_FILE)):
-        if _is_writable_dir(cwd):
-            return os.path.join(cwd, CONFIG_FILE)
-
-    # If no existing config, prefer CWD for new portable config if writable
     if cwd and _is_writable_dir(cwd):
         return os.path.join(cwd, CONFIG_FILE)
 
-    # Check for existing config in app_dir (legacy portable installs)
-    if app_dir and app_dir != cwd and os.path.exists(os.path.join(app_dir, CONFIG_FILE)):
-        if _is_writable_dir(app_dir):
-            return os.path.join(app_dir, CONFIG_FILE)
-
-    # Otherwise, fall back to the user config directory. This is the most robust location.
     return os.path.join(get_user_config_dir(), CONFIG_FILE)
 
 def load_config() -> Dict:
+    global _CONFIG_PATH
     default = {
         "playlists": [],
         "epgs": [],
@@ -161,13 +162,22 @@ def load_config() -> Dict:
                     # Ensure all default keys are present
                     for k, v in default.items():
                         data.setdefault(k, v)
+                    _CONFIG_PATH = p
                     return data
             except Exception as e:
                 _log_error(f"Failed to load config from {p}: {e}")
                 # Do not break; try the next candidate location.
+    # No config found; remember we are effectively using the App Dir path
+    try:
+        app_dir = get_app_dir()
+        if app_dir:
+            _CONFIG_PATH = os.path.join(app_dir, CONFIG_FILE)
+    except Exception:
+        _CONFIG_PATH = None
     return default
 
 def save_config(cfg: Dict):
+    global _CONFIG_PATH
     path = get_config_write_target()
     try:
         # Ensure the directory exists before writing; skip if writing to CWD
@@ -188,8 +198,13 @@ def save_config(cfg: Dict):
                 except Exception:
                     pass
             os.rename(tmp_path, path)
+        _CONFIG_PATH = path
     except Exception as e:
         _log_error(f"Failed to save config to {path}: {e}")
+
+def get_loaded_config_path() -> str:
+    """Return the config path most recently loaded or saved, if known."""
+    return _CONFIG_PATH or ""
 
 def get_cache_dir():
     cache_dir = os.path.join(tempfile.gettempdir(), "iptv_cache")
