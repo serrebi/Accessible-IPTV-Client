@@ -37,6 +37,19 @@ from providers import (
     ProviderError, generate_provider_id
 )
 
+try:
+    from internal_player import (
+        InternalPlayerFrame,
+        InternalPlayerUnavailableError,
+        _VLC_IMPORT_ERROR,
+    )
+except Exception as _internal_player_import_error:  # pragma: no cover - import guard
+    InternalPlayerFrame = None  # type: ignore[assignment]
+    _VLC_IMPORT_ERROR = _internal_player_import_error  # type: ignore[assignment]
+
+    class InternalPlayerUnavailableError(RuntimeError):
+        """Fallback error when internal player cannot load."""
+
 
 _M3U_ATTR_RE = re.compile(r'([A-Za-z0-9_\-]+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^",\s]+))')
 
@@ -141,6 +154,7 @@ class TrayIcon(wx.adv.TaskBarIcon):
 
 class IPTVClient(wx.Frame):
     PLAYER_KEYS = [
+        ("Built-in Player", "player_Internal"),
         ("VLC", "player_VLC"),
         ("MPC", "player_MPC"),
         ("MPC-BE", "player_MPCBE"),
@@ -187,7 +201,7 @@ class IPTVClient(wx.Frame):
         self.all_channels: List[Dict[str, str]] = []
         self.displayed: List[Dict[str, str]] = []
         self.current_group = "All Channels"
-        self.default_player = self.config.get("media_player", "VLC")
+        self.default_player = self.config.get("media_player", "Built-in Player")
         self.custom_player_path = self.config.get("custom_player_path", "")
         self.epg_importing = False
         self.epg_cache = {}
@@ -199,6 +213,7 @@ class IPTVClient(wx.Frame):
         self._tray_ready_timer: Optional[wx.CallLater] = None
         self.provider_clients: Dict[str, object] = {}
         self.provider_epg_sources: List[str] = []
+        self._internal_player_frame: Optional[InternalPlayerFrame] = None
 
         # batch-population state to avoid UI hangs
         self._populate_token = 0
@@ -269,7 +284,7 @@ class IPTVClient(wx.Frame):
                 pass
 
     def _sync_player_menu_from_config(self):
-        defplayer = self.config.get("media_player", "VLC")
+        defplayer = self.config.get("media_player", "Built-in Player")
         self.default_player = defplayer
         for key, attr in self.PLAYER_MENU_ATTRS.items():
             if hasattr(self, attr):
@@ -761,6 +776,13 @@ class IPTVClient(wx.Frame):
                     pass
                 self.tray_icon.Destroy()
                 self.tray_icon = None
+            frame = getattr(self, "_internal_player_frame", None)
+            if frame is not None:
+                try:
+                    frame.Destroy()
+                except Exception:
+                    pass
+                self._internal_player_frame = None
             self.Destroy()
 
     def _select_player(self, player):
@@ -1846,9 +1868,49 @@ class IPTVClient(wx.Frame):
             wx.MessageBox(f"Could not resolve stream URL:\n{err}", "Playback Error", wx.OK | wx.ICON_ERROR)
             return
 
-        self._launch_stream(url)
+        display_name = None
+        if channel:
+            display_name = (channel.get("name")
+                            or channel.get("tvg-name")
+                            or channel.get("tvg_name")
+                            or channel.get("tvg-id")
+                            or channel.get("tvg_id"))
+        if show:
+            show_title = show.get("show_title") or show.get("title")
+            if show_title:
+                if display_name:
+                    display_name = f"{show_title} - {display_name}"
+                else:
+                    display_name = show_title
+        if not display_name:
+            display_name = "IPTV Stream"
+        self._launch_stream(url, display_name)
 
-    def _launch_stream(self, url: str):
+    def _on_internal_player_closed(self) -> None:
+        self._internal_player_frame = None
+
+    def _ensure_internal_player(self) -> InternalPlayerFrame:
+        if InternalPlayerFrame is None:
+            detail = _VLC_IMPORT_ERROR or "Built-in player is unavailable."
+            raise InternalPlayerUnavailableError(str(detail))
+        frame = getattr(self, "_internal_player_frame", None)
+        if frame:
+            try:
+                if getattr(frame, "_destroyed", False):
+                    frame = None
+            except Exception:
+                frame = None
+        if frame:
+            return frame
+        try:
+            base_buffer = float(self.config.get("internal_player_buffer_seconds", 12.0))
+        except Exception:
+            base_buffer = 12.0
+        frame = InternalPlayerFrame(self, base_buffer_seconds=base_buffer, on_close=self._on_internal_player_closed)
+        self._internal_player_frame = frame
+        return frame
+
+    def _launch_stream(self, url: str, title: Optional[str] = None):
         if not url:
             wx.MessageBox("Could not find stream URL for this selection.", "Not Found",
                           wx.OK | wx.ICON_WARNING)
@@ -1856,6 +1918,24 @@ class IPTVClient(wx.Frame):
 
         player = self.default_player
         custom_path = self.config.get("custom_player_path", "")
+
+        if player in {"Built-in Player", "player_Internal", "internal", "Internal"}:
+            player = "Built-in Player"
+            try:
+                frame = self._ensure_internal_player()
+            except InternalPlayerUnavailableError as err:
+                detail = str(err)
+                wx.MessageBox(f"Built-in player unavailable:\n{detail}", "Launch Error", wx.OK | wx.ICON_ERROR)
+                return
+            display_title = title or "IPTV Stream"
+            try:
+                frame.Show()
+                frame.Raise()
+                frame.SetFocus()
+                frame.play(url, display_title)
+            except Exception as err:
+                wx.MessageBox(f"Failed to start built-in player:\n{err}", "Launch Error", wx.OK | wx.ICON_ERROR)
+            return
 
         # If using mpv, try to reuse an existing instance via IPC first.
         if player == "MPV":
@@ -1995,7 +2075,8 @@ class IPTVClient(wx.Frame):
                 except Exception as err:
                     wx.MessageBox(f"Unable to prepare catch-up stream:\n{err}", "Catch-up", wx.OK | wx.ICON_ERROR)
                     return
-                self._launch_stream(url)
+                display = (selected.get("title") or channel.get("name", "IPTV Stream"))
+                self._launch_stream(url, display)
         finally:
             dlg.Destroy()
 

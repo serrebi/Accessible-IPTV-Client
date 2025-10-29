@@ -9,13 +9,15 @@ A vibe coded, accessible, keyboard-first IPTV player that works well with screen
 - Lets you add or remove playlist sources at any time
 - Groups channels by category for quicker browsing
 - Built‑in search across channel names (and EPG when available)
-- Plays streams in your preferred external media player (VLC, MPC‑HC, MPV, etc.)
+- Plays streams in the built-in IPTV player with adaptive buffering, or hand off to your preferred external media player (VLC, MPC-HC, MPV, etc.)
 - Optional XMLTV EPG support (direct .xml or compressed .xml.gz)
 
 ## What You Need
 
 - Python 3.8 or newer
 - wxPython (install with: `pip install wxpython`)
+- python-vlc (install with: `pip install python-vlc`) if you want to use the built-in player
+- VLC media player 3.0+ installed on the system so libVLC is available to python-vlc (the client will download a matching portable build, or fall back to `winget`, if it cannot find one)
 - At least one playlist URL or file
 - Optional: one or more XMLTV EPG sources (`.xml` or `.xml.gz`)
 
@@ -58,6 +60,11 @@ If you want a single executable you can copy around:
 - Searching: type in the search box to filter channel names. The app will also look up matching shows in the EPG and append them to your results without jumping your list position.
 - EPG downloads: `.xml.gz` guides are handled reliably (downloaded to a temp file, automatically verified, and then cleaned up). If a server sends an incomplete file, the app retries automatically.
 - Logs (for troubleshooting): a detailed log is written to your system’s temp folder as `iptvclient_epg_debug.log` while EPG is importing. This does not affect normal playback.
+- Need an external player? Pick it in the Options menu and the app will auto-install it via winget (Windows), pkexec/apt-get (Debian/Ubuntu), or Homebrew when it can; otherwise you'll get a gentle reminder to install it manually.
+
+## Built-in Player Buffering
+
+The internal player is powered by libVLC and sizes its network buffer dynamically, aiming for uninterrupted playback on links that range from about 1 Mbps up to gigabit broadband speeds. You can raise or lower the baseline buffer (default 2 seconds) by editing the `internal_player_buffer_seconds` field in `iptvclient.conf`. Lower values reduce startup latency, while higher values add extra headroom on unstable connections. Make sure the desktop VLC player is installed using the same architecture as Python (32-bit vs 64-bit) so python-vlc can load libVLC. On Windows, if a compatible libVLC build is not found the client will first download a matching portable VLC bundle under your profile, then fall back to `winget` if available.
 
 ## Platform Notes
 

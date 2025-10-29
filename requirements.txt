@@ -1,2 +1,2 @@
-wxPython>=4.2.1
-psutil>=5.9.0
+wxPython>=4.2.0
+python-vlc>=3.0.20123

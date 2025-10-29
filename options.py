@@ -150,6 +150,7 @@ def load_config() -> Dict:
         "epgs": [],
         "media_player": "VLC",
         "custom_player_path": "",
+        "internal_player_buffer_seconds": 2.0,
         "minimize_to_tray": False,
         "epg_enabled": True
     }
@@ -162,6 +163,8 @@ def load_config() -> Dict:
                     # Ensure all default keys are present
                     for k, v in default.items():
                         data.setdefault(k, v)
+                    if data.get("internal_player_buffer_seconds") == 12.0:
+                        data["internal_player_buffer_seconds"] = 2.0
                     _CONFIG_PATH = p
                     return data
             except Exception as e:
