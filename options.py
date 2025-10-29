@@ -143,6 +143,40 @@ def get_config_write_target():
 
     return os.path.join(get_user_config_dir(), CONFIG_FILE)
 
+def _apply_internal_player_bounds(cfg: Dict) -> None:
+    """Coerce internal player buffering settings into valid ranges."""
+    max_val = cfg.get("internal_player_max_buffer_seconds", 18.0)
+    try:
+        max_val = float(max_val)
+    except Exception:
+        max_val = 18.0
+    if max_val <= 0:
+        max_val = 18.0
+    max_val = max(6.0, max_val)
+    cfg["internal_player_max_buffer_seconds"] = max_val
+
+    base_val = cfg.get("internal_player_buffer_seconds", 2.0)
+    try:
+        base_val = float(base_val)
+    except Exception:
+        base_val = 2.0
+    if base_val < 0:
+        base_val = 0.0
+    if base_val > max_val:
+        base_val = max_val
+    cfg["internal_player_buffer_seconds"] = base_val
+
+    variant_cap = cfg.get("internal_player_variant_max_mbps", 0.0)
+    try:
+        variant_cap = float(variant_cap)
+    except Exception:
+        variant_cap = 0.0
+    if variant_cap <= 0.0:
+        variant_cap = 0.0
+    else:
+        variant_cap = max(0.25, min(variant_cap, 120.0))
+    cfg["internal_player_variant_max_mbps"] = variant_cap
+
 def load_config() -> Dict:
     global _CONFIG_PATH
     default = {
@@ -151,9 +185,12 @@ def load_config() -> Dict:
         "media_player": "VLC",
         "custom_player_path": "",
         "internal_player_buffer_seconds": 2.0,
+        "internal_player_max_buffer_seconds": 18.0,
+        "internal_player_variant_max_mbps": 0.0,
         "minimize_to_tray": False,
         "epg_enabled": True
     }
+    _apply_internal_player_bounds(default)
     for p in get_config_read_candidates():
         if os.path.exists(p):
             try:
@@ -165,6 +202,7 @@ def load_config() -> Dict:
                         data.setdefault(k, v)
                     if data.get("internal_player_buffer_seconds") == 12.0:
                         data["internal_player_buffer_seconds"] = 2.0
+                    _apply_internal_player_bounds(data)
                     _CONFIG_PATH = p
                     return data
             except Exception as e:
@@ -181,6 +219,7 @@ def load_config() -> Dict:
 
 def save_config(cfg: Dict):
     global _CONFIG_PATH
+    _apply_internal_player_bounds(cfg)
     path = get_config_write_target()
     try:
         # Ensure the directory exists before writing; skip if writing to CWD

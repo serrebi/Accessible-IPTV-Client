@@ -7,7 +7,7 @@ import time
 import urllib.parse
 import urllib.request
 from collections import deque
-from typing import Callable, Deque, Optional, Tuple
+from typing import Callable, Deque, List, Optional, Tuple
 
 import wx
 
@@ -20,6 +20,8 @@ else:
     _VLC_IMPORT_ERROR = None
 
 LOG = logging.getLogger(__name__)
+
+_HLS_ATTR_RE = re.compile(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)')
 
 
 class InternalPlayerUnavailableError(RuntimeError):
@@ -49,6 +51,8 @@ class InternalPlayerFrame(wx.Frame):
         self,
         parent: Optional[wx.Window],
         base_buffer_seconds: float = 12.0,
+        max_buffer_seconds: Optional[float] = None,
+        variant_max_mbps: Optional[float] = None,
         on_close: Optional[Callable[[], None]] = None,
     ) -> None:
         _prepare_vlc_runtime()
@@ -56,8 +60,7 @@ class InternalPlayerFrame(wx.Frame):
             raise InternalPlayerUnavailableError("python-vlc (libVLC) is not available.")
         super().__init__(parent, title="Built-in IPTV Player", size=(960, 540))
         self._on_close_cb = on_close
-        self.base_buffer_seconds = max(6.0, float(base_buffer_seconds or 0.0))
-        self._last_buffer_seconds: float = self.base_buffer_seconds
+        base_value = self._coerce_seconds(base_buffer_seconds, fallback=12.0)
         self._last_bitrate_mbps: Optional[float] = None
         self._current_url: Optional[str] = None
         self._current_title: str = ""
@@ -76,8 +79,15 @@ class InternalPlayerFrame(wx.Frame):
         self._last_restart_ts = 0.0
         self._last_restart_reason = ""
         self._buffer_step_seconds = 2.0
-        self._max_buffer_seconds = 18.0
-        self._max_network_cache_seconds = 8.0
+        self._max_buffer_seconds = self._resolve_max_buffer(max_buffer_seconds, base_value)
+        self.base_buffer_seconds = max(6.0, min(base_value, self._max_buffer_seconds))
+        self._network_cache_fraction = 0.85
+        self._min_network_cache_seconds = 5.0
+        self._max_network_cache_seconds = 18.0
+        self._update_cache_bounds()
+        self._last_buffer_seconds: float = self.base_buffer_seconds
+        self._variant_max_mbps: Optional[float] = self._sanitize_variant_cap(variant_max_mbps)
+        self._last_variant_url: Optional[str] = None
         self._buffering_events: Deque[float] = deque(maxlen=20)
         self._choppy_window_seconds = 25.0
         self._choppy_threshold = 4
@@ -213,11 +223,14 @@ class InternalPlayerFrame(wx.Frame):
         self._has_seen_playing = False
 
         self.SetTitle(f"{self._current_title} - Built-in Player")
-        target_buffer, cache_profile, bitrate = self._compute_buffer_profile(url)
+        playback_url, variant_bitrate = self._resolve_stream_url(url)
+        target_buffer, cache_profile, bitrate = self._compute_buffer_profile(
+            playback_url, bitrate_hint=variant_bitrate
+        )
         self._last_buffer_seconds = target_buffer
         self._last_bitrate_mbps = bitrate
 
-        media = self.instance.media_new(url)
+        media = self.instance.media_new(playback_url)
         self._apply_cache_options(media, cache_profile)
         try:
             self.player.stop()
@@ -257,7 +270,8 @@ class InternalPlayerFrame(wx.Frame):
             seconds = float(seconds)
         except Exception:
             return
-        self.base_buffer_seconds = max(6.0, seconds)
+        self.base_buffer_seconds = max(6.0, min(seconds, self._max_buffer_seconds))
+        self._update_cache_bounds()
 
     # ---------------------------------------------------------------- internal
     def _apply_cache_options(self, media: "vlc.Media", profile: dict) -> None:
@@ -277,6 +291,152 @@ class InternalPlayerFrame(wx.Frame):
             media.add_option(f":demux-read-ahead={profile['demux_read_ahead']}")
         if profile.get("adaptive_cache"):
             media.add_option(":adaptive-use-access=1")
+
+    # ---------------------------------------------------------------- helpers
+    @staticmethod
+    def _coerce_seconds(value: Optional[float], *, fallback: float) -> float:
+        try:
+            coerced = float(value) if value is not None else float(fallback)
+        except Exception:
+            coerced = float(fallback)
+        return max(0.0, coerced)
+
+    def _resolve_max_buffer(self, supplied: Optional[float], base_value: float) -> float:
+        raw_max = self._coerce_seconds(supplied if supplied is not None else 18.0, fallback=18.0)
+        if raw_max <= 0.0:
+            raw_max = 18.0
+        resolved = max(6.0, raw_max)
+        if resolved < 6.0:
+            resolved = 6.0
+        if resolved < base_value:
+            return max(6.0, base_value)
+        return resolved
+
+    def _update_cache_bounds(self) -> None:
+        upper = max(self.base_buffer_seconds * 0.95, self.base_buffer_seconds + 8.0, 12.0)
+        upper = min(self._max_buffer_seconds, upper)
+        lower = min(upper - 2.0, upper * 0.6)
+        lower = max(5.0, lower)
+        self._max_network_cache_seconds = upper
+        self._min_network_cache_seconds = lower
+
+    @staticmethod
+    def _sanitize_variant_cap(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            cap = float(value)
+        except Exception:
+            return None
+        if cap <= 0:
+            return None
+        return max(0.25, cap)
+
+    def update_variant_cap(self, max_mbps: Optional[float]) -> None:
+        self._variant_max_mbps = self._sanitize_variant_cap(max_mbps)
+
+    def _resolve_stream_url(self, url: str) -> Tuple[str, Optional[float]]:
+        cap = self._variant_max_mbps
+        if not cap:
+            self._last_variant_url = None
+            return url, None
+        lower = url.lower()
+        if "m3u8" not in lower and "manifest" not in lower:
+            self._last_variant_url = None
+            return url, None
+
+        manifest_text = self._fetch_hls_manifest(url)
+        if not manifest_text:
+            self._last_variant_url = None
+            return url, None
+        variants = self._parse_hls_variants(manifest_text, url)
+        if not variants:
+            self._last_variant_url = None
+            return url, None
+
+        selected = self._select_hls_variant(variants, cap)
+        if not selected:
+            self._last_variant_url = None
+            return url, None
+        self._last_variant_url = selected["url"]
+        return selected["url"], selected.get("bandwidth_mbps")
+
+    def _fetch_hls_manifest(self, url: str) -> Optional[str]:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "IPTVClient/1.0",
+                "Accept": "application/x-mpegURL,application/vnd.apple.mpegurl,text/plain,*/*",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=4) as response:
+                data = response.read(512_000)
+        except Exception as err:
+            LOG.debug("Failed to fetch HLS manifest %s: %s", url, err)
+            return None
+        try:
+            return data.decode("utf-8", errors="ignore")
+        except Exception:
+            return None
+
+    def _parse_hls_variants(self, manifest_text: str, base_url: str) -> List[dict]:
+        variants: List[dict] = []
+        if not manifest_text:
+            return variants
+        lines = manifest_text.splitlines()
+        total = len(lines)
+        idx = 0
+        while idx < total:
+            line = lines[idx].strip()
+            if line.startswith("#EXT-X-STREAM-INF"):
+                attrs = {k: v.strip('"') for k, v in _HLS_ATTR_RE.findall(line)}
+                bandwidth_val = attrs.get("AVERAGE-BANDWIDTH") or attrs.get("BANDWIDTH")
+                bandwidth_mbps: Optional[float] = None
+                if bandwidth_val:
+                    try:
+                        bandwidth_mbps = max(float(bandwidth_val) / 1_000_000.0, 0.0)
+                    except Exception:
+                        bandwidth_mbps = None
+                uri = ""
+                look_ahead = idx + 1
+                while look_ahead < total:
+                    next_line = lines[look_ahead].strip()
+                    if not next_line:
+                        look_ahead += 1
+                        continue
+                    if next_line.startswith("#"):
+                        if next_line.startswith("#EXT-X-STREAM-INF"):
+                            break
+                        look_ahead += 1
+                        continue
+                    uri = next_line
+                    break
+                if uri:
+                    resolved = urllib.parse.urljoin(base_url, uri)
+                    variants.append(
+                        {
+                            "url": resolved,
+                            "bandwidth_mbps": bandwidth_mbps,
+                            "raw_bandwidth": bandwidth_val,
+                        }
+                    )
+                idx = look_ahead
+                continue
+            idx += 1
+        return variants
+
+    @staticmethod
+    def _select_hls_variant(variants: List[dict], cap_mbps: float) -> Optional[dict]:
+        if not variants:
+            return None
+        eligible = [v for v in variants if v.get("bandwidth_mbps") and v["bandwidth_mbps"] <= cap_mbps]
+        if eligible:
+            return max(eligible, key=lambda v: v["bandwidth_mbps"] or 0.0)
+        with_bandwidth = [v for v in variants if v.get("bandwidth_mbps")]
+        if with_bandwidth:
+            return min(with_bandwidth, key=lambda v: v["bandwidth_mbps"] or 0.0)
+        return variants[0]
 
     def _ensure_player_window(self) -> None:
         if self._have_handle:
@@ -306,8 +466,10 @@ class InternalPlayerFrame(wx.Frame):
                 LOG.warning("Failed to bind video surface: %s", err)
                 wx.CallLater(int(self._HANDLE_CHECK_INTERVAL * 1000), self._ensure_player_window)
 
-    def _compute_buffer_profile(self, url: str) -> Tuple[float, dict, Optional[float]]:
-        bitrate = self._estimate_stream_bitrate(url)
+    def _compute_buffer_profile(
+        self, url: str, *, bitrate_hint: Optional[float] = None
+    ) -> Tuple[float, dict, Optional[float]]:
+        bitrate = bitrate_hint if bitrate_hint and bitrate_hint > 0 else self._estimate_stream_bitrate(url)
         base = self.base_buffer_seconds
 
         if bitrate is None:
@@ -323,16 +485,19 @@ class InternalPlayerFrame(wx.Frame):
         else:
             raw_target = max(8.0, min(base, 12.0))
 
-        target = min(raw_target, self._max_buffer_seconds)
-        network_target = min(target, self._max_network_cache_seconds)
+        target = min(self._max_buffer_seconds, max(base, raw_target))
+        network_candidate = max(target - 0.75, target * self._network_cache_fraction)
+        network_target = max(self._min_network_cache_seconds, network_candidate)
+        network_target = min(network_target, self._max_network_cache_seconds, target)
         network_ms = int(network_target * 1000)
-        file_cache = max(2000, int(max(target / 2.0, 3.0) * 1000))
+        file_cache_target = max(target + 4.0, network_target + 6.0)
+        file_cache = max(4000, int(file_cache_target * 1000))
         profile = {
             "network_ms": network_ms,
-            "live_ms": int((max(network_target, target) + 2.0) * 1000),
+            "live_ms": int(max(target + 2.5, network_target + 5.0) * 1000),
             "file_ms": file_cache,
             "disc_ms": file_cache,
-            "demux_read_ahead": max(4, int(target / 2.0)),
+            "demux_read_ahead": max(8, int(min(target, 24.0) * 0.85)),
             "adaptive_cache": True,
         }
         return network_target, profile, bitrate
@@ -443,6 +608,7 @@ class InternalPlayerFrame(wx.Frame):
                 if new_base > self.base_buffer_seconds:
                     LOG.info("Increasing base buffer to %.1fs to stabilise playback.", new_base)
                     self.base_buffer_seconds = new_base
+                    self._update_cache_bounds()
             try:
                 self.play(self._current_url, self._current_title, _retry=True)
             except Exception as err:
