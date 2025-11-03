@@ -1398,6 +1398,72 @@ class IPTVClient(wx.Frame):
         except Exception:
             return "?"
 
+    def _epg_offset_hours_for_channel(self, channel: Dict[str, str]) -> float:
+        if not isinstance(channel, dict):
+            return 0.0
+        offsets = self.config.get("epg_host_offsets") or {}
+        if not offsets:
+            return 0.0
+        url = channel.get("url") or ""
+        host = ""
+        if url:
+            try:
+                host = (urllib.parse.urlsplit(url).hostname or "").lower()
+            except Exception:
+                host = ""
+        if not host:
+            return 0.0
+        raw = offsets.get(host)
+        if raw is None:
+            return 0.0
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _apply_epg_offset_to_show(show: Optional[Dict[str, object]], offset_hours: float) -> Optional[Dict[str, object]]:
+        if not show or not offset_hours:
+            return show
+        delta = datetime.timedelta(hours=offset_hours)
+        adjusted = dict(show)
+        for key in ("start", "end"):
+            val = adjusted.get(key)
+            if isinstance(val, datetime.datetime):
+                dt = val
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+                adjusted[key] = (dt + delta).astimezone(datetime.timezone.utc)
+            elif isinstance(val, str) and val:
+                try:
+                    dt = datetime.datetime.strptime(val, "%Y%m%d%H%M%S")
+                    dt = dt.replace(tzinfo=datetime.timezone.utc) + delta
+                    adjusted[key] = dt.strftime("%Y%m%d%H%M%S")
+                except Exception:
+                    continue
+        return adjusted
+
+    def _apply_epg_offset_to_programmes(self, programmes: List[Dict[str, str]], channel: Dict[str, str]) -> List[Dict[str, str]]:
+        offset = self._epg_offset_hours_for_channel(channel)
+        if not offset or not programmes:
+            return programmes
+        delta = datetime.timedelta(hours=offset)
+        adjusted: List[Dict[str, str]] = []
+        for prog in programmes:
+            new_prog = dict(prog)
+            for key in ("start", "end"):
+                val = new_prog.get(key)
+                if not val:
+                    continue
+                try:
+                    dt = datetime.datetime.strptime(val, "%Y%m%d%H%M%S")
+                    dt = dt.replace(tzinfo=datetime.timezone.utc) + delta
+                    new_prog[key] = dt.strftime("%Y%m%d%H%M%S")
+                except Exception:
+                    continue
+            adjusted.append(new_prog)
+        return adjusted
+
     def _utc_now(self) -> datetime.datetime:
         try:
             return datetime.datetime.now(datetime.timezone.utc)
@@ -1559,7 +1625,11 @@ class IPTVClient(wx.Frame):
             now_show, next_show = None, None
         else:
             now_show, next_show = now_next
-            
+            offset = self._epg_offset_hours_for_channel(channel)
+            if offset:
+                now_show = self._apply_epg_offset_to_show(now_show, offset)
+                next_show = self._apply_epg_offset_to_show(next_show, offset)
+
         with self.epg_cache_lock:
             self.epg_cache[canonicalize_name(cname)] = (now_show, next_show, self._utc_now())
         wx.CallAfter(self._update_epg_display_if_selected, channel, now_show, next_show)
@@ -2105,7 +2175,7 @@ class IPTVClient(wx.Frame):
                 db.close()
         except Exception:
             programmes = []
-        return programmes
+        return self._apply_epg_offset_to_programmes(programmes, channel)
 
 
 class CatchupDialog(wx.Dialog):

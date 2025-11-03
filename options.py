@@ -4,6 +4,10 @@ import json
 import hashlib
 import datetime
 import re
+import time
+import platform
+import threading
+import ctypes
 try:
     import wx  # type: ignore
     _HAS_WX = True
@@ -15,6 +19,47 @@ import tempfile
 
 CONFIG_FILE = "iptvclient.conf"
 _CONFIG_PATH = None  # Path of config last loaded/saved
+_IS_WINDOWS = platform.system() == "Windows"
+
+_WINDOWS_TZ_RESETTER = None
+_WINDOWS_TZ_LOCK = threading.Lock()
+_WINDOWS_TZ_LAST_REFRESH = 0.0
+
+if _IS_WINDOWS:
+    # Prefer the Universal CRT, fall back to legacy msvcrt for older systems.
+    for _dll_name in ("ucrtbase", "msvcrt"):
+        try:
+            _dll = ctypes.CDLL(_dll_name)
+        except OSError:
+            continue
+        resetter = getattr(_dll, "_tzset", None)
+        if resetter is not None:
+            try:
+                resetter.restype = None
+            except Exception:
+                pass
+            _WINDOWS_TZ_RESETTER = resetter
+            break
+
+
+def _refresh_windows_timezone():
+    """Ensure long-running Windows processes pick up DST/offset changes."""
+    global _WINDOWS_TZ_LAST_REFRESH
+    if _WINDOWS_TZ_RESETTER is None:
+        return
+    now = time.monotonic()
+    if now - _WINDOWS_TZ_LAST_REFRESH < 300:
+        return
+    with _WINDOWS_TZ_LOCK:
+        # Re-check inside the lock to avoid redundant tzset calls.
+        now = time.monotonic()
+        if now - _WINDOWS_TZ_LAST_REFRESH < 300:
+            return
+        try:
+            _WINDOWS_TZ_RESETTER()
+        except Exception:
+            return
+        _WINDOWS_TZ_LAST_REFRESH = now
 
 
 def _log_error(message: str):
@@ -188,7 +233,13 @@ def load_config() -> Dict:
         "internal_player_max_buffer_seconds": 18.0,
         "internal_player_variant_max_mbps": 0.0,
         "minimize_to_tray": False,
-        "epg_enabled": True
+        "epg_enabled": True,
+        # Providers like live.iptvcanada.tv have historically delivered XMLTV
+        # times that lag daylight-saving transitions by one hour. Allow a
+        # per-host correction so guides stay aligned without hand-editing.
+        "epg_host_offsets": {
+            "live.iptvcanada.tv": 1.0
+        }
     }
     _apply_internal_player_bounds(default)
     for p in get_config_read_candidates():
@@ -462,6 +513,8 @@ def extract_group(title: str) -> str:
     return _search_country_in_text(title or "")
 
 def utc_to_local(dt):
+    if _IS_WINDOWS:
+        _refresh_windows_timezone()
     if dt.tzinfo is None:
         try:
             dt = dt.replace(tzinfo=datetime.timezone.utc)
