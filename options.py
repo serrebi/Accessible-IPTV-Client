@@ -234,12 +234,6 @@ def load_config() -> Dict:
         "internal_player_variant_max_mbps": 0.0,
         "minimize_to_tray": False,
         "epg_enabled": True,
-        # Providers like live.iptvcanada.tv have historically delivered XMLTV
-        # times that lag daylight-saving transitions by one hour. Allow a
-        # per-host correction so guides stay aligned without hand-editing.
-        "epg_host_offsets": {
-            "live.iptvcanada.tv": 1.0
-        }
     }
     _apply_internal_player_bounds(default)
     for p in get_config_read_candidates():
