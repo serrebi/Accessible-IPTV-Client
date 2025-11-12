@@ -64,6 +64,7 @@ def _refresh_windows_timezone():
 
 def _log_error(message: str):
     """Log errors without requiring a wx.App (headless safe)."""
+    text = str(message or "")
     app = None
     if _HAS_WX and hasattr(wx, "GetApp"):
         try:
@@ -72,11 +73,11 @@ def _log_error(message: str):
             app = None
     if _HAS_WX and app is not None:
         try:
-            wx.LogError(message)
+            wx.LogError(text.replace("%", "%%"))
             return
         except Exception:
             pass
-    sys.stderr.write(f"{message}\n")
+    sys.stderr.write(f"{text}\n")
 
 
 def _is_writable_dir(path: str) -> bool:

@@ -32,13 +32,15 @@ except ModuleNotFoundError:
 
 
 def _log_wx_error(message: str):
+    text = str(message or "")
     if WX_AVAILABLE and hasattr(wx, "LogError"):
         try:
-            wx.LogError(message)
+            # wx logging APIs treat % tokens as printf placeholders; escape them first.
+            wx.LogError(text.replace("%", "%%"))
             return
         except Exception:
             pass
-    sys.stderr.write(f"{message}\n")
+    sys.stderr.write(f"{text}\n")
 
 
 if WX_AVAILABLE:
