@@ -76,6 +76,7 @@ class InternalPlayerFrame(wx.Frame):
         self._manual_stop = False
         self._gave_up = False
         self._pending_restart = False
+        self._pending_xtream_refresh = False
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 4
         self._last_restart_ts = 0.0
@@ -87,6 +88,7 @@ class InternalPlayerFrame(wx.Frame):
         self._min_network_cache_seconds = 5.0
         self._max_network_cache_seconds = 18.0
         self._ts_network_bias = 0.92
+        self._xtream_buffer_refresh_seconds = 4.5
         self._refresh_ts_floor()
         self._update_cache_bounds()
         self._last_buffer_seconds: float = self.base_buffer_seconds
@@ -414,10 +416,12 @@ class InternalPlayerFrame(wx.Frame):
             or self._current_stream_kind != "live"
             or not self._looks_like_xtream_live_ts()
         ):
+            self._pending_xtream_refresh = False
             return False
         if self._pending_restart:
             return True
         self._pending_restart = True
+        self._pending_xtream_refresh = True
         self._last_restart_reason = "xtream segment rollover"
         self._last_restart_ts = time.monotonic()
         LOG.info("Xtream TS segment ended; refreshing stream without consuming retries.")
@@ -425,6 +429,7 @@ class InternalPlayerFrame(wx.Frame):
 
         def _do_restart() -> None:
             self._pending_restart = False
+            self._pending_xtream_refresh = False
             if self._destroyed or self._manual_stop or not self._current_url:
                 return
             try:
@@ -685,6 +690,7 @@ class InternalPlayerFrame(wx.Frame):
     def _schedule_restart(self, reason: str, adjust_buffer: bool = False) -> None:
         if self._destroyed or not self._current_url or self._manual_stop or self._gave_up:
             return
+        self._pending_xtream_refresh = False
         now = time.monotonic()
         if self._last_restart_ts and (now - self._last_restart_ts) >= self._reconnect_reset_window:
             if self._reconnect_attempts:
@@ -865,6 +871,7 @@ class InternalPlayerFrame(wx.Frame):
                 self._stall_ticks = 0
 
         self._monitor_playback_progress(now, state_key)
+        xtream_live = self._current_stream_kind == "live" and self._looks_like_xtream_live_ts()
 
         if state_key == "buffering":
             if self._buffer_start_ts is None:
@@ -872,15 +879,25 @@ class InternalPlayerFrame(wx.Frame):
             buffer_duration = now - self._buffer_start_ts
             since_start = now - self._play_start_monotonic if self._play_start_monotonic else float("inf")
             allow_recovery = self._has_seen_playing
-            if allow_recovery and (
-                not self._pending_restart
+            handled_xtream_refresh = False
+            if (
+                allow_recovery
+                and xtream_live
+                and not self._pending_restart
+                and buffer_duration >= self._xtream_buffer_refresh_seconds
+            ):
+                handled_xtream_refresh = self._restart_expected_xtream_live()
+            if (
+                allow_recovery
+                and not handled_xtream_refresh
+                and not self._pending_restart
                 and not self._early_buffer_fix_applied
                 and since_start <= 45.0
                 and buffer_duration >= 3.0
             ):
                 self._early_buffer_fix_applied = True
                 self._schedule_restart("early buffering detected", adjust_buffer=True)
-            elif allow_recovery and not self._pending_restart and buffer_duration >= 6.0:
+            elif allow_recovery and not handled_xtream_refresh and not self._pending_restart and buffer_duration >= 6.0:
                 self._schedule_restart("prolonged buffering", adjust_buffer=True)
         else:
             if self._buffer_start_ts is not None:
@@ -915,7 +932,7 @@ class InternalPlayerFrame(wx.Frame):
             prefix = "Buffering..."
 
         if self._pending_restart:
-            prefix = "Reconnecting..."
+            prefix = "Refreshing stream..." if self._pending_xtream_refresh else "Reconnecting..."
         elif self._gave_up:
             prefix = "Stream lost"
 

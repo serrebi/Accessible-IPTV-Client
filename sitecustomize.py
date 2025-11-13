@@ -74,6 +74,7 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
             self._manual_stop = False
             self._gave_up = False
             self._pending_restart = False
+            self._pending_xtream_refresh = False
             self._reconnect_attempts = 0
             self._max_reconnect_attempts = 4
             self._last_restart_ts = 0.0
@@ -111,6 +112,7 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
             self._auto_pausing = False
             self._buffer_pause_failures = 0
             self._min_buffer_event_seconds = 1.25
+            self._xtream_buffer_refresh_seconds = 4.5
 
             instance_opts = [
                 "--quiet",
@@ -426,10 +428,12 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
                 or self._current_stream_kind != "live"
                 or not self._looks_like_xtream_live_ts()
             ):
+                self._pending_xtream_refresh = False
                 return False
             if self._pending_restart:
                 return True
             self._pending_restart = True
+            self._pending_xtream_refresh = True
             self._last_restart_reason = "xtream segment rollover"
             self._last_restart_ts = time.monotonic()
             self._cancel_buffer_pause(resume=True)
@@ -439,6 +443,7 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
 
             def _do_restart() -> None:
                 self._pending_restart = False
+                self._pending_xtream_refresh = False
                 if self._destroyed or self._manual_stop or not self._current_url:
                     return
                 try:
@@ -771,6 +776,7 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
         def _schedule_restart(self, reason: str, adjust_buffer: bool = False) -> None:
             if self._destroyed or not self._current_url or self._manual_stop or self._gave_up:
                 return
+            self._pending_xtream_refresh = False
             self._cancel_buffer_pause(resume=True)
             self._buffer_pause_failures = 0
             now = time.monotonic()
@@ -955,6 +961,7 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
                     self._stall_ticks = 0
 
             self._monitor_playback_progress(now, state_key)
+            xtream_live = self._current_stream_kind == "live" and self._looks_like_xtream_live_ts()
 
             if state_key == "buffering":
                 if self._buffer_start_ts is None:
@@ -963,9 +970,17 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
                 since_start = now - self._play_start_monotonic if self._play_start_monotonic else float("inf")
                 allow_recovery = self._has_seen_playing
                 used_autopause = False
-                if allow_recovery and not self._pending_restart:
+                handled_xtream_refresh = False
+                if (
+                    allow_recovery
+                    and xtream_live
+                    and not self._pending_restart
+                    and buffer_duration >= self._xtream_buffer_refresh_seconds
+                ):
+                    handled_xtream_refresh = self._restart_expected_xtream_live()
+                if allow_recovery and not handled_xtream_refresh and not self._pending_restart:
                     used_autopause = self._handle_buffer_autopause(now, buffer_duration, since_start)
-                if allow_recovery and not self._pending_restart and not used_autopause:
+                if allow_recovery and not handled_xtream_refresh and not self._pending_restart and not used_autopause:
                     if (
                         not self._early_buffer_fix_applied
                         and since_start <= 45.0
@@ -1010,7 +1025,7 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
                 prefix = "Buffering..."
 
             if self._pending_restart:
-                prefix = "Reconnecting..."
+                prefix = "Refreshing stream..." if self._pending_xtream_refresh else "Reconnecting..."
             elif self._gave_up:
                 prefix = "Stream lost"
 
