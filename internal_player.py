@@ -64,6 +64,8 @@ class InternalPlayerFrame(wx.Frame):
         self._last_bitrate_mbps: Optional[float] = None
         self._current_url: Optional[str] = None
         self._current_title: str = ""
+        self._current_stream_kind: str = "live"
+        self._last_resolved_url: Optional[str] = None
         self._auto_handle_bound = False
         self._have_handle = False
         self._is_paused = False
@@ -84,6 +86,8 @@ class InternalPlayerFrame(wx.Frame):
         self._network_cache_fraction = 0.85
         self._min_network_cache_seconds = 5.0
         self._max_network_cache_seconds = 18.0
+        self._ts_network_bias = 0.92
+        self._refresh_ts_floor()
         self._update_cache_bounds()
         self._last_buffer_seconds: float = self.base_buffer_seconds
         self._variant_max_mbps: Optional[float] = self._sanitize_variant_cap(variant_max_mbps)
@@ -99,10 +103,12 @@ class InternalPlayerFrame(wx.Frame):
         self._stall_threshold = 8
         self._play_start_monotonic = 0.0
         self._restart_cooldown = 2.0
+        self._reconnect_reset_window = 120.0
         self._end_near_threshold_ms = 10_000
         self._buffer_start_ts: Optional[float] = None
         self._early_buffer_fix_applied = False
         self._has_seen_playing = False
+        self._min_buffer_event_seconds = 1.25
 
         instance_opts = [
             "--quiet",
@@ -196,7 +202,14 @@ class InternalPlayerFrame(wx.Frame):
         self._update_status_label("Idle")
 
     # ------------------------------------------------------------------ public
-    def play(self, url: str, title: Optional[str] = None, *, _retry: bool = False) -> None:
+    def play(
+        self,
+        url: str,
+        title: Optional[str] = None,
+        *,
+        stream_kind: Optional[str] = None,
+        _retry: bool = False,
+    ) -> None:
         """Start playback of the given URL with buffering and recovery hooks."""
         if self._destroyed:
             raise InternalPlayerUnavailableError("Player window has been destroyed.")
@@ -205,10 +218,15 @@ class InternalPlayerFrame(wx.Frame):
 
         if _retry:
             self._manual_stop = False
+            if stream_kind is None:
+                stream_kind = self._current_stream_kind
         else:
             self._reconnect_attempts = 0
             self._last_restart_reason = ""
             self._gave_up = False
+        if stream_kind is None:
+            stream_kind = "live"
+        self._current_stream_kind = stream_kind
 
         self._current_url = url
         self._current_title = title or "IPTV Stream"
@@ -224,6 +242,7 @@ class InternalPlayerFrame(wx.Frame):
 
         self.SetTitle(f"{self._current_title} - Built-in Player")
         playback_url, variant_bitrate = self._resolve_stream_url(url)
+        self._last_resolved_url = playback_url
         target_buffer, cache_profile, bitrate = self._compute_buffer_profile(
             playback_url, bitrate_hint=variant_bitrate
         )
@@ -271,6 +290,7 @@ class InternalPlayerFrame(wx.Frame):
         except Exception:
             return
         self.base_buffer_seconds = max(6.0, min(seconds, self._max_buffer_seconds))
+        self._refresh_ts_floor()
         self._update_cache_bounds()
 
     # ---------------------------------------------------------------- internal
@@ -314,11 +334,17 @@ class InternalPlayerFrame(wx.Frame):
 
     def _update_cache_bounds(self) -> None:
         upper = max(self.base_buffer_seconds * 0.95, self.base_buffer_seconds + 8.0, 12.0)
+        ts_floor = getattr(self, "_ts_buffer_floor", None)
+        if ts_floor:
+            upper = max(upper, ts_floor)
         upper = min(self._max_buffer_seconds, upper)
         lower = min(upper - 2.0, upper * 0.6)
         lower = max(5.0, lower)
         self._max_network_cache_seconds = upper
         self._min_network_cache_seconds = lower
+
+    def _refresh_ts_floor(self) -> None:
+        self._ts_buffer_floor = min(self._max_buffer_seconds, max(self.base_buffer_seconds + 6.0, 18.0))
 
     @staticmethod
     def _sanitize_variant_cap(value: Optional[float]) -> Optional[float]:
@@ -334,6 +360,85 @@ class InternalPlayerFrame(wx.Frame):
 
     def update_variant_cap(self, max_mbps: Optional[float]) -> None:
         self._variant_max_mbps = self._sanitize_variant_cap(max_mbps)
+
+    @staticmethod
+    def _is_linear_ts(url: str) -> bool:
+        if not url:
+            return False
+        lower = url.lower()
+        if ".ts?" in lower or lower.endswith(".ts"):
+            return True
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path.lower() if parsed.path else ""
+        if path.endswith(".ts"):
+            return True
+        return False
+
+    @staticmethod
+    def _strip_stream_modifiers(url: str) -> str:
+        if not url:
+            return ""
+        base, _, _ = url.partition("|")
+        return base.strip()
+
+    def _looks_like_xtream_live_ts(self) -> bool:
+        target = self._strip_stream_modifiers(self._last_resolved_url or self._current_url or "")
+        return self._looks_like_xtream_live_ts_url(target)
+
+    @staticmethod
+    def _looks_like_xtream_live_ts_url(url: str) -> bool:
+        if not url:
+            return False
+        if not InternalPlayerFrame._is_linear_ts(url):
+            return False
+        lower = url.lower()
+        if any(token in lower for token in ("/timeshift/", "/movie/", "/series/", "/archive/", "catchup", "recording")):
+            return False
+        parsed = urllib.parse.urlparse(url)
+        parts = [part for part in (parsed.path or "").split("/") if part]
+        if len(parts) < 3:
+            return False
+        stem = parts[-1].rsplit(".", 1)[0]
+        if stem.isdigit():
+            return True
+        if len(parts) >= 4 and parts[-2].isdigit():
+            return True
+        return False
+
+    def _restart_expected_xtream_live(self) -> bool:
+        if (
+            self._destroyed
+            or self._manual_stop
+            or self._gave_up
+            or not self._current_url
+            or self._current_stream_kind != "live"
+            or not self._looks_like_xtream_live_ts()
+        ):
+            return False
+        if self._pending_restart:
+            return True
+        self._pending_restart = True
+        self._last_restart_reason = "xtream segment rollover"
+        self._last_restart_ts = time.monotonic()
+        LOG.info("Xtream TS segment ended; refreshing stream without consuming retries.")
+        self._update_status_label("Refreshing stream...")
+
+        def _do_restart() -> None:
+            self._pending_restart = False
+            if self._destroyed or self._manual_stop or not self._current_url:
+                return
+            try:
+                self.play(
+                    self._current_url,
+                    self._current_title,
+                    stream_kind=self._current_stream_kind,
+                    _retry=True,
+                )
+            except Exception as err:
+                LOG.error("Xtream stream refresh failed: %s", err)
+
+        wx.CallLater(200, _do_restart)
+        return True
 
     def _resolve_stream_url(self, url: str) -> Tuple[str, Optional[float]]:
         cap = self._variant_max_mbps
@@ -471,9 +576,15 @@ class InternalPlayerFrame(wx.Frame):
     ) -> Tuple[float, dict, Optional[float]]:
         bitrate = bitrate_hint if bitrate_hint and bitrate_hint > 0 else self._estimate_stream_bitrate(url)
         base = self.base_buffer_seconds
+        is_linear_ts = self._is_linear_ts(url)
+        cache_fraction = self._network_cache_fraction
+        if is_linear_ts:
+            cache_fraction = max(cache_fraction, self._ts_network_bias)
 
         if bitrate is None:
             raw_target = max(base, 12.0)
+            if is_linear_ts:
+                raw_target = max(raw_target, self._ts_buffer_floor)
         elif bitrate <= 1.5:
             raw_target = max(base, 20.0)
         elif bitrate <= 3.0:
@@ -484,20 +595,26 @@ class InternalPlayerFrame(wx.Frame):
             raw_target = max(base, 10.0)
         else:
             raw_target = max(8.0, min(base, 12.0))
+        if is_linear_ts and bitrate is not None and bitrate <= 12.0:
+            raw_target = max(raw_target, self._ts_buffer_floor)
 
         target = min(self._max_buffer_seconds, max(base, raw_target))
-        network_candidate = max(target - 0.75, target * self._network_cache_fraction)
+        network_candidate = max(target - 0.75, target * cache_fraction)
         network_target = max(self._min_network_cache_seconds, network_candidate)
         network_target = min(network_target, self._max_network_cache_seconds, target)
         network_ms = int(network_target * 1000)
-        file_cache_target = max(target + 4.0, network_target + 6.0)
+        file_pad = 6.0 if is_linear_ts else 4.0
+        live_pad = 4.0 if is_linear_ts else 2.5
+        disc_pad = file_pad
+        file_cache_target = max(target + file_pad, network_target + (file_pad + 2.0))
         file_cache = max(4000, int(file_cache_target * 1000))
+        demux_cap = 28.0 if is_linear_ts else 24.0
         profile = {
             "network_ms": network_ms,
-            "live_ms": int(max(target + 2.5, network_target + 5.0) * 1000),
+            "live_ms": int(max(target + live_pad, network_target + (live_pad + 1.5)) * 1000),
             "file_ms": file_cache,
-            "disc_ms": file_cache,
-            "demux_read_ahead": max(8, int(min(target, 24.0) * 0.85)),
+            "disc_ms": max(file_cache, int((target + disc_pad) * 1000)),
+            "demux_read_ahead": max(8, int(min(target, demux_cap) * 0.85)),
             "adaptive_cache": True,
         }
         return network_target, profile, bitrate
@@ -569,6 +686,13 @@ class InternalPlayerFrame(wx.Frame):
         if self._destroyed or not self._current_url or self._manual_stop or self._gave_up:
             return
         now = time.monotonic()
+        if self._last_restart_ts and (now - self._last_restart_ts) >= self._reconnect_reset_window:
+            if self._reconnect_attempts:
+                LOG.debug(
+                    "Resetting reconnect attempts after %.1fs without retries.",
+                    now - self._last_restart_ts,
+                )
+            self._reconnect_attempts = 0
         if self._pending_restart:
             return
         if now - self._last_restart_ts < self._restart_cooldown:
@@ -608,6 +732,7 @@ class InternalPlayerFrame(wx.Frame):
                 if new_base > self.base_buffer_seconds:
                     LOG.info("Increasing base buffer to %.1fs to stabilise playback.", new_base)
                     self.base_buffer_seconds = new_base
+                    self._refresh_ts_floor()
                     self._update_cache_bounds()
             try:
                 self.play(self._current_url, self._current_title, _retry=True)
@@ -619,6 +744,15 @@ class InternalPlayerFrame(wx.Frame):
     def _prune_buffer_events(self, now: float) -> None:
         while self._buffering_events and now - self._buffering_events[0] > self._choppy_window_seconds:
             self._buffering_events.popleft()
+
+    def _record_buffer_event(self, now: float) -> None:
+        if self._buffer_start_ts is None:
+            return
+        duration = now - self._buffer_start_ts
+        if duration < self._min_buffer_event_seconds:
+            return
+        self._buffering_events.append(now)
+        self._maybe_handle_choppy(now)
 
     def _maybe_handle_choppy(self, now: float) -> None:
         if not self._has_seen_playing:
@@ -723,17 +857,12 @@ class InternalPlayerFrame(wx.Frame):
         now = time.monotonic()
 
         if self._last_state_name != state_key:
-            if state_key == "buffering":
-                self._buffering_events.append(now)
-                self._maybe_handle_choppy(now)
             self._last_state_name = state_key
             if state_key == "playing":
                 self._has_seen_playing = True
                 self._stall_ticks = 0
             elif state_key != "playing":
                 self._stall_ticks = 0
-        elif state_key == "buffering":
-            self._maybe_handle_choppy(now)
 
         self._monitor_playback_progress(now, state_key)
 
@@ -754,19 +883,29 @@ class InternalPlayerFrame(wx.Frame):
             elif allow_recovery and not self._pending_restart and buffer_duration >= 6.0:
                 self._schedule_restart("prolonged buffering", adjust_buffer=True)
         else:
+            if self._buffer_start_ts is not None:
+                self._record_buffer_event(now)
             self._buffer_start_ts = None
 
         prefix = "Paused" if self._is_paused else state_name.capitalize()
 
         if state_key == "error":
-            self._schedule_restart("playback error", adjust_buffer=True)
-            prefix = "Reconnecting..."
+            if not self._restart_expected_xtream_live():
+                self._schedule_restart("playback error", adjust_buffer=True)
+                prefix = "Reconnecting..."
+            else:
+                prefix = "Refreshing stream..."
         elif state_key == "stopped":
             if not self._manual_stop:
-                self._schedule_restart("stream stopped unexpectedly")
-                prefix = "Reconnecting..."
+                if not self._restart_expected_xtream_live():
+                    self._schedule_restart("stream stopped unexpectedly")
+                    prefix = "Reconnecting..."
+                else:
+                    prefix = "Refreshing stream..."
         elif state_key == "ended":
-            if self._should_auto_recover_on_end():
+            if self._restart_expected_xtream_live():
+                prefix = "Refreshing stream..."
+            elif self._should_auto_recover_on_end():
                 self._schedule_restart("stream ended unexpectedly")
                 prefix = "Reconnecting..."
             else:

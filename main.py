@@ -1875,6 +1875,7 @@ class IPTVClient(wx.Frame):
                             or channel.get("tvg_name")
                             or channel.get("tvg-id")
                             or channel.get("tvg_id"))
+        stream_kind = "catchup" if show else "live"
         if show:
             show_title = show.get("show_title") or show.get("title")
             if show_title:
@@ -1884,7 +1885,7 @@ class IPTVClient(wx.Frame):
                     display_name = show_title
         if not display_name:
             display_name = "IPTV Stream"
-        self._launch_stream(url, display_name)
+        self._launch_stream(url, display_name, stream_kind=stream_kind)
 
     def _on_internal_player_closed(self) -> None:
         self._internal_player_frame = None
@@ -1926,7 +1927,7 @@ class IPTVClient(wx.Frame):
         self._internal_player_frame = frame
         return frame
 
-    def _launch_stream(self, url: str, title: Optional[str] = None):
+    def _launch_stream(self, url: str, title: Optional[str] = None, *, stream_kind: str = "live"):
         if not url:
             wx.MessageBox("Could not find stream URL for this selection.", "Not Found",
                           wx.OK | wx.ICON_WARNING)
@@ -1948,7 +1949,7 @@ class IPTVClient(wx.Frame):
                 frame.Show()
                 frame.Raise()
                 frame.SetFocus()
-                frame.play(url, display_title)
+                frame.play(url, display_title, stream_kind=stream_kind)
             except Exception as err:
                 wx.MessageBox(f"Failed to start built-in player:\n{err}", "Launch Error", wx.OK | wx.ICON_ERROR)
             return
@@ -2092,7 +2093,7 @@ class IPTVClient(wx.Frame):
                     wx.MessageBox(f"Unable to prepare catch-up stream:\n{err}", "Catch-up", wx.OK | wx.ICON_ERROR)
                     return
                 display = (selected.get("title") or channel.get("name", "IPTV Stream"))
-                self._launch_stream(url, display)
+                self._launch_stream(url, display, stream_kind="catchup")
         finally:
             dlg.Destroy()
 
