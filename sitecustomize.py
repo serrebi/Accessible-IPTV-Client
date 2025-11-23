@@ -1,13 +1,14 @@
 """Runtime patches for the IPTV client."""
 
 import logging
+import os
 import re
 import threading
 import time
 import urllib.parse
 import urllib.request
 from collections import deque
-from typing import Callable, Deque, List, Optional, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 try:
     import wx  # type: ignore
@@ -30,11 +31,38 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
 
     _VLC_RUNTIME_PREPARED = False
 
+    def _prime_vlc_search_path() -> None:
+        candidates = [
+            os.path.join(os.environ.get("ProgramFiles(x86)", ""), "VideoLAN", "VLC"),
+            os.path.join(os.environ.get("ProgramFiles", ""), "VideoLAN", "VLC"),
+        ]
+        seen = set()
+        for path in candidates:
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            dll_path = os.path.join(path, "libvlc.dll")
+            if os.path.isfile(dll_path):
+                try:
+                    os.add_dll_directory(path)  # type: ignore[attr-defined]
+                except Exception:
+                    os.environ["PATH"] = f"{path};" + os.environ.get("PATH", "")
+
     def _prepare_vlc_runtime() -> None:
         """Ensure python-vlc is ready. Minimal guard that surfaces import issues."""
-        global _VLC_RUNTIME_PREPARED
+        global _VLC_RUNTIME_PREPARED, vlc, _VLC_IMPORT_ERROR
         if _VLC_RUNTIME_PREPARED:
             return
+        if vlc is None:
+            _prime_vlc_search_path()
+            try:
+                import importlib
+
+                vlc = importlib.import_module("vlc")  # type: ignore
+                _VLC_IMPORT_ERROR = None
+            except Exception as err:  # pragma: no cover - import guard
+                _VLC_IMPORT_ERROR = err
+                vlc = None  # type: ignore
         if vlc is None:
             detail = _VLC_IMPORT_ERROR or "python-vlc (libVLC) is not installed."
             raise InternalPlayerUnavailableError(str(detail))
@@ -64,6 +92,7 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
             self._current_title: str = ""
             self._current_stream_kind: str = "live"
             self._last_resolved_url: Optional[str] = None
+            self._current_headers: Dict[str, object] = {}
             self._auto_handle_bound = False
             self._have_handle = False
             self._is_paused = False
@@ -71,6 +100,9 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
             self._handle_guard = threading.Lock()
             self._fullscreen = False
             self._volume_value = 80
+            self._volume_last_ts = 0.0
+            self._volume_ramp = 0
+            self._volume_last_dir = 0
             self._manual_stop = False
             self._gave_up = False
             self._pending_restart = False
@@ -177,9 +209,20 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
             self.fullscreen_btn.Bind(wx.EVT_NAVIGATION_KEY, self._on_navigation_key)
             self.fullscreen_btn.Bind(wx.EVT_CHAR_HOOK, self._on_key_down)
 
+            self.volume_slider = wx.Slider(
+                self.controls_panel,
+                value=self._volume_value,
+                minValue=0,
+                maxValue=100,
+                style=wx.SL_HORIZONTAL,
+            )
+            self.volume_slider.Bind(wx.EVT_SLIDER, self._on_volume_slider)
+
             controls.Add(self.play_pause_btn, 0, wx.ALL, 5)
             controls.Add(self.stop_btn, 0, wx.ALL, 5)
             controls.Add(self.fullscreen_btn, 0, wx.ALL, 5)
+            # Expand horizontally; avoid ALIGN_* with EXPAND to sidestep wx sizer assertions.
+            controls.Add(self.volume_slider, 1, wx.ALL | wx.EXPAND, 5)
             controls.AddStretchSpacer(1)
             self.status_label = wx.StaticText(self.controls_panel, label="Idle")
             controls.Add(self.status_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
@@ -196,6 +239,7 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
                 self.play_pause_btn,
                 self.stop_btn,
                 self.fullscreen_btn,
+                self.volume_slider,
             ]
 
             self._status_timer = wx.Timer(self)
@@ -212,6 +256,7 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
             title: Optional[str] = None,
             *,
             stream_kind: Optional[str] = None,
+            headers: Optional[Dict[str, object]] = None,
             _retry: bool = False,
         ) -> None:
             """Start playback of the given URL with buffering and recovery hooks."""
@@ -234,7 +279,10 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
                 stream_kind = "live"
             self._current_stream_kind = stream_kind
 
-            self._current_url = url
+            header_payload = headers if headers is not None else (self._current_headers if _retry else None)
+            base_url, merged_headers = self._normalise_stream_url(url, header_payload)
+            self._current_headers = merged_headers
+            self._current_url = base_url
             self._current_title = title or "IPTV Stream"
             self._play_start_monotonic = time.monotonic()
             self._pending_restart = False
@@ -251,16 +299,17 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
             self._buffer_pause_failures = 0
 
             self.SetTitle(f"{self._current_title} - Built-in Player")
-            playback_url, variant_bitrate = self._resolve_stream_url(url)
+            playback_url, variant_bitrate = self._resolve_stream_url(base_url, headers=merged_headers)
             self._last_resolved_url = playback_url
             target_buffer, cache_profile, bitrate = self._compute_buffer_profile(
-                playback_url, bitrate_hint=variant_bitrate
+                playback_url, bitrate_hint=variant_bitrate, headers=merged_headers
             )
             self._last_buffer_seconds = target_buffer
             self._last_bitrate_mbps = bitrate
 
             media = self.instance.media_new(playback_url)
             self._apply_cache_options(media, cache_profile)
+            self._apply_stream_headers(media, merged_headers)
             try:
                 self.player.stop()
             except Exception:
@@ -325,6 +374,157 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
                 media.add_option(":adaptive-use-access=1")
 
         # ---------------------------------------------------------------- helpers
+        def _normalise_stream_url(
+            self, url: str, header_overrides: Optional[Dict[str, object]]
+        ) -> Tuple[str, Dict[str, object]]:
+            base, parsed_headers = self._parse_stream_modifiers(url)
+            merged: Dict[str, object] = {}
+            if parsed_headers:
+                merged.update(parsed_headers)
+            if header_overrides:
+                for key, value in header_overrides.items():
+                    if key == "_extra":
+                        if value:
+                            merged.setdefault("_extra", [])
+                            merged["_extra"] += [v for v in value if v]
+                    elif value:
+                        merged[key.lower()] = value
+            merged["_extra"] = self._dedupe_headers_list(merged.get("_extra"))
+            return base, merged
+
+        def _parse_stream_modifiers(self, url: str) -> Tuple[str, Dict[str, object]]:
+            if not url:
+                return "", {}
+            base, sep, tail = url.partition("|")
+            headers: Dict[str, object] = {}
+            extras: List[str] = []
+            if sep:
+                for part in tail.split("|"):
+                    token = part.strip()
+                    if not token or "=" not in token:
+                        continue
+                    key, value = token.split("=", 1)
+                    key = key.strip().lower()
+                    value = urllib.parse.unquote_plus(value.strip())
+                    if not value:
+                        continue
+                    if key in ("user-agent", "ua", "http-user-agent"):
+                        headers["user-agent"] = value
+                    elif key in ("referer", "referrer", "http-referrer", "http-referer"):
+                        headers["referer"] = value
+                    elif key in ("origin", "http-origin"):
+                        headers["origin"] = value
+                    elif key in ("cookie", "http-cookie"):
+                        headers["cookie"] = value
+                    elif key in ("authorization", "auth", "http-authorization"):
+                        headers["authorization"] = value
+                    elif key in ("bearer", "token"):
+                        headers["authorization"] = f"Bearer {value}"
+                    elif key in ("x-forwarded-for", "xff"):
+                        headers["x-forwarded-for"] = value
+                    elif key in ("accept", "http-accept"):
+                        headers["accept"] = value
+                    elif key in ("range", "http-range"):
+                        headers["range"] = value
+                    elif key in ("host", "http-host"):
+                        extras.append(f"Host: {value}")
+                    else:
+                        extras.append(f"{self._normalize_header_name(key)}: {value}")
+            if extras:
+                headers["_extra"] = extras
+            return base.strip(), headers
+
+        @staticmethod
+        def _normalize_header_name(key: str) -> str:
+            return "-".join(part.capitalize() for part in key.split("-") if part)
+
+        @staticmethod
+        def _dedupe_headers_list(headers: Optional[List[str]]) -> List[str]:
+            if not headers:
+                return []
+            seen = set()
+            deduped: List[str] = []
+            for hdr in headers:
+                if not hdr:
+                    continue
+                prefix = hdr.split(":", 1)[0].strip().lower() if ":" in hdr else hdr.lower()
+                if prefix in seen:
+                    continue
+                seen.add(prefix)
+                deduped.append(hdr)
+            return deduped
+
+        def _apply_stream_headers(self, media: "vlc.Media", headers: Dict[str, object]) -> None:
+            if not headers:
+                return
+            ua = headers.get("user-agent")
+            if ua:
+                media.add_option(f":http-user-agent={ua}")
+            ref = headers.get("referer")
+            if ref:
+                media.add_option(f":http-referrer={ref}")
+            cookie = headers.get("cookie")
+            if cookie:
+                media.add_option(f":http-cookie={cookie}")
+            origin = headers.get("origin")
+            if origin:
+                media.add_option(f":http-header=Origin: {origin}")
+            auth = headers.get("authorization")
+            if auth:
+                media.add_option(f":http-header=Authorization: {auth}")
+            accept = headers.get("accept")
+            if accept:
+                media.add_option(f":http-header=Accept: {accept}")
+            xff = headers.get("x-forwarded-for")
+            if xff:
+                media.add_option(f":http-header=X-Forwarded-For: {xff}")
+            range_header = headers.get("range")
+            if range_header:
+                media.add_option(f":http-header=Range: {range_header}")
+            extras = headers.get("_extra") or []
+            if isinstance(extras, list):
+                for hdr in extras:
+                    media.add_option(f":http-header={hdr}")
+
+        def _request_headers(self, headers: Optional[Dict[str, object]], *, include_accept: bool = True) -> dict:
+            ua = None
+            req_headers = {}
+            if headers:
+                ua = headers.get("user-agent")
+            if ua:
+                req_headers["User-Agent"] = str(ua)
+            else:
+                req_headers["User-Agent"] = "IPTVClient/1.0"
+            if include_accept:
+                if headers and headers.get("accept"):
+                    req_headers["Accept"] = str(headers.get("accept"))
+                else:
+                    req_headers["Accept"] = "application/x-mpegURL,application/vnd.apple.mpegurl,text/plain,*/*"
+            if headers:
+                ref = headers.get("referer")
+                if ref:
+                    req_headers["Referer"] = str(ref)
+                origin = headers.get("origin")
+                if origin:
+                    req_headers["Origin"] = str(origin)
+                cookie = headers.get("cookie")
+                if cookie:
+                    req_headers["Cookie"] = str(cookie)
+                auth = headers.get("authorization")
+                if auth:
+                    req_headers["Authorization"] = str(auth)
+                extras = headers.get("_extra")
+                if isinstance(extras, list):
+                    for hdr in extras:
+                        if ":" not in str(hdr):
+                            continue
+                        name, val = str(hdr).split(":", 1)
+                        name = name.strip()
+                        val = val.strip()
+                        if name and val and name not in req_headers:
+                            req_headers[name] = val
+            return req_headers
+
         @staticmethod
         def _coerce_seconds(value: Optional[float], *, fallback: float) -> float:
             try:
@@ -459,7 +659,7 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
             wx.CallLater(200, _do_restart)
             return True
 
-        def _resolve_stream_url(self, url: str) -> Tuple[str, Optional[float]]:
+        def _resolve_stream_url(self, url: str, headers: Optional[Dict[str, object]] = None) -> Tuple[str, Optional[float]]:
             cap = self._variant_max_mbps
             if not cap:
                 self._last_variant_url = None
@@ -469,7 +669,7 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
                 self._last_variant_url = None
                 return url, None
 
-            manifest_text = self._fetch_hls_manifest(url)
+            manifest_text = self._fetch_hls_manifest(url, headers=headers)
             if not manifest_text:
                 self._last_variant_url = None
                 return url, None
@@ -485,14 +685,8 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
             self._last_variant_url = selected["url"]
             return selected["url"], selected.get("bandwidth_mbps")
 
-        def _fetch_hls_manifest(self, url: str) -> Optional[str]:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "IPTVClient/1.0",
-                    "Accept": "application/x-mpegURL,application/vnd.apple.mpegurl,text/plain,*/*",
-                },
-            )
+        def _fetch_hls_manifest(self, url: str, headers: Optional[Dict[str, object]] = None) -> Optional[str]:
+            req = urllib.request.Request(url, headers=self._request_headers(headers))
             try:
                 with urllib.request.urlopen(req, timeout=4) as response:
                     data = response.read(512_000)
@@ -591,9 +785,13 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
                     wx.CallLater(int(self._HANDLE_CHECK_INTERVAL * 1000), self._ensure_player_window)
 
         def _compute_buffer_profile(
-            self, url: str, *, bitrate_hint: Optional[float] = None
+            self,
+            url: str,
+            *,
+            bitrate_hint: Optional[float] = None,
+            headers: Optional[Dict[str, object]] = None,
         ) -> Tuple[float, dict, Optional[float]]:
-            bitrate = bitrate_hint if bitrate_hint and bitrate_hint > 0 else self._estimate_stream_bitrate(url)
+            bitrate = bitrate_hint if bitrate_hint and bitrate_hint > 0 else self._estimate_stream_bitrate(url, headers=headers)
             base = self.base_buffer_seconds
             is_linear_ts = self._is_linear_ts(url)
             cache_fraction = self._network_cache_fraction
@@ -638,7 +836,7 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
             }
             return network_target, profile, bitrate
 
-        def _estimate_stream_bitrate(self, url: str) -> Optional[float]:
+        def _estimate_stream_bitrate(self, url: str, headers: Optional[Dict[str, object]] = None) -> Optional[float]:
             parsed = urllib.parse.urlparse(url)
             query_hint = self._extract_bitrate_from_query(parsed.query)
             if query_hint:
@@ -648,13 +846,7 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
             if "m3u8" not in lower and "manifest" not in lower:
                 return None
 
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "IPTVClient/1.0",
-                    "Accept": "application/x-mpegURL,application/vnd.apple.mpegurl,text/plain,*/*",
-                },
-            )
+            req = urllib.request.Request(url, headers=self._request_headers(headers))
             try:
                 with urllib.request.urlopen(req, timeout=3) as response:
                     data = response.read(65536)
@@ -1071,24 +1263,54 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
                     if current >= 0:
                         self._volume_value = current
                     self.player.audio_set_volume(self._volume_value)
+                    self._sync_volume_slider()
                 except Exception:
                     pass
 
             wx.CallLater(150, _apply)
 
+        def _sync_volume_slider(self) -> None:
+            if hasattr(self, "volume_slider") and self.volume_slider:
+                try:
+                    self.volume_slider.SetValue(int(min(100, max(0, self._volume_value))))
+                except Exception:
+                    pass
+
+        def _on_volume_slider(self, event: wx.CommandEvent) -> None:
+            try:
+                value = int(self.volume_slider.GetValue())
+            except Exception:
+                return
+            self._volume_value = max(0, min(100, value))
+            try:
+                self.player.audio_set_volume(self._volume_value)
+            except Exception:
+                pass
+            self._update_status_label()
+            self._sync_volume_slider()
+            self._sync_volume_slider()
+            event.Skip(False)
+
         def _adjust_volume(self, delta: int) -> None:
+            # Plex-style: fixed 5% steps, no acceleration.
+            base_step = 5
+            self._volume_ramp = 0
+            self._volume_last_dir = 1 if delta > 0 else -1 if delta < 0 else 0
+            self._volume_last_ts = time.monotonic()
+            applied_delta = base_step if delta >= 0 else -base_step
             try:
                 current = self.player.audio_get_volume()
             except Exception:
                 current = -1
             if current >= 0:
                 self._volume_value = current
-            self._volume_value = max(0, min(200, self._volume_value + delta))
+            self._volume_value = max(0, min(100, self._volume_value + applied_delta))
             try:
                 self.player.audio_set_volume(self._volume_value)
             except Exception:
                 pass
             self._update_status_label()
+            self._sync_volume_slider()
 
         def _set_fullscreen(self, enable: bool) -> None:
             enable = bool(enable)

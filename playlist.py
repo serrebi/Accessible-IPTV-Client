@@ -1,9 +1,7 @@
-﻿import os
+import os
 import re
-import io
 import gzip
 import time
-import json
 import tracemalloc
 import sqlite3
 import urllib.request
@@ -68,7 +66,7 @@ else:
 # Debug logging (rotating file) + memory helpers
 # =========================
 
-DEBUG = True if os.getenv("EPG_DEBUG", "1").strip() not in {"0", "false", "False"} else False
+DEBUG = True if os.getenv("EPG_DEBUG", "0").strip() not in {"0", "false", "False"} else False
 # FIX: Write log to temp dir to avoid permission errors on startup
 LOG_PATH = os.path.join(tempfile.gettempdir(), "iptvclient_epg_debug.log")
 _logger = logging.getLogger("EPG")
@@ -2576,5 +2574,4 @@ def _derive_playlist_region(channel: Dict[str, str]) -> str:
         return tied[0]
     tied.sort(key=lambda code: order.get(code, 1_000_000))
     return tied[0]
-
 

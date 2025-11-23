@@ -1,23 +1,18 @@
 import os
-import sys
 import json
 import socket
 import tempfile
 import ctypes
 import urllib.request
 import urllib.parse
-import gzip
 import sqlite3
 import threading
 from typing import Dict, List, Optional
 import wx
-import xml.etree.ElementTree as ET
 import datetime
 import re
-import shutil
 import platform
 import time
-import signal
 import subprocess
 import hashlib
 
@@ -25,11 +20,11 @@ import wx.adv
 
 from options import (
     load_config, save_config, get_cache_path_for_url, get_cache_dir,
-    get_db_path, canonicalize_name, relaxed_name, extract_group, utc_to_local,
+    get_db_path, canonicalize_name, extract_group, utc_to_local,
     CustomPlayerDialog
 )
 from playlist import (
-    EPGDatabase, EPGImportDialog, EPGManagerDialog, PlaylistManagerDialog
+    EPGDatabase, EPGManagerDialog, PlaylistManagerDialog
 )
 from providers import (
     XtreamCodesClient, XtreamCodesConfig,
@@ -1060,6 +1055,12 @@ class IPTVClient(wx.Frame):
         catchup_source = ""
         catchup_offset = ""
         http_user_agent = ""
+        http_referrer = ""
+        http_origin = ""
+        http_cookie = ""
+        http_headers: List[str] = []
+        http_auth = ""
+        http_accept = ""
 
         for raw_line in text.splitlines():
             s = raw_line.strip()
@@ -1082,6 +1083,12 @@ class IPTVClient(wx.Frame):
                     catchup_source = ""
                     catchup_offset = ""
                     http_user_agent = ""
+                    http_referrer = ""
+                    http_origin = ""
+                    http_cookie = ""
+                    http_headers = []
+                    http_auth = ""
+                    http_accept = ""
 
                     comma_idx = s.find(',')
                     info_part = s if comma_idx == -1 else s[:comma_idx]
@@ -1110,6 +1117,11 @@ class IPTVClient(wx.Frame):
                             catchup_source = attrs.get("catchup-source", "")
                             catchup_offset = attrs.get("catchup-offset", "")
                             http_user_agent = attrs.get("http-user-agent", "")
+                            http_referrer = attrs.get("http-referrer") or attrs.get("http-referer", http_referrer)
+                            http_origin = attrs.get("http-origin", http_origin)
+                            http_cookie = attrs.get("http-cookie", http_cookie)
+                            http_auth = attrs.get("http-authorization", http_auth)
+                            http_accept = attrs.get("http-accept", http_accept)
                     continue
 
                 if upper_prefix.startswith("#EXTVLCOPT"):
@@ -1128,6 +1140,19 @@ class IPTVClient(wx.Frame):
                                 catchup_type = value
                             elif key == "http-user-agent":
                                 http_user_agent = value
+                            elif key in {"http-referrer", "http-referer", "referer", "referrer"}:
+                                http_referrer = value
+                            elif key in {"http-origin", "origin"}:
+                                http_origin = value
+                            elif key in {"http-cookie", "cookie"}:
+                                http_cookie = value
+                            elif key in {"http-authorization", "authorization", "auth"}:
+                                http_auth = value
+                            elif key in {"http-accept", "accept"}:
+                                http_accept = value
+                            elif key.startswith("http-header"):
+                                if value:
+                                    http_headers.append(value)
                     continue
 
                 if upper_prefix.startswith("#KODIPROP"):
@@ -1142,6 +1167,16 @@ class IPTVClient(wx.Frame):
                                 catchup_days = value
                             elif key.endswith("catchup_source"):
                                 catchup_source = value
+                            elif key in {"http-referrer", "http-referer", "referer", "referrer"}:
+                                http_referrer = value
+                            elif key in {"http-origin", "origin"}:
+                                http_origin = value
+                            elif key in {"http-cookie", "cookie"}:
+                                http_cookie = value
+                            elif key in {"http-authorization", "authorization", "auth"}:
+                                http_auth = value
+                            elif key in {"http-accept", "accept"}:
+                                http_accept = value
                     continue
 
                 # Other comment/directive lines are ignored
@@ -1178,6 +1213,27 @@ class IPTVClient(wx.Frame):
                 channel["catchup-offset"] = catchup_offset
             if http_user_agent:
                 channel["http-user-agent"] = http_user_agent
+            if http_referrer:
+                channel["http-referrer"] = http_referrer
+            if http_origin:
+                channel["http-origin"] = http_origin
+            if http_cookie:
+                channel["http-cookie"] = http_cookie
+            if http_auth:
+                channel["http-authorization"] = http_auth
+            if http_accept:
+                channel["http-accept"] = http_accept
+            if http_headers:
+                # Preserve header order but drop duplicates case-insensitively.
+                seen_headers = set()
+                unique_headers: List[str] = []
+                for hdr in http_headers:
+                    key_lower = hdr.split(":", 1)[0].strip().lower() if ":" in hdr else hdr.lower()
+                    if key_lower in seen_headers:
+                        continue
+                    seen_headers.add(key_lower)
+                    unique_headers.append(hdr)
+                channel["http-headers"] = unique_headers
 
             if provider_type == "xtream" or catchup_source:
                 stream_id = stream_id_for(url)
@@ -1200,6 +1256,12 @@ class IPTVClient(wx.Frame):
             catchup_source = ""
             catchup_offset = ""
             http_user_agent = ""
+            http_referrer = ""
+            http_origin = ""
+            http_cookie = ""
+            http_headers = []
+            http_auth = ""
+            http_accept = ""
 
         return out
 
@@ -1695,6 +1757,27 @@ class IPTVClient(wx.Frame):
         now = datetime.datetime.now(datetime.timezone.utc)
         return start_dt >= now - datetime.timedelta(days=span)
 
+    def _channel_http_headers(self, channel: Optional[Dict[str, str]]) -> Dict[str, object]:
+        """Collect per-channel HTTP headers for the built-in player."""
+        headers: Dict[str, object] = {}
+        if not channel:
+            return headers
+        def _copy(key: str, target: str) -> None:
+            val = channel.get(key)
+            if val:
+                headers[target] = val
+        _copy("http-user-agent", "user-agent")
+        _copy("http-referrer", "referer")
+        _copy("http-referer", "referer")
+        _copy("http-origin", "origin")
+        _copy("http-cookie", "cookie")
+        _copy("http-authorization", "authorization")
+        _copy("http-accept", "accept")
+        extra = channel.get("http-headers")
+        if isinstance(extra, list):
+            headers["_extra"] = [str(h) for h in extra if h]
+        return headers
+
     def _resolve_live_url(self, channel: Dict[str, str]) -> str:
         url = channel.get("url", "")
         provider_type = channel.get("provider-type")
@@ -1885,7 +1968,7 @@ class IPTVClient(wx.Frame):
                     display_name = show_title
         if not display_name:
             display_name = "IPTV Stream"
-        self._launch_stream(url, display_name, stream_kind=stream_kind)
+        self._launch_stream(url, display_name, stream_kind=stream_kind, channel=channel)
 
     def _on_internal_player_closed(self) -> None:
         self._internal_player_frame = None
@@ -1927,13 +2010,14 @@ class IPTVClient(wx.Frame):
         self._internal_player_frame = frame
         return frame
 
-    def _launch_stream(self, url: str, title: Optional[str] = None, *, stream_kind: str = "live"):
+    def _launch_stream(self, url: str, title: Optional[str] = None, *, stream_kind: str = "live", channel: Optional[Dict[str, str]] = None):
         if not url:
             wx.MessageBox("Could not find stream URL for this selection.", "Not Found",
                           wx.OK | wx.ICON_WARNING)
             return
 
         player = self.default_player
+        stream_headers = self._channel_http_headers(channel)
         custom_path = self.config.get("custom_player_path", "")
 
         if player in {"Built-in Player", "player_Internal", "internal", "Internal"}:
@@ -1949,7 +2033,7 @@ class IPTVClient(wx.Frame):
                 frame.Show()
                 frame.Raise()
                 frame.SetFocus()
-                frame.play(url, display_title, stream_kind=stream_kind)
+                frame.play(url, display_title, stream_kind=stream_kind, headers=stream_headers)
             except Exception as err:
                 wx.MessageBox(f"Failed to start built-in player:\n{err}", "Launch Error", wx.OK | wx.ICON_ERROR)
             return
@@ -2093,7 +2177,7 @@ class IPTVClient(wx.Frame):
                     wx.MessageBox(f"Unable to prepare catch-up stream:\n{err}", "Catch-up", wx.OK | wx.ICON_ERROR)
                     return
                 display = (selected.get("title") or channel.get("name", "IPTV Stream"))
-                self._launch_stream(url, display, stream_kind="catchup")
+                self._launch_stream(url, display, stream_kind="catchup", channel=channel)
         finally:
             dlg.Destroy()
 
