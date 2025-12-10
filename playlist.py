@@ -1235,6 +1235,11 @@ class EPGDatabase:
                 else:
                     score -= 15
                     why.append('-zone')
+            elif playlist_region == 'us' and not playlist_zone and epg_zone == 'east':
+                # For US channels with no zone specified, prefer "East" over generic/west
+                # sufficiently to overcome exact-name match scores (~96 vs ~60).
+                score += 38
+                why.append('+implicit-east')
 
             epg_ts = _detect_timeshift(" ".join([disp, ch_id]))
             # Timeshift-aware scoring: strongly prefer exact +N matches; penalize mismatches
@@ -1332,140 +1337,103 @@ class EPGDatabase:
         except AttributeError:
             return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
 
-    def get_now_next(self, channel: Dict[str, str]) -> Optional[tuple]:
-        matches, _playlist_region = self.get_matching_channel_ids(channel)
+    def _rank_key(self, start_int: int, ch_id: str, aux_map: Dict[str, dict], playlist_region: str):
+        md = aux_map.get(ch_id, {})
+        score = int(md.get('score', 0))
+        tok = int(md.get('token_overlap', 0))
+        grp = (md.get('group_tag') or '').strip().lower()
+        rb = 0 if grp == playlist_region else (1 if grp == '' else 2)
+        return (-score, -tok, rb, start_int)
+
+    def resolve_best_channel_id(self, channel: Dict[str, str]) -> Optional[str]:
+        """Find the best matching DB channel ID for a playlist channel."""
+        matches, playlist_region = self.get_matching_channel_ids(channel)
         if not matches:
-            if DEBUG:
-                _logger.debug("NOW/NEXT: no candidates for '%s' (tvg-id=%s tvg-name=%s)",
-                              _safe(channel.get('name')), _safe(channel.get('tvg-id')), _safe(channel.get('tvg-name')))
             return None
 
-        # Sort by score
+        # Sort by score initially
         matches = sorted(matches, key=lambda m: -m.get('score', 0))
 
-        # Probe schedule availability for top-N and reorder with region/city preference.
+        # Probe schedule availability for top-N and reorder
         try:
             avail = []
             for m in matches[:20]:
                 ch_id = m['id']
                 has_any = self._has_any_schedule_from_now(ch_id)
                 avail.append((m, has_any))
-                if DEBUG:
-                    _logger.debug("MATCH CAND ch_id=%s score=%s grp=%s why=%s has_schedule_from_now=%s",
-                                  ch_id, m.get('score'), m.get('group_tag'), _safe(m.get('why'), 300), has_any)
 
-            # Region-aware bucket: same region > unknown > other
             def region_bucket(m):
                 grp = (m.get('group_tag') or '').strip().lower()
-                if grp == _playlist_region:
-                    return 0
-                if grp == '':
-                    return 1
+                if grp == playlist_region: return 0
+                if grp == '': return 1
                 return 2
 
-            # Prefer schedule availability, same region, higher token_overlap, then score
+            # Prefer region, then Score + Data Bonus
+            # A bonus of 40 allow decent matches (e.g. "East" variant) with data to beat 
+            # exact matches without data, but prevents garbage (e.g. "Pluto") from winning.
             ordered = sorted(
                 avail,
                 key=lambda t: (
-                    region_bucket(t[0]),              # 0/1/2
-                    not t[1],                          # has schedule first
-                    -int(t[0].get('token_overlap', 0)),
-                    -int(t[0].get('score', 0)),
+                    region_bucket(t[0]),
+                    -(int(t[0].get('score', 0)) + (40 if t[1] else 0))
                 )
             )
-            # Flatten; do NOT force original top anchor ahead of better region/schedule matches
-            matches = [m for m, _ok in ordered] + matches[20:]
+            best = ordered[0][0]
+            return best['id']
         except Exception:
-            pass
+            # Fallback to score-based top
+            return matches[0]['id'] if matches else None
 
+    def get_now_next_by_id(self, channel_id: str) -> Optional[tuple]:
+        """Retrieve (now, next) tuple for a specific, already-resolved DB channel ID."""
+        if not channel_id:
+            return None
+        
         c = self.conn.cursor()
         now = self._utcnow()
         now_str = now.strftime("%Y%m%d%H%M%S")
         now_int = int(now_str)
 
-        current_shows = []  # list of (start_int, payload)
-        next_shows = []     # list of (start_int, payload)
-        aux_map = {m["id"]: m for m in matches}
+        rows = c.execute(
+            "SELECT title, start, end FROM programmes WHERE channel_id = ? AND end > ? ORDER BY start ASC LIMIT 6",
+            (channel_id, now_str)
+        ).fetchall()
 
-        # strict interval; evaluate each candidate's own EPG at real 'now'
-        for m in matches[:30]:
-            ch_id = m['id']
-            rows = c.execute(
-                "SELECT title, start, end FROM programmes WHERE channel_id = ? AND end > ? ORDER BY start ASC LIMIT 6",
-                (ch_id, now_str)
-            ).fetchall()
-            for title, start, end in rows:
-                st_i = int(start); en_i = int(end)
-                # Current if st <= now <= en, OR if within small grace after start
-                if st_i <= now_int < en_i:
-                    current_shows.append((st_i, {
-                        'channel_id': ch_id,
-                        'title': title,
-                        'start': datetime.datetime.strptime(start, "%Y%m%d%H%M%S"),
-                        'end': datetime.datetime.strptime(end, "%Y%m%d%H%M%S")
-                    }))
-                elif st_i > now_int:
-                    next_shows.append((st_i, {
-                        'channel_id': ch_id,
-                        'title': title,
-                        'start': datetime.datetime.strptime(start, "%Y%m%d%H%M%S"),
-                        'end': datetime.datetime.strptime(end, "%Y%m%d%H%M%S")
-                    }))
+        current_shows = []
+        next_shows = []
+        
+        for title, start, end in rows:
+            st_i = int(start)
+            en_i = int(end)
+            payload = {
+                'channel_id': channel_id,
+                'title': title,
+                'start': datetime.datetime.strptime(start, "%Y%m%d%H%M%S").replace(tzinfo=datetime.timezone.utc),
+                'end': datetime.datetime.strptime(end, "%Y%m%d%H%M%S").replace(tzinfo=datetime.timezone.utc)
+            }
+            
+            if st_i <= now_int < en_i:
+                current_shows.append(payload)
+            elif st_i > now_int:
+                next_shows.append(payload)
 
-        def _rank_key(start_int: int, ch_id: str):
-            md = aux_map.get(ch_id, {})
-            score = int(md.get('score', 0))
-            tok = int(md.get('token_overlap', 0))
-            grp = (md.get('group_tag') or '').strip().lower()
-            rb = 0 if grp == _playlist_region else (1 if grp == '' else 2)
-            return (-score, -tok, rb, start_int)
-
-        now_show = None if not current_shows else sorted(current_shows, key=lambda x: _rank_key(x[0], x[1]['channel_id']))[0][1]
-
-        next_show = None
-        if next_shows:
-            if now_show:
-                sel_channel = now_show['channel_id']
-                same_channel = [item for item in next_shows if item[1]['channel_id'] == sel_channel]
-                if same_channel:
-                    same_channel.sort(key=lambda x: x[0])
-                    next_show = same_channel[0][1]
-            if next_show is None:
-                next_shows.sort(key=lambda x: _rank_key(x[0], x[1]['channel_id']))
-                next_show = next_shows[0][1]
-
-        if DEBUG:
-            sel_id = now_show['channel_id'] if now_show else None
-            sel_md = aux_map.get(sel_id, {}) if sel_id else {}
-            _logger.debug(
-                "NOW/NEXT result for '%s' -> now=%s (ch=%s) next=%s (ch=%s) (picked ch=%s score=%s grp=%s why=%s)",
-                _safe(channel.get('name')),
-                _safe(now_show['title'] if now_show else None),
-                sel_id,
-                _safe(next_show['title'] if next_show else None),
-                next_show['channel_id'] if next_show else None,
-                sel_id,
-                sel_md.get('score'),
-                sel_md.get('group_tag'),
-                _safe(sel_md.get('why'), 300)
-            )
-
-            # Warn if selected channel looks cross-region or lacks city token match
-            try:
-                pl_tokens = tokenize_channel_name(" ".join([channel.get('tvg-name',''), channel.get('name',''), channel.get('group','')]))
-                epg_disp = sel_md.get('display_name') or ''
-                epg_tokens = tokenize_channel_name(epg_disp)
-                # Tokens already filtered from brand/noise by tokenize_channel_name
-                cityish_overlap = len(pl_tokens & epg_tokens)
-                grp = (sel_md.get('group_tag') or '').strip().lower()
-                if _playlist_region and grp not in {_playlist_region, ''}:
-                    _logger.warning("NOW/NEXT for '%s' picked cross-region channel ch=%s (grp=%s vs expected=%s)", _safe(channel.get('name')), sel_id, grp, _playlist_region)
-                elif cityish_overlap == 0 and pl_tokens:
-                    _logger.warning("NOW/NEXT for '%s' picked ch=%s without city-token match; pl_tokens=%s epg_tokens=%s", _safe(channel.get('name')), sel_id, sorted(list(pl_tokens))[:5], sorted(list(epg_tokens))[:5])
-            except Exception:
-                pass
-
+        now_show = current_shows[0] if current_shows else None
+        next_show = next_shows[0] if next_shows else None
+        
+        # If we have nothing, return None to indicate no data
+        if not now_show and not next_show:
+            return None
+            
         return now_show, next_show
+
+    def get_now_next(self, channel: Dict[str, str]) -> Optional[tuple]:
+        """Legacy wrapper: resolves best ID then fetches schedule."""
+        cid = self.resolve_best_channel_id(channel)
+        if not cid:
+            if DEBUG:
+                _logger.debug("NOW/NEXT: no candidates for '%s'", _safe(channel.get('name')))
+            return None
+        return self.get_now_next_by_id(cid)
     
     def get_channels_with_show(self, query: str) -> List[Dict[str, str]]:
         q = "%" + canonicalize_name(strip_noise_words(query)) + "%"
@@ -1542,21 +1510,50 @@ class EPGDatabase:
         results.sort(key=lambda r: r["start"], reverse=True)
         return results[:limit]
 
+    def get_schedule(self, channel: Dict[str, str], start_dt: datetime.datetime, end_dt: datetime.datetime) -> List[Dict[str, str]]:
+        # Use the smart resolution logic (prefer data availability)
+        ch_id = self.resolve_best_channel_id(channel)
+        if not ch_id:
+            return []
+            
+        start_str = start_dt.strftime("%Y%m%d%H%M%S")
+        end_str = end_dt.strftime("%Y%m%d%H%M%S")
+        
+        c = self.conn.cursor()
+        rows = c.execute("""
+            SELECT title, start, end 
+            FROM programmes 
+            WHERE channel_id = ? AND end >= ? AND start <= ?
+            ORDER BY start ASC
+        """, (ch_id, start_str, end_str)).fetchall()
+        
+        results = []
+        for title, s, e in rows:
+            results.append({
+                "title": title,
+                "start": s,
+                "end": e
+            })
+        return results
+
     # =========================
     # Streaming importer with detailed debug
     # =========================
     def import_epg_xml(self, xml_sources: List[str], progress_callback=None):
         # Block until we can import; avoid user-facing warnings.
         _wait_for_import_lock(self.db_path)
-        if DEBUG and tracemalloc.is_tracing(): tracemalloc.stop()
-        tracemalloc.start()
+        trace_mem = DEBUG or os.getenv("EPG_TRACE_MEM", "0").strip().lower() in {"1", "true", "yes"}
+        if trace_mem and tracemalloc.is_tracing():
+            tracemalloc.stop()
+        if trace_mem:
+            tracemalloc.start()
 
         for p in PRAGMA_IMPORT:
             try: self.conn.execute(p)
             except Exception: pass
 
         total = len(xml_sources)
-        BATCH = 10000
+        BATCH = 15000
         grand_prog, grand_chan = 0, 0
 
         def _open_stream(src):
@@ -1657,19 +1654,13 @@ class EPGDatabase:
             lock = _acquire_download_lock(temp_path)
             success = False
 
-            def _verify_gzip_ok(path: str) -> bool:
+            def _quick_gzip_probe(path: str) -> bool:
+                """Lightweight integrity probe (read first 16KB) to avoid double full decompression."""
                 try:
                     with gzip.open(path, 'rb') as gzf:
-                        while gzf.read(1 << 18):  # 256KB chunks
-                            pass
+                        gzf.read(1 << 14)
                     return True
-                except Exception as ve:
-                    # Treat common gzip truncation/CRC errors as not-ok; others bubble to retry
-                    msg = str(ve).lower()
-                    if any(t in msg for t in (
-                        'end-of-stream marker', 'compressed file ended', 'unexpected end of data', 'crc check failed'
-                    )):
-                        return False
+                except Exception:
                     return False
 
             attempts = 0
@@ -1748,8 +1739,8 @@ class EPGDatabase:
                             resp.close()
                         except Exception:
                             pass
-                        # Verify gzip integrity; if ok, return locked stream
-                        if _verify_gzip_ok(temp_path):
+                        # Quick probe for gzip integrity; avoid full second pass
+                        if _quick_gzip_probe(temp_path):
                             stream = _TempGzipStream(temp_path, lock)
                             success = True
                             return stream
@@ -1845,7 +1836,7 @@ class EPGDatabase:
 
                     # Stream and parse
                     while True:
-                        chunk = stream.read(65536) # 64KB chunk
+                        chunk = stream.read(262144) # 256KB chunk reduces parser churn
                         if not chunk:
                             break
                         parser.feed(chunk)
@@ -1994,8 +1985,11 @@ class EPGDatabase:
             self.commit()
         except Exception as e:
             _logger.debug("EPG maintenance skipped due to lock or error: %s", e)
-        current, peak = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
+        if trace_mem:
+            current, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+        else:
+            current, peak = (0, 0)
         try:
             c = self.conn.cursor()
             row_c = c.execute("SELECT COUNT(*) FROM channels").fetchone()

@@ -1,4 +1,5 @@
 import os
+import shutil
 import json
 import socket
 import tempfile
@@ -15,6 +16,8 @@ import platform
 import time
 import subprocess
 import hashlib
+import asyncio
+import concurrent.futures
 
 import wx.adv
 
@@ -31,6 +34,7 @@ from providers import (
     StalkerPortalClient, StalkerPortalConfig,
     ProviderError, generate_provider_id
 )
+from casting import CastingManager, CastDevice, CastProtocol
 
 try:
     from internal_player import (
@@ -210,6 +214,10 @@ class IPTVClient(wx.Frame):
         self.provider_epg_sources: List[str] = []
         self._internal_player_frame: Optional[InternalPlayerFrame] = None
 
+        # Casting Manager
+        self.caster = CastingManager()
+        self.caster.start()
+
         # batch-population state to avoid UI hangs
         self._populate_token = 0
 
@@ -218,6 +226,11 @@ class IPTVClient(wx.Frame):
         # Track in-flight EPG fetches to avoid hammering get_now_next while importer is busy
         self._epg_fetch_inflight = set()
         self._epg_inflight_lock = threading.Lock()
+        
+        # Caching map: canonical_name -> db_channel_id
+        self._epg_match_cache: Dict[str, Optional[str]] = {}
+        # Dedicated executor for EPG lookups to avoid thread-spawning overhead
+        self._epg_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="EPGFetch")
 
         self._ensure_db_tuned()
         self._build_ui()
@@ -315,6 +328,8 @@ class IPTVClient(wx.Frame):
         Loads playlists from cache for a fast UI update, then refreshes from the network.
         Crucially, it only starts the EPG import *after* playlists are loaded.
         """
+        import concurrent.futures
+
         playlist_sources = self.config.get("playlists", [])
         # Ensure all provider entries have persistent IDs so we can track clients.
         mutated = False
@@ -330,12 +345,19 @@ class IPTVClient(wx.Frame):
         all_channels: List[Dict[str, str]] = []
         valid_caches = set()
         seen_channel_keys = set()
-        results: List[Optional[Dict]] = [None] * len(playlist_sources)
+        
+        # We will collect these from the workers
         provider_clients_local: Dict[str, object] = {}
         provider_epg_sources: List[str] = []
-        provider_lock = threading.Lock()
 
-        def fetch_playlist(idx, src):
+        def fetch_and_process_playlist(src):
+            result = {
+                "channels": [],
+                "clients": {},
+                "epg_sources": [],
+                "valid_cache": None,
+                "error": None
+            }
             try:
                 if isinstance(src, dict):
                     stype = (src.get("type") or "").lower()
@@ -357,19 +379,21 @@ class IPTVClient(wx.Frame):
                         cache_key = provider_id or f"xtream:{cfg.base_url}:{cfg.username}"
                         parsed_cache = self._parsed_cache_path_for_key(f"provider:{cache_key}")
                         provider_meta = {"provider-type": "xtream", "provider-id": provider_id}
-                        results[idx] = {
-                            "kind": "m3u",
-                            "text": text,
-                            "provider": provider_meta,
-                            "hash": text_hash,
-                            "cache_path": parsed_cache
-                        }
-                        with provider_lock:
-                            provider_clients_local[provider_id] = client
-                            if cfg.auto_epg:
-                                for epg in client.epg_urls():
-                                    if epg and epg not in provider_epg_sources:
-                                        provider_epg_sources.append(epg)
+                        
+                        channels = None
+                        if parsed_cache and text_hash:
+                            channels = self._load_cached_playlist(parsed_cache, text_hash, provider_meta)
+                        if channels is None:
+                            channels = self._parse_m3u_return(text, provider_info=provider_meta)
+                            if parsed_cache and text_hash:
+                                self._store_cached_playlist(parsed_cache, text_hash, channels, provider_meta)
+                        
+                        result["channels"] = channels or []
+                        result["clients"][provider_id] = client
+                        if cfg.auto_epg:
+                            for epg in client.epg_urls():
+                                if epg: result["epg_sources"].append(epg)
+
                     elif stype == "stalker":
                         cfg = StalkerPortalConfig(
                             base_url=src.get("base_url") or src.get("url") or "",
@@ -385,27 +409,28 @@ class IPTVClient(wx.Frame):
                         for ch in channels:
                             ch.setdefault("provider-id", provider_id)
                             ch.setdefault("provider-type", "stalker")
-                        results[idx] = {"kind": "channels", "channels": channels}
-                        with provider_lock:
-                            provider_clients_local[provider_id] = client
-                            for epg in epgs:
-                                if epg and epg not in provider_epg_sources:
-                                    provider_epg_sources.append(epg)
+                        
+                        result["channels"] = channels
+                        result["clients"][provider_id] = client
+                        for epg in epgs:
+                            if epg: result["epg_sources"].append(epg)
                     else:
-                        results[idx] = None
-                    return
+                        pass # Unknown dict source
+                    return result
 
                 # Plain playlist path or URL
                 if isinstance(src, str) and src.startswith(("http://", "https://")):
                     cache_path = get_cache_path_for_url(src)
                     parsed_cache = self._parsed_cache_path_for_key(src)
-                    valid_caches.add(cache_path)
+                    result["valid_cache"] = cache_path
+                    
                     download = True
                     if os.path.exists(cache_path):
                         age = (datetime.datetime.now() - datetime.datetime.fromtimestamp(os.path.getmtime(cache_path))).total_seconds()
                         if age < 15 * 60:
                             download = False
 
+                    text = ""
                     if download:
                         with urllib.request.urlopen(
                             urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"}), timeout=60
@@ -420,73 +445,67 @@ class IPTVClient(wx.Frame):
                     else:
                         with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
                             text = f.read()
+                            
                     text_hash = self._playlist_text_hash(text)
-                    results[idx] = {
-                        "kind": "m3u",
-                        "text": text,
-                        "provider": None,
-                        "hash": text_hash,
-                        "cache_path": parsed_cache
-                    }
+                    
+                    channels = None
+                    if parsed_cache and text_hash:
+                        channels = self._load_cached_playlist(parsed_cache, text_hash, provider_meta=None)
+                    if channels is None:
+                        channels = self._parse_m3u_return(text, provider_info=None)
+                        if parsed_cache and text_hash:
+                            self._store_cached_playlist(parsed_cache, text_hash, channels, provider_meta=None)
+                    
+                    result["channels"] = channels or []
+
                 elif isinstance(src, str) and os.path.exists(src):
                     with open(src, "r", encoding="utf-8", errors="ignore") as f:
                         text = f.read()
                     text_hash = self._playlist_text_hash(text)
                     cache_key = f"file:{os.path.abspath(src)}"
                     parsed_cache = self._parsed_cache_path_for_key(cache_key)
-                    results[idx] = {
-                        "kind": "m3u",
-                        "text": text,
-                        "provider": None,
-                        "hash": text_hash,
-                        "cache_path": parsed_cache
-                    }
+                    
+                    channels = None
+                    if parsed_cache and text_hash:
+                        channels = self._load_cached_playlist(parsed_cache, text_hash, provider_meta=None)
+                    if channels is None:
+                        channels = self._parse_m3u_return(text, provider_info=None)
+                        if parsed_cache and text_hash:
+                            self._store_cached_playlist(parsed_cache, text_hash, channels, provider_meta=None)
+                            
+                    result["channels"] = channels or []
                 else:
-                    results[idx] = None
+                    pass # Invalid source
             except Exception as e:
-                results[idx] = {"error": str(e)}
+                result["error"] = str(e)
+                # LOG.error(f"Error fetching playlist {src}: {e}")
+            
+            return result
 
-        threads = []
-        for idx, src in enumerate(playlist_sources):
-            t = threading.Thread(target=fetch_playlist, args=(idx, src), daemon=True)
-            t.start()
-            threads.append(t)
-
-        for t in threads:
-            t.join()
-
-        # Build channel aggregates
-        for result in results:
-            if not result:
-                continue
-            if result.get("error"):
-                continue
-            if result.get("kind") == "channels":
-                channels = result.get("channels", [])
-            else:
-                text = result.get("text")
-                if not text:
+        # Execute in parallel (fetching AND parsing)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(fetch_and_process_playlist, src) for src in playlist_sources]
+            for future in concurrent.futures.as_completed(futures):
+                res = future.result()
+                if res["error"]:
                     continue
-                cache_path = result.get("cache_path")
-                text_hash = result.get("hash")
-                provider_meta = result.get("provider")
-                channels = None
-                if cache_path and text_hash:
-                    # Reuse a parsed playlist snapshot when the raw text hasn't changed.
-                    channels = self._load_cached_playlist(cache_path, text_hash, provider_meta)
-                if channels is None:
-                    channels = self._parse_m3u_return(text, provider_info=provider_meta)
-                    if cache_path and text_hash:
-                        self._store_cached_playlist(cache_path, text_hash, channels, provider_meta)
-
-            for ch in channels or []:
-                key = (ch.get("name", ""), ch.get("url", ""), ch.get("provider-id", ""))
-                if key in seen_channel_keys:
-                    continue
-                seen_channel_keys.add(key)
-                grp = ch.get("group") or "Uncategorized"
-                channels_by_group.setdefault(grp, []).append(ch)
-                all_channels.append(ch)
+                
+                if res["valid_cache"]:
+                    valid_caches.add(res["valid_cache"])
+                
+                provider_clients_local.update(res["clients"])
+                for epg in res["epg_sources"]:
+                    if epg not in provider_epg_sources:
+                        provider_epg_sources.append(epg)
+                
+                for ch in res["channels"]:
+                    key = (ch.get("name", ""), ch.get("url", ""), ch.get("provider-id", ""))
+                    if key in seen_channel_keys:
+                        continue
+                    seen_channel_keys.add(key)
+                    grp = ch.get("group") or "Uncategorized"
+                    channels_by_group.setdefault(grp, []).append(ch)
+                    all_channels.append(ch)
 
         # Replace provider mappings atomically after successful refresh
         self.provider_clients = provider_clients_local
@@ -575,6 +594,11 @@ class IPTVClient(wx.Frame):
                 min_item.Check(self.minimize_to_tray)
                 self.Bind(wx.EVT_MENU, self.on_toggle_min_to_tray, id=min_to_tray_id)
                 menu.AppendSeparator()
+                
+                # Casting Menu Item (Linux)
+                menu.Append(1005, "Cast To...")
+                self.Bind(wx.EVT_MENU, self.show_cast_dialog, id=1005)
+                
                 menu.Append(1004, "Exit\tCtrl+Q")
                 self.Bind(wx.EVT_MENU, self.show_manager, id=1001)
                 self.Bind(wx.EVT_MENU, self.show_epg_manager, id=1002)
@@ -593,7 +617,10 @@ class IPTVClient(wx.Frame):
             m_mgr = fm.Append(wx.ID_ANY, "Playlist Manager\tCtrl+M")
             m_epg = fm.Append(wx.ID_ANY, "EPG Manager\tCtrl+E")
             m_imp = fm.Append(wx.ID_ANY, "Import EPG to DB\tCtrl+I")
-            fm.appendSeparator = fm.AppendSeparator()
+            fm.AppendSeparator()
+            # Casting Menu Item (Windows/Mac)
+            m_cast = fm.Append(wx.ID_ANY, "Cast To...")
+            fm.AppendSeparator()
             m_exit = fm.Append(wx.ID_EXIT, "Exit\tCtrl+Q")
             mb.Append(fm, "File")
             om = wx.Menu()
@@ -612,6 +639,7 @@ class IPTVClient(wx.Frame):
             self.Bind(wx.EVT_MENU, self.show_manager, m_mgr)
             self.Bind(wx.EVT_MENU, self.show_epg_manager, m_epg)
             self.Bind(wx.EVT_MENU, self.import_epg, m_imp)
+            self.Bind(wx.EVT_MENU, self.show_cast_dialog, m_cast)
             self.Bind(wx.EVT_MENU, lambda _: self.Close(), m_exit)
             for item, key in self.player_menu_items:
                 self.Bind(wx.EVT_MENU, lambda evt, attr=key: self._select_player(attr), item)
@@ -681,6 +709,11 @@ class IPTVClient(wx.Frame):
         menu = wx.Menu()
         play_item = menu.Append(wx.ID_ANY, "Play")
         menu.Bind(wx.EVT_MENU, lambda evt: self.play_selected(), play_item)
+        
+        if not self._channel_is_epg_exempt(channel):
+            epg_item = menu.Append(wx.ID_ANY, "View EPG...")
+            menu.Bind(wx.EVT_MENU, lambda evt, ch=channel: self._view_channel_epg(ch), epg_item)
+
         if self._channel_has_catchup(channel):
             catch_item = menu.Append(wx.ID_ANY, "Play Catch-up…")
             menu.Bind(wx.EVT_MENU, lambda evt, ch=channel: self._open_catchup_dialog(ch), catch_item)
@@ -688,6 +721,30 @@ class IPTVClient(wx.Frame):
             self.channel_list.PopupMenu(menu)
         finally:
             menu.Destroy()
+
+    def _view_channel_epg(self, channel: Dict[str, str]):
+        def fetch_and_show():
+            try:
+                db = EPGDatabase(get_db_path(), readonly=True)
+                now = datetime.datetime.now(datetime.timezone.utc)
+                start_dt = now - datetime.timedelta(hours=4)
+                end_dt = now + datetime.timedelta(hours=24)
+                programmes = db.get_schedule(channel, start_dt, end_dt)
+                db.close()
+                
+                wx.CallAfter(lambda: self._show_epg_dialog(channel.get("name", ""), programmes))
+            except Exception as e:
+                wx.CallAfter(lambda: wx.MessageBox(f"Error fetching EPG: {e}", "Error", wx.OK | wx.ICON_ERROR))
+
+        threading.Thread(target=fetch_and_show, daemon=True).start()
+
+    def _show_epg_dialog(self, channel_name, programmes):
+        if not programmes:
+            wx.MessageBox("No upcoming schedule found for this channel.", "EPG", wx.OK | wx.ICON_INFORMATION)
+            return
+        dlg = ChannelEPGDialog(self, channel_name, programmes)
+        dlg.ShowModal()
+        dlg.Destroy()
 
     def on_toggle_min_to_tray(self, event):
         if platform.system() == "Linux":
@@ -733,6 +790,7 @@ class IPTVClient(wx.Frame):
                 pass
             self.tray_icon.Destroy()
             self.tray_icon = None
+        self.caster.stop()
         self.Destroy()
 
     def _enable_tray_restore(self):
@@ -764,6 +822,10 @@ class IPTVClient(wx.Frame):
                 self._stop_epg_poll_timer()
             except Exception:
                 pass
+            if hasattr(self, "_epg_executor"):
+                self._epg_executor.shutdown(wait=False)
+            if self.caster:
+                self.caster.stop()
             if self.tray_icon:
                 try:
                     self.tray_icon.RemoveIcon()
@@ -987,6 +1049,8 @@ class IPTVClient(wx.Frame):
         self._stop_epg_poll_timer()
         with self.epg_cache_lock:
             self.epg_cache.clear()
+        # Clear match cache as IDs/channels may have changed in the DB
+        self._epg_match_cache.clear()
         self.on_highlight()
         self._start_epg_poll_timer()
 
@@ -1594,37 +1658,59 @@ class IPTVClient(wx.Frame):
 
     def _fetch_and_cache_epg(self, channel, cname):
         key = canonicalize_name(cname)
-        # Deduplicate inflight fetches per canonical name to avoid heavy repeated scoring during import.
         with self._epg_inflight_lock:
             if key in self._epg_fetch_inflight:
                 return
             self._epg_fetch_inflight.add(key)
-        try:
+
+        def _do_work():
             try:
                 if self._channel_is_epg_exempt(channel):
-                    now_next = None  # Do not query DB for exempt channels
-                else:
-                    db = EPGDatabase(get_db_path(), readonly=True)
-                    now_next = db.get_now_next(channel)
+                    return None, None
+                
+                db = EPGDatabase(get_db_path(), readonly=True)
+                try:
+                    # Check match cache first
+                    cached_id = self._epg_match_cache.get(key)
+                    if cached_id is None:
+                        # Resolve and cache
+                        cached_id = db.resolve_best_channel_id(channel)
+                        # Cache even if None to avoid repeated expensive misses
+                        self._epg_match_cache[key] = cached_id or ""
+                    
+                    # If we have a valid ID (and it's not the empty string marker for 'no match')
+                    if cached_id:
+                        return db.get_now_next_by_id(cached_id)
+                    return None
+                finally:
                     db.close()
             except Exception:
+                return None
+
+        def _on_done(future):
+            try:
+                now_next = future.result()
+            except Exception:
                 now_next = None
-        finally:
-            # Ensure we always remove from inflight even if DB access raised.
+            
             with self._epg_inflight_lock:
                 try:
                     self._epg_fetch_inflight.discard(key)
                 except Exception:
                     pass
 
-        if not now_next:
-            now_show, next_show = None, None
-        else:
-            now_show, next_show = now_next
+            if not now_next:
+                now_show, next_show = None, None
+            else:
+                now_show, next_show = now_next
 
-        with self.epg_cache_lock:
-            self.epg_cache[canonicalize_name(cname)] = (now_show, next_show, self._utc_now())
-        wx.CallAfter(self._update_epg_display_if_selected, channel, now_show, next_show)
+            with self.epg_cache_lock:
+                self.epg_cache[key] = (now_show, next_show, self._utc_now())
+            
+            wx.CallAfter(self._update_epg_display_if_selected, channel, now_show, next_show)
+
+        # Submit to executor instead of spawning raw thread
+        self._epg_executor.submit(_do_work).add_done_callback(_on_done)
 
     def _update_epg_display_if_selected(self, channel, now_show, next_show):
         i = self.channel_list.GetSelection()
@@ -1675,6 +1761,9 @@ class IPTVClient(wx.Frame):
     def _on_epg_poll_timer(self, event):
         # Only refresh the currently highlighted channel (cheap, targeted).
         try:
+            # Skip background polling when the window is hidden/minimised to avoid idle CPU use.
+            if not self.IsShownOnScreen() or self.IsIconized():
+                return
             i = self.channel_list.GetSelection()
             if i < 0 or i >= len(self.displayed):
                 return
@@ -2010,11 +2099,153 @@ class IPTVClient(wx.Frame):
         self._internal_player_frame = frame
         return frame
 
+    def _get_install_cmd(self, player_name):
+        system = platform.system()
+        if system == "Windows":
+            ids = {
+                "VLC": "VideoLAN.VLC",
+                "MPC": "clsid2.mpc-hc",
+                "MPC-BE": "MPC-BE.MPC-BE",
+                "Kodi": "Kodi.Kodi",
+                "Winamp": "Winamp.Winamp",
+                "Foobar2000": "PeterPawlowski.foobar2000",
+                "MPV": "mpv.mpv",
+                "SMPlayer": "smplayer.smplayer",
+                "iTunes/Apple Music": "Apple.iTunes",
+                "PotPlayer": "Daum.PotPlayer",
+                "KMPlayer": "Pandora.KMPlayer",
+                "AIMP": "AIMP.AIMP",
+                "QMPlay2": "zenyth.QMPlay2",
+                "GOM Player": "GOMLab.GOMPlayer",
+                "Clementine": "Clementine.Clementine",
+                "Strawberry": "StrawberryMusicPlayer.Strawberry"
+            }
+            if player_name in ids:
+                # Return the package ID
+                return ids[player_name]
+        elif system == "Darwin":
+            casks = {
+                "VLC": "vlc",
+                "Kodi": "kodi",
+                "MPV": "mpv",
+                "SMPlayer": "smplayer",
+                "IINA": "iina",
+                "Clementine": "clementine",
+                "Strawberry": "strawberry",
+                "QMPlay2": "qmplay2"
+            }
+            if player_name in casks:
+                return ["brew", "install", "--cask", casks[player_name]]
+        else: # Linux
+            pkgs = {
+                "VLC": "vlc",
+                "MPV": "mpv",
+                "Kodi": "kodi",
+                "SMPlayer": "smplayer",
+                "Totem": "totem",
+                "Audacious": "audacious",
+                "Clementine": "clementine",
+                "Strawberry": "strawberry",
+                "Rhythmbox": "rhythmbox",
+                "Vocal": "vocal",
+                "Celluloid": "celluloid",
+                "Haruna": "haruna"
+            }
+            if player_name in pkgs:
+                # Try generic apt/flatpak (needs terminal)
+                # We return a list of candidate commands; installer will pick one
+                p = pkgs[player_name]
+                return [
+                    f"sudo apt-get install -y {p}",
+                    f"flatpak install -y {p}",
+                    f"snap install {p}"
+                ]
+        return None
+
+    def _try_install_player(self, player_name, install_info):
+        """
+        Blocking, silent, fully automatic installation.
+        Returns True if exit code is 0.
+        """
+        system = platform.system()
+        try:
+            if system == "Windows":
+                # Winget silent install
+                # --force to ensure it doesn't prompt
+                cmd = f"winget install -e --id {install_info} --silent --force --accept-source-agreements --accept-package-agreements --disable-interactivity"
+                # CREATE_NO_WINDOW = 0x08000000
+                subprocess.run(cmd, shell=True, check=True, creationflags=0x08000000,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+
+            elif system == "Darwin":
+                # Brew silent install
+                cmd = list(install_info)
+                if "brew" in cmd:
+                    # Ensure non-interactive
+                    if "--quiet" not in cmd: cmd.append("--quiet")
+                    if "--force" not in cmd: cmd.append("--force")
+                    env = os.environ.copy()
+                    env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
+                    subprocess.run(cmd, check=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    # Fallback for raw commands
+                    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+
+            else: # Linux
+                # Try to find a working command from the candidates
+                candidates = install_info if isinstance(install_info, list) else [install_info]
+                
+                for base_cmd in candidates:
+                    # Inject non-interactive flags
+                    cmd = base_cmd
+                    if "apt" in cmd:
+                        cmd = f"DEBIAN_FRONTEND=noninteractive {cmd} -y -q"
+                    elif "flatpak" in cmd:
+                        cmd = f"{cmd} -y --noninteractive"
+                    
+                    # Try pkexec for privilege escalation without terminal window (GUI prompt)
+                    # If user is already root, pkexec is fine or unnecessary.
+                    final_cmd = cmd
+                    if shutil.which("pkexec") and os.geteuid() != 0:
+                        final_cmd = f"pkexec {cmd}"
+                    
+                    try:
+                        subprocess.run(final_cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        return True
+                    except subprocess.CalledProcessError:
+                        continue
+                return False
+
+        except Exception as e:
+            return False
+
     def _launch_stream(self, url: str, title: Optional[str] = None, *, stream_kind: str = "live", channel: Optional[Dict[str, str]] = None):
         if not url:
             wx.MessageBox("Could not find stream URL for this selection.", "Not Found",
                           wx.OK | wx.ICON_WARNING)
             return
+
+        # Check if casting
+        if self.caster.is_connected():
+            try:
+                # Run async cast play in background thread
+                def do_cast():
+                    try:
+                        self.caster.play(url, title or "IPTV Stream", channel=channel)
+                    except Exception as e:
+                        err_msg = str(e)
+                        wx.CallAfter(lambda: wx.MessageBox(f"Casting error: {err_msg}", "Error", wx.OK | wx.ICON_ERROR))
+                
+                threading.Thread(target=do_cast, daemon=True).start()
+                
+                wx.MessageBox(f"Casting to {self.caster.active_device.display_name}...", "Casting", wx.OK | wx.ICON_INFORMATION)
+                return
+            except Exception as e:
+                wx.MessageBox(f"Failed to cast: {e}", "Casting Error", wx.OK | wx.ICON_ERROR)
+                # Fallback to local player? No, user expects cast.
+                return
 
         player = self.default_player
         stream_headers = self._channel_http_headers(channel)
@@ -2147,6 +2378,35 @@ class IPTVClient(wx.Frame):
                 else: err = f"{player} is not configured for Linux."
 
         if not ok:
+            # If manual launch failed, check for auto-install capability
+            install_info = self._get_install_cmd(player)
+            if install_info:
+                # Check if we are already installing this player to avoid loops
+                if getattr(self, "_installing_player", None) == player:
+                    wx.MessageBox(f"Installation of {player} appears to have failed.", "Install Error", wx.OK | wx.ICON_ERROR)
+                    self._installing_player = None
+                    return
+
+                # Start invisible install
+                self._installing_player = player
+                old_title = self.GetTitle()
+                self.SetTitle(f"Installing {player}... please wait")
+                
+                def do_install():
+                    success = self._try_install_player(player, install_info)
+                    def on_complete():
+                        self.SetTitle(old_title)
+                        if success:
+                            # Retry launch
+                            self._launch_stream(url, title, stream_kind=stream_kind, channel=channel)
+                        else:
+                            self._installing_player = None
+                            wx.MessageBox(f"Automatic installation of {player} failed.", "Install Error", wx.OK | wx.ICON_ERROR)
+                    wx.CallAfter(on_complete)
+                
+                threading.Thread(target=do_install, daemon=True).start()
+                return
+            
             wx.MessageBox(f"Failed to launch {self.default_player}:\n{err}", "Launch Error", wx.OK | wx.ICON_ERROR)
 
     def _open_catchup_dialog(self, channel: Dict[str, str]):
@@ -2181,6 +2441,32 @@ class IPTVClient(wx.Frame):
         finally:
             dlg.Destroy()
 
+    def show_cast_dialog(self, _):
+        if self.caster.is_connected():
+            msg = f"Currently connected to: {self.caster.active_device.display_name}\n\nDisconnect?"
+            if wx.MessageBox(msg, "Casting", wx.YES_NO | wx.ICON_QUESTION) == wx.YES:
+                # Disconnect in background
+                threading.Thread(target=self.caster.disconnect, daemon=True).start()
+            return
+
+        dlg = CastDiscoveryDialog(self, self.caster)
+        if dlg.ShowModal() == wx.ID_OK:
+            device = dlg.get_selected_device()
+            if device:
+                # Connect in background
+                def do_connect():
+                    try:
+                        creds = self.config.get("cast_credentials", {}).get(device.identifier)
+                        self.caster.connect(device, credentials=creds)
+                        wx.CallAfter(lambda: wx.MessageBox(f"Connected to {device.display_name}", "Connected", wx.OK))
+                    except Exception as e:
+                        err_msg = str(e)
+                        wx.CallAfter(lambda: wx.MessageBox(f"Failed to connect: {err_msg}", "Error", wx.OK | wx.ICON_ERROR))
+                
+                threading.Thread(target=do_connect, daemon=True).start()
+        dlg.Destroy()
+
+
     def _get_catchup_programmes(self, channel: Dict[str, str]) -> List[Dict[str, str]]:
         try:
             db = EPGDatabase(get_db_path(), readonly=True)
@@ -2191,6 +2477,174 @@ class IPTVClient(wx.Frame):
         except Exception:
             programmes = []
         return programmes
+
+
+class CastDiscoveryDialog(wx.Dialog):
+    def __init__(self, parent, caster: CastingManager):
+        super().__init__(parent, title="Select Device to Cast", size=(450, 350))
+        self.parent_frame = parent
+        self.caster = caster
+        self.devices: List[CastDevice] = []
+        
+        panel = wx.Panel(self)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        self.status_lbl = wx.StaticText(panel, label="Searching for devices...")
+        self.listbox = wx.ListBox(panel, style=wx.LB_SINGLE)
+        
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        
+        self.pair_btn = wx.Button(panel, label="Pair...")
+        self.pair_btn.Disable()
+        
+        self.ok_btn = wx.Button(panel, id=wx.ID_OK, label="Connect")
+        self.ok_btn.Disable()
+        cancel_btn = wx.Button(panel, id=wx.ID_CANCEL)
+        
+        btn_sizer.Add(self.pair_btn, 0, wx.ALL, 5)
+        btn_sizer.AddStretchSpacer(1)
+        btn_sizer.Add(self.ok_btn, 0, wx.ALL, 5)
+        btn_sizer.Add(cancel_btn, 0, wx.ALL, 5)
+        
+        sizer.Add(self.status_lbl, 0, wx.ALL, 10)
+        sizer.Add(self.listbox, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        sizer.Add(btn_sizer, 0, wx.EXPAND | wx.ALL, 10)
+        
+        panel.SetSizer(sizer)
+        
+        self.listbox.Bind(wx.EVT_LISTBOX, self._on_select)
+        self.listbox.Bind(wx.EVT_LISTBOX_DCLICK, self._on_dclick)
+        self.pair_btn.Bind(wx.EVT_BUTTON, self._on_pair)
+        
+        self.CenterOnParent()
+        
+        # Start discovery
+        self._start_discovery()
+
+    def _start_discovery(self):
+        def do_scan():
+            try:
+                # caster.discover_all() is synchronous and thread-safe (uses internal loop)
+                devices = self.caster.discover_all()
+                wx.CallAfter(self._update_list, devices)
+            except Exception as e:
+                wx.CallAfter(self.status_lbl.SetLabel, f"Error: {e}")
+        
+        threading.Thread(target=do_scan, daemon=True).start()
+
+    def _update_list(self, devices: List[CastDevice]):
+        self.devices = devices
+        self.listbox.Clear()
+        if not devices:
+            self.status_lbl.SetLabel("No devices found.")
+            return
+            
+        self.status_lbl.SetLabel(f"Found {len(devices)} devices:")
+        for dev in devices:
+            self.listbox.Append(dev.display_name)
+        
+        # Restore selection if possible (not implemented for now to keep it simple)
+
+    def _on_select(self, event):
+        sel = self.listbox.GetSelection()
+        if sel != wx.NOT_FOUND:
+            self.ok_btn.Enable()
+            dev = self.devices[sel]
+            # Enable Pair button for AirPlay devices
+            self.pair_btn.Enable(dev.protocol.value == "AirPlay")
+        else:
+            self.ok_btn.Disable()
+            self.pair_btn.Disable()
+
+    def _on_dclick(self, event):
+        if self.listbox.GetSelection() != wx.NOT_FOUND:
+            self.EndModal(wx.ID_OK)
+
+    def _on_pair(self, event):
+        device = self.get_selected_device()
+        if not device:
+            return
+        
+        # Disable UI
+        self.pair_btn.Disable()
+        self.ok_btn.Disable()
+        self.status_lbl.SetLabel(f"Starting pairing with {device.name}...")
+        
+        def do_pair_flow():
+            handler = None
+            try:
+                # Step 1: Begin Pairing
+                handler = self.caster.start_pairing(device) # This is sync now
+                self.caster.dispatch(handler.begin())
+                
+                # Step 2: Ask User for PIN
+                def ask_pin():
+                    dlg = wx.TextEntryDialog(self, f"Enter PIN displayed on {device.name}:", "Pairing")
+                    if dlg.ShowModal() == wx.ID_OK:
+                        return dlg.GetValue().strip()
+                    return None
+                
+                # We need to run the dialog on main thread
+                pin_result = [None]
+                evt = threading.Event()
+                def show_dialog_main():
+                    pin_result[0] = ask_pin()
+                    evt.set()
+                
+                wx.CallAfter(show_dialog_main)
+                evt.wait()
+                
+                pin = pin_result[0]
+                if not pin:
+                    # User cancelled
+                    self.caster.dispatch(handler.close())
+                    wx.CallAfter(self.status_lbl.SetLabel, "Pairing cancelled.")
+                    return
+
+                # Step 3: Submit PIN
+                handler.pin(pin)
+                
+                # Step 4: Finish
+                self.caster.dispatch(handler.finish())
+                
+                # Step 5: Save Credentials
+                creds = handler.service.credentials
+                if creds:
+                    wx.CallAfter(self._save_creds_and_notify, device, creds)
+                else:
+                    wx.CallAfter(lambda: wx.MessageBox("Pairing finished but no credentials returned.", "Pairing Failed", wx.OK | wx.ICON_ERROR))
+                    
+            except Exception as e:
+                err_msg = str(e)
+                wx.CallAfter(lambda: wx.MessageBox(f"Pairing error: {err_msg}", "Error", wx.OK | wx.ICON_ERROR))
+                wx.CallAfter(self.status_lbl.SetLabel, f"Pairing failed: {err_msg}")
+                if handler:
+                    try:
+                        self.caster.dispatch(handler.close())
+                    except Exception:
+                        pass
+            finally:
+                wx.CallAfter(self._on_select, None) # Re-enable buttons
+        
+        threading.Thread(target=do_pair_flow, daemon=True).start()
+
+    def _save_creds_and_notify(self, device, creds):
+        # Save to main config
+        cfg = self.parent_frame.config
+        if "cast_credentials" not in cfg:
+            cfg["cast_credentials"] = {}
+        
+        cfg["cast_credentials"][device.identifier] = creds
+        save_config(cfg)
+        
+        wx.MessageBox(f"Successfully paired with {device.name}!", "Pairing Complete", wx.OK)
+        self.status_lbl.SetLabel(f"Paired with {device.name}. Ready to connect.")
+
+    def get_selected_device(self) -> Optional[CastDevice]:
+        sel = self.listbox.GetSelection()
+        if sel != wx.NOT_FOUND and 0 <= sel < len(self.devices):
+            return self.devices[sel]
+        return None
 
 
 class CatchupDialog(wx.Dialog):
@@ -2249,6 +2703,55 @@ class CatchupDialog(wx.Dialog):
         if idx == wx.NOT_FOUND or idx >= len(self.programmes):
             return None
         return self.programmes[idx]
+
+
+class ChannelEPGDialog(wx.Dialog):
+    def __init__(self, parent, channel_name: str, programmes: List[Dict[str, str]]):
+        super().__init__(parent, title=f"EPG: {channel_name}", size=(600, 450))
+        
+        panel = wx.Panel(self)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        self.list_ctrl = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.list_ctrl.InsertColumn(0, "Time", width=140)
+        self.list_ctrl.InsertColumn(1, "Title", width=400)
+        
+        self._populate_list(programmes)
+        
+        close_btn = wx.Button(panel, id=wx.ID_CANCEL, label="Close")
+        
+        sizer.Add(self.list_ctrl, 1, wx.EXPAND | wx.ALL, 10)
+        sizer.Add(close_btn, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+        
+        panel.SetSizer(sizer)
+        
+        self.Layout()
+        self.CenterOnParent()
+
+    def _populate_list(self, programmes):
+        for prog in programmes:
+            try:
+                start = datetime.datetime.strptime(prog.get("start", ""), "%Y%m%d%H%M%S").replace(tzinfo=datetime.timezone.utc)
+                end = datetime.datetime.strptime(prog.get("end", ""), "%Y%m%d%H%M%S").replace(tzinfo=datetime.timezone.utc)
+                start_local = utc_to_local(start)
+                end_local = utc_to_local(end)
+                time_str = f"{start_local.strftime('%H:%M')} - {end_local.strftime('%H:%M')}"
+                
+                # Check if this program is currently airing
+                now = datetime.datetime.now(datetime.timezone.utc)
+                is_now = start <= now <= end
+                
+                idx = self.list_ctrl.InsertItem(self.list_ctrl.GetItemCount(), time_str)
+                self.list_ctrl.SetItem(idx, 1, prog.get("title", ""))
+                
+                if is_now:
+                    # Highlight current program (bold font)
+                    font = self.list_ctrl.GetItemFont(idx)
+                    font.SetWeight(wx.FONTWEIGHT_BOLD)
+                    self.list_ctrl.SetItemFont(idx, font)
+                    self.list_ctrl.EnsureVisible(idx)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     app = wx.App()

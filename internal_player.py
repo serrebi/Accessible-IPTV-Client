@@ -65,6 +65,19 @@ def _prepare_vlc_runtime() -> None:
     _VLC_RUNTIME_PREPARED = True
 
 
+def _detect_system_http_proxy() -> Optional[str]:
+    """Return system HTTP(S) proxy if configured (Windows honours IE settings)."""
+    try:
+        proxies = urllib.request.getproxies()
+    except Exception:
+        return None
+    for key in ("http", "https"):
+        proxy = proxies.get(key)
+        if proxy:
+            return proxy
+    return None
+
+
 class InternalPlayerFrame(wx.Frame):
     """Embedded IPTV player with buffering resilience and keyboard controls."""
 
@@ -113,7 +126,7 @@ class InternalPlayerFrame(wx.Frame):
         self.base_buffer_seconds = max(6.0, min(base_value, self._max_buffer_seconds))
         self._network_cache_fraction = 0.85
         self._min_network_cache_seconds = 5.0
-        self._max_network_cache_seconds = 18.0
+        self._max_network_cache_seconds = 30.0
         self._ts_network_bias = 0.92
         self._xtream_buffer_refresh_seconds = 4.5
         self._refresh_ts_floor()
@@ -138,6 +151,9 @@ class InternalPlayerFrame(wx.Frame):
         self._early_buffer_fix_applied = False
         self._has_seen_playing = False
         self._min_buffer_event_seconds = 1.25
+
+        # Volume throttling state
+        self._last_status_prefix = "Idle"
 
         instance_opts = [
             "--quiet",
@@ -181,10 +197,12 @@ class InternalPlayerFrame(wx.Frame):
         self.video_panel.Bind(wx.EVT_LEFT_DOWN, self._on_video_panel_click)
         self.video_panel.Bind(wx.EVT_NAVIGATION_KEY, self._on_navigation_key)
         self.video_panel.Bind(wx.EVT_CHAR_HOOK, self._on_key_down)
+        self.video_panel.Bind(wx.EVT_MOUSEWHEEL, self._on_mouse_wheel)
         main_sizer.Add(self.video_panel, 1, wx.EXPAND | wx.ALL, 0)
 
         self.controls_panel = wx.Panel(panel, style=wx.TAB_TRAVERSAL)
         self.controls_panel.SetBackgroundColour(wx.BLACK)
+        self.controls_panel.Bind(wx.EVT_MOUSEWHEEL, self._on_mouse_wheel)
         controls = wx.BoxSizer(wx.HORIZONTAL)
 
         self.play_pause_btn = wx.Button(self.controls_panel, label="Pause")
@@ -347,6 +365,10 @@ class InternalPlayerFrame(wx.Frame):
         media.add_option(":clock-synchro=0")
         media.add_option(":drop-late-frames=0")
         media.add_option(":skip-frames=0")
+
+        proxy_url = _detect_system_http_proxy()
+        if proxy_url:
+            media.add_option(f":http-proxy={proxy_url}")
 
         media.add_option(f":network-caching={profile['network_ms']}")
         media.add_option(f":live-caching={profile['live_ms']}")
@@ -519,9 +541,9 @@ class InternalPlayerFrame(wx.Frame):
         return max(0.0, coerced)
 
     def _resolve_max_buffer(self, supplied: Optional[float], base_value: float) -> float:
-        raw_max = self._coerce_seconds(supplied if supplied is not None else 18.0, fallback=18.0)
+        raw_max = self._coerce_seconds(supplied if supplied is not None else 30.0, fallback=30.0)
         if raw_max <= 0.0:
-            raw_max = 18.0
+            raw_max = 30.0
         resolved = max(6.0, raw_max)
         if resolved < 6.0:
             resolved = 6.0
@@ -779,34 +801,37 @@ class InternalPlayerFrame(wx.Frame):
         if is_linear_ts:
             cache_fraction = max(cache_fraction, self._ts_network_bias)
 
+        # Simplified buffer logic: respect base buffer and scale up if needed, but never cap below base.
+        # High bitrate streams on gigabit connections benefit from larger buffers, not smaller ones.
         if bitrate is None:
             raw_target = max(base, 12.0)
-            if is_linear_ts:
-                raw_target = max(raw_target, self._ts_buffer_floor)
-        elif bitrate <= 1.5:
-            raw_target = max(base, 20.0)
-        elif bitrate <= 3.0:
-            raw_target = max(base, 16.0)
-        elif bitrate <= 8.0:
-            raw_target = max(base, 12.0)
-        elif bitrate <= 25.0:
-            raw_target = max(base, 10.0)
+        elif bitrate <= 5.0:
+            # Low bitrate: keep generous buffer
+            raw_target = max(base, 15.0)
         else:
-            raw_target = max(8.0, min(base, 12.0))
-        if is_linear_ts and bitrate is not None and bitrate <= 12.0:
+            # Higher bitrate: ensure we have at least 'base' or 12s, whichever is higher
+            raw_target = max(base, 12.0)
+            
+        if is_linear_ts:
             raw_target = max(raw_target, self._ts_buffer_floor)
 
         target = min(self._max_buffer_seconds, max(base, raw_target))
-        network_candidate = max(target - 0.75, target * cache_fraction)
+        
+        # Allow network cache to take up most of the buffer time
+        network_candidate = max(target - 0.5, target * cache_fraction)
         network_target = max(self._min_network_cache_seconds, network_candidate)
         network_target = min(network_target, self._max_network_cache_seconds, target)
         network_ms = int(network_target * 1000)
+        
         file_pad = 6.0 if is_linear_ts else 4.0
         live_pad = 4.0 if is_linear_ts else 2.5
         disc_pad = file_pad
+        
+        # Calculate file caching layer
         file_cache_target = max(target + file_pad, network_target + (file_pad + 2.0))
         file_cache = max(4000, int(file_cache_target * 1000))
-        demux_cap = 28.0 if is_linear_ts else 24.0
+        
+        demux_cap = 45.0 if is_linear_ts else 40.0
         profile = {
             "network_ms": network_ms,
             "live_ms": int(max(target + live_pad, network_target + (live_pad + 1.5)) * 1000),
@@ -1026,13 +1051,35 @@ class InternalPlayerFrame(wx.Frame):
         except Exception:
             pass
 
-    def _update_status_label(self, prefix: str = "") -> None:
+    def _update_status_label(self, prefix: str = "", volume_override: Optional[int] = None) -> None:
         bitrate_txt = ""
         if self._last_bitrate_mbps:
             bitrate_txt = f" | ~{self._last_bitrate_mbps:.1f} Mbps"
         buf_txt = f"{self._last_buffer_seconds:.1f}s buffer"
-        vol_txt = f" | Vol {self._volume_value}%"
-        label = f"{prefix}{(' ' if prefix else '')}{buf_txt}{bitrate_txt}{vol_txt}"
+        
+        vol = int(self._volume_value) if volume_override is None else volume_override
+        vol_txt = f" | Vol {vol}%"
+        
+        # If prefix is empty, try to preserve existing prefix from label? 
+        # No, caller usually knows state. If called from volume update, we might lose state info ("Buffering...").
+        # But `_perform_update` doesn't know the state.
+        # We should store `_current_state_prefix` in the class to update label correctly.
+        # But for now, let's just update if we can.
+        # Actually, if prefix is "", we might be erasing "Buffering...".
+        # Let's add `self._last_status_prefix` to __init__ and use it.
+        
+        current_lbl = self.status_label.GetLabel()
+        # Hacky heuristic: if prefix arg is empty, try to keep the existing prefix text (everything before " X.Xs buffer")
+        # But simpler is to just use a stored state variable.
+        
+        # Let's assume the user is okay with just "Vol XX%" updating if we don't have state.
+        # Or better: `buf_txt` is always generated fresh.
+        
+        real_prefix = prefix if prefix else getattr(self, "_last_status_prefix", "Idle")
+        if prefix:
+            self._last_status_prefix = prefix
+            
+        label = f"{real_prefix}{(' ' if real_prefix else '')}{buf_txt}{bitrate_txt}{vol_txt}"
         self.status_label.SetLabel(label.strip())
 
     def _on_timer(self, _event: wx.TimerEvent) -> None:
@@ -1139,17 +1186,29 @@ class InternalPlayerFrame(wx.Frame):
         self._focus_control_step(event.GetDirection())
         event.Skip(False)
 
+    def _on_mouse_wheel(self, event: wx.MouseEvent) -> None:
+        rot = event.GetWheelRotation()
+        if rot > 0:
+            self._adjust_volume(2)
+        elif rot < 0:
+            self._adjust_volume(-2)
+
     def _on_key_down(self, event: wx.KeyEvent) -> None:
         key = event.GetKeyCode()
         if key == wx.WXK_TAB:
             self._focus_control_step(not event.ShiftDown())
             return
+        
+        # Volume control with optional Ctrl modifier for speed
         if key in (wx.WXK_UP, wx.WXK_NUMPAD_UP):
-            self._adjust_volume(+5)
+            step = 5 if event.ControlDown() else 2
+            self._adjust_volume(step)
             return
         if key in (wx.WXK_DOWN, wx.WXK_NUMPAD_DOWN):
-            self._adjust_volume(-5)
+            step = 5 if event.ControlDown() else 2
+            self._adjust_volume(-step)
             return
+            
         if key == wx.WXK_F11:
             self._set_fullscreen(not self._fullscreen)
             return
@@ -1183,34 +1242,29 @@ class InternalPlayerFrame(wx.Frame):
             value = int(self.volume_slider.GetValue())
         except Exception:
             return
-        self._volume_value = max(0, min(100, value))
-        try:
-            self.player.audio_set_volume(self._volume_value)
-        except Exception:
-            pass
-        self._update_status_label()
+        self._apply_volume(value)
         event.Skip(False)
 
     def _adjust_volume(self, delta: int) -> None:
-        # Plex-style: fixed 5% steps, no acceleration.
-        base_step = 5
-        self._volume_ramp = 0
-        self._volume_last_dir = 1 if delta > 0 else -1 if delta < 0 else 0
-        self._volume_last_ts = time.monotonic()
-        applied_delta = base_step if delta >= 0 else -base_step
+        new_val = max(0, min(100, self._volume_value + delta))
+        if new_val != self._volume_value:
+            self._apply_volume(new_val)
+
+    def _apply_volume(self, value: float) -> None:
+        self._volume_value = value
+        ival = int(value)
+        
+        # 1. Update UI immediately
+        self._update_status_label()
+        if self.volume_slider.GetValue() != ival:
+            self.volume_slider.SetValue(ival)
+            
+        # 2. Apply to VLC immediately
+        # Simple, direct, synchronous call.
         try:
-            current = self.player.audio_get_volume()
-        except Exception:
-            current = -1
-        if current >= 0:
-            self._volume_value = current
-        self._volume_value = max(0, min(100, self._volume_value + applied_delta))
-        try:
-            self.player.audio_set_volume(self._volume_value)
+            self.player.audio_set_volume(ival)
         except Exception:
             pass
-        self._update_status_label()
-        self._sync_volume_slider()
 
     def _set_fullscreen(self, enable: bool) -> None:
         enable = bool(enable)
