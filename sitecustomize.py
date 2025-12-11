@@ -76,7 +76,7 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
         def __init__(
             self,
             parent: Optional[wx.Window],
-            base_buffer_seconds: float = 12.0,
+            base_buffer_seconds: float = 0.0,
             max_buffer_seconds: Optional[float] = None,
             variant_max_mbps: Optional[float] = None,
             on_close: Optional[Callable[[], None]] = None,
@@ -113,9 +113,10 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
             self._last_restart_reason = ""
             self._buffer_step_seconds = 2.0
             self._max_buffer_seconds = self._resolve_max_buffer(max_buffer_seconds, base_value)
-            self.base_buffer_seconds = max(6.0, min(base_value, self._max_buffer_seconds))
-            self._network_cache_fraction = 0.85
-            self._min_network_cache_seconds = 5.0
+            self.base_buffer_seconds = min(base_value, self._max_buffer_seconds)
+            self._network_cache_fraction = 0.75
+            # Keep at least ~6 seconds of network buffer once playing.
+            self._min_network_cache_seconds = 6.0
             self._max_network_cache_seconds = 18.0
             self._ts_network_bias = 0.92
             self._refresh_ts_floor()
@@ -350,7 +351,7 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
                 seconds = float(seconds)
             except Exception:
                 return
-            self.base_buffer_seconds = max(6.0, min(seconds, self._max_buffer_seconds))
+            self.base_buffer_seconds = min(seconds, self._max_buffer_seconds)
             self._refresh_ts_floor()
             self._update_cache_bounds()
 
@@ -535,28 +536,43 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
 
         def _resolve_max_buffer(self, supplied: Optional[float], base_value: float) -> float:
             raw_max = self._coerce_seconds(supplied if supplied is not None else 18.0, fallback=18.0)
-            if raw_max <= 0.0:
-                raw_max = 18.0
-            resolved = max(6.0, raw_max)
-            if resolved < 6.0:
-                resolved = 6.0
+            if raw_max < 0.0:
+                raw_max = 0.0
+            resolved = raw_max
             if resolved < base_value:
-                return max(6.0, base_value)
+                return base_value
             return resolved
 
         def _update_cache_bounds(self) -> None:
-            upper = max(self.base_buffer_seconds * 0.95, self.base_buffer_seconds + 8.0, 12.0)
+            """Recalculate network cache bounds for low-latency startup.
+
+            We keep the network cache tight so streams join quickly, but never
+            drop it below ~6 seconds to avoid constant rebuffering on flaky
+            providers.
+            """
+            upper = max(self.base_buffer_seconds + 3.0, 9.0)
             ts_floor = getattr(self, "_ts_buffer_floor", None)
             if ts_floor:
                 upper = max(upper, ts_floor)
-            upper = min(self._max_buffer_seconds, upper)
-            lower = min(upper - 2.0, upper * 0.6)
-            lower = max(5.0, lower)
+            # Never exceed either the configured max buffer or a sane hard cap.
+            upper = min(self._max_buffer_seconds, upper, 18.0)
+            # Lower bound sits slightly under the upper bound but not below 6s.
+            lower = min(upper - 1.0, upper * 0.75)
+            lower = max(6.0, lower)
             self._max_network_cache_seconds = upper
-            self._min_network_cache_seconds = lower
+            # Always clamp network caching to be at least ~6 seconds.
+            self._min_network_cache_seconds = 6.0
 
         def _refresh_ts_floor(self) -> None:
-            self._ts_buffer_floor = min(self._max_buffer_seconds, max(self.base_buffer_seconds + 6.0, 18.0))
+            """Set the floor for linear .ts live streams.
+
+            Xtream/linear TS gets a bit more headroom than other streams, but
+            we keep it close to the base buffer so startup latency stays low.
+            """
+            self._ts_buffer_floor = min(
+                self._max_buffer_seconds,
+                max(self.base_buffer_seconds + 2.0, 8.0),
+            )
 
         @staticmethod
         def _sanitize_variant_cap(value: Optional[float]) -> Optional[float]:
@@ -799,30 +815,33 @@ if wx is not None and _ip is not None and hasattr(_ip, "InternalPlayerFrame"):
                 cache_fraction = max(cache_fraction, self._ts_network_bias)
 
             if bitrate is None:
-                raw_target = max(base, 12.0)
-                if is_linear_ts:
-                    raw_target = max(raw_target, self._ts_buffer_floor)
-            elif bitrate <= 1.5:
-                raw_target = max(base, 20.0)
+                # Unknown bitrate: keep the total buffer small but safe.
+                raw_target = max(base, 8.0 if is_linear_ts else 7.0)
             elif bitrate <= 3.0:
-                raw_target = max(base, 16.0)
-            elif bitrate <= 8.0:
-                raw_target = max(base, 12.0)
-            elif bitrate <= 25.0:
-                raw_target = max(base, 10.0)
+                # Very low bitrate streams tend to be bursty; add a little headroom.
+                raw_target = max(base, 9.0 if is_linear_ts else 7.5)
+            elif bitrate <= 12.0:
+                raw_target = max(base, 9.0 if is_linear_ts else 7.0)
             else:
-                raw_target = max(8.0, min(base, 12.0))
-            if is_linear_ts and bitrate is not None and bitrate <= 12.0:
+                # High bitrate on fast links: favour low latency over huge buffers.
+                raw_target = max(base, 8.0 if is_linear_ts else 6.5)
+
+            if is_linear_ts:
                 raw_target = max(raw_target, self._ts_buffer_floor)
 
             target = min(self._max_buffer_seconds, max(base, raw_target))
-            network_candidate = max(target - 0.75, target * cache_fraction)
-            network_target = max(self._min_network_cache_seconds, network_candidate)
+
+            # Keep at least ~6 seconds of network buffer but avoid huge prebuffer
+            # so the channel starts quickly.
+            network_target = target * self._network_cache_fraction
+            network_target = max(self._min_network_cache_seconds, network_target)
             network_target = min(network_target, self._max_network_cache_seconds, target)
             network_ms = int(network_target * 1000)
+
             file_pad = 6.0 if is_linear_ts else 4.0
             live_pad = 4.0 if is_linear_ts else 2.5
             disc_pad = file_pad
+
             file_cache_target = max(target + file_pad, network_target + (file_pad + 2.0))
             file_cache = max(4000, int(file_cache_target * 1000))
             demux_cap = 28.0 if is_linear_ts else 24.0

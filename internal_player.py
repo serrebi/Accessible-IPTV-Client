@@ -86,7 +86,7 @@ class InternalPlayerFrame(wx.Frame):
     def __init__(
         self,
         parent: Optional[wx.Window],
-        base_buffer_seconds: float = 12.0,
+        base_buffer_seconds: float = 0.0,
         max_buffer_seconds: Optional[float] = None,
         variant_max_mbps: Optional[float] = None,
         on_close: Optional[Callable[[], None]] = None,
@@ -96,7 +96,7 @@ class InternalPlayerFrame(wx.Frame):
             raise InternalPlayerUnavailableError("python-vlc (libVLC) is not available.")
         super().__init__(parent, title="Built-in IPTV Player", size=(960, 540))
         self._on_close_cb = on_close
-        base_value = self._coerce_seconds(base_buffer_seconds, fallback=12.0)
+        base_value = self._coerce_seconds(base_buffer_seconds, fallback=0.0)
         self._last_bitrate_mbps: Optional[float] = None
         self._current_url: Optional[str] = None
         self._current_title: str = ""
@@ -121,21 +121,21 @@ class InternalPlayerFrame(wx.Frame):
         self._max_reconnect_attempts = 4
         self._last_restart_ts = 0.0
         self._last_restart_reason = ""
-        self._buffer_step_seconds = 2.0
+        self._buffer_step_seconds = 0.0
         self._max_buffer_seconds = self._resolve_max_buffer(max_buffer_seconds, base_value)
-        self.base_buffer_seconds = max(6.0, min(base_value, self._max_buffer_seconds))
-        self._network_cache_fraction = 0.85
-        self._min_network_cache_seconds = 5.0
-        self._max_network_cache_seconds = 30.0
-        self._ts_network_bias = 0.92
-        self._xtream_buffer_refresh_seconds = 4.5
+        self.base_buffer_seconds = max(0.0, min(base_value, self._max_buffer_seconds))
+        self._network_cache_fraction = 0.0
+        self._min_network_cache_seconds = 0.0
+        self._max_network_cache_seconds = 0.0
+        self._ts_network_bias = 0.0
+        self._xtream_buffer_refresh_seconds = 0.0
         self._refresh_ts_floor()
         self._update_cache_bounds()
         self._last_buffer_seconds: float = self.base_buffer_seconds
         self._variant_max_mbps: Optional[float] = self._sanitize_variant_cap(variant_max_mbps)
         self._last_variant_url: Optional[str] = None
         self._buffering_events: Deque[float] = deque(maxlen=20)
-        self._choppy_window_seconds = 25.0
+        self._choppy_window_seconds = 0.0
         self._choppy_threshold = 4
         self._choppy_cooldown = 20.0
         self._last_adjust_ts = 0.0
@@ -353,7 +353,7 @@ class InternalPlayerFrame(wx.Frame):
             seconds = float(seconds)
         except Exception:
             return
-        self.base_buffer_seconds = max(6.0, min(seconds, self._max_buffer_seconds))
+        self.base_buffer_seconds = min(seconds, self._max_buffer_seconds)
         self._refresh_ts_floor()
         self._update_cache_bounds()
 
@@ -542,28 +542,19 @@ class InternalPlayerFrame(wx.Frame):
 
     def _resolve_max_buffer(self, supplied: Optional[float], base_value: float) -> float:
         raw_max = self._coerce_seconds(supplied if supplied is not None else 30.0, fallback=30.0)
-        if raw_max <= 0.0:
-            raw_max = 30.0
-        resolved = max(6.0, raw_max)
-        if resolved < 6.0:
-            resolved = 6.0
+        if raw_max < 0.0:
+            raw_max = 0.0
+        resolved = raw_max
         if resolved < base_value:
-            return max(6.0, base_value)
+            return base_value
         return resolved
 
     def _update_cache_bounds(self) -> None:
-        upper = max(self.base_buffer_seconds * 0.95, self.base_buffer_seconds + 8.0, 12.0)
-        ts_floor = getattr(self, "_ts_buffer_floor", None)
-        if ts_floor:
-            upper = max(upper, ts_floor)
-        upper = min(self._max_buffer_seconds, upper)
-        lower = min(upper - 2.0, upper * 0.6)
-        lower = max(5.0, lower)
-        self._max_network_cache_seconds = upper
-        self._min_network_cache_seconds = lower
+        self._max_network_cache_seconds = self._max_buffer_seconds
+        self._min_network_cache_seconds = self.base_buffer_seconds
 
     def _refresh_ts_floor(self) -> None:
-        self._ts_buffer_floor = min(self._max_buffer_seconds, max(self.base_buffer_seconds + 6.0, 18.0))
+        self._ts_buffer_floor = min(self._max_buffer_seconds, self.base_buffer_seconds)
 
     @staticmethod
     def _sanitize_variant_cap(value: Optional[float]) -> Optional[float]:

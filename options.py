@@ -196,9 +196,9 @@ def _apply_internal_player_bounds(cfg: Dict) -> None:
         max_val = float(max_val)
     except Exception:
         max_val = 60.0
-    if max_val <= 0:
-        max_val = 60.0
-    max_val = max(6.0, min(max_val, 300.0))  # Allow up to 5 mins buffer for stability
+    if max_val < 0:
+        max_val = 0.0
+    max_val = min(max_val, 300.0)  # Allow up to 5 mins buffer for stability
     cfg["internal_player_max_buffer_seconds"] = max_val
 
     base_val = cfg.get("internal_player_buffer_seconds", 4.0)
@@ -230,8 +230,8 @@ def load_config() -> Dict:
         "epgs": [],
         "media_player": "VLC",
         "custom_player_path": "",
-        "internal_player_buffer_seconds": 4.0,
-        "internal_player_max_buffer_seconds": 60.0,
+        "internal_player_buffer_seconds": 0.0,
+        "internal_player_max_buffer_seconds": 0.0,
         "internal_player_variant_max_mbps": 0.0,
         "minimize_to_tray": False,
         "epg_enabled": True,

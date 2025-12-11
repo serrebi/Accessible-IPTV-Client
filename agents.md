@@ -1,4 +1,4 @@
-﻿You are a professional windows python developer with a decade of IPTV app experience. Always fully investigate things before applying a fix. If you learn anything new, write it in this file.
+﻿﻿You are a professional windows python developer with a decade of IPTV app experience. Always fully investigate things before applying a fix. If you learn anything new, write it in this file.
 You are root and you can install and use whatever you need to on windows or with pip3. You can use any package manager, like winget, pip3, or anything you need.
 
 ## Project Overview
@@ -44,3 +44,5 @@ wxPython>=4.2.1 (GUI), python-vlc (built-in player), psutil optional for memory 
 **Update 2025-12-01**: Volume control refined to 2% steps for finer precision (5% with Ctrl modifier) and now supports mouse wheel input with rate-limiting to prevent UI lag. Internal player buffering logic updated to remove artificial caps on high-bitrate streams, better utilizing high-speed (gigabit) connections with buffers up to 300s. Playlist loading refactored to use parallel threads for both fetching and parsing, significantly reducing startup time with multiple sources.
 
 **Update 2025-12-01**: Refactored `CastingManager` to run a persistent background thread with its own `asyncio` loop. Previous implementation spun up ephemeral loops for each action, which caused `RuntimeError` with libraries like `pyatv` and `aiohttp` that bind objects to the loop they were created in. All cast operations now dispatch synchronously to this background loop.
+
+**Update 2025-12-10**: Internal player buffering retuned for low-latency startup. Network caching now targets roughly 6–8 seconds for live streams (including Xtream `.ts`), so channels join faster while still maintaining at least ~6 seconds of buffered content once playback has started to avoid constant rebuffering.

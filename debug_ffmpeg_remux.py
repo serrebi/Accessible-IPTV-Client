@@ -36,8 +36,7 @@ def test_remux():
         cmd, 
         stdout=subprocess.DEVNULL, 
         stderr=subprocess.PIPE, 
-        universal_newlines=True,
-        bufsize=1
+        bufsize=0
     )
     
     print("Process started. Monitoring for 60 seconds...")

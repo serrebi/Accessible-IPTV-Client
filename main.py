@@ -2078,13 +2078,13 @@ class IPTVClient(wx.Frame):
         try:
             base_buffer = float(self.config.get("internal_player_buffer_seconds", 12.0))
         except Exception:
-            base_buffer = 12.0
+            base_buffer = 0.0
         try:
-            max_buffer = float(self.config.get("internal_player_max_buffer_seconds", 18.0))
+            max_buffer = float(self.config.get("internal_player_max_buffer_seconds", 0.0))
         except Exception:
-            max_buffer = 18.0
+            max_buffer = 0.0
         if max_buffer <= 0:
-            max_buffer = 18.0
+            max_buffer = 0.0
         try:
             variant_cap = float(self.config.get("internal_player_variant_max_mbps", 0.0))
         except Exception:
