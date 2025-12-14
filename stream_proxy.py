@@ -81,7 +81,12 @@ class HLSConverter:
         ])
 
         LOG.info(f"Starting ffmpeg remux to {self.temp_dir}")
-        creation_flags = 0x08000000 if os.name == 'nt' else 0
+
+        if not shutil.which("ffmpeg"):
+            LOG.error("ffmpeg not found in PATH. Transcoding impossible.")
+            return
+
+        creation_flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
         try:
             self.process = subprocess.Popen(cmd, creationflags=creation_flags)
         except Exception as e:
@@ -283,7 +288,7 @@ class StreamProxyHandler(http.server.BaseHTTPRequestHandler):
                             if not chunk:
                                 break
                             self.wfile.write(chunk)
-                    except BrokenPipeError:
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                         pass
                     except Exception as e:
                         LOG.error("Error writing to client: %s", e)

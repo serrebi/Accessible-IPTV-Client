@@ -46,3 +46,5 @@ wxPython>=4.2.1 (GUI), python-vlc (built-in player), psutil optional for memory 
 **Update 2025-12-01**: Refactored `CastingManager` to run a persistent background thread with its own `asyncio` loop. Previous implementation spun up ephemeral loops for each action, which caused `RuntimeError` with libraries like `pyatv` and `aiohttp` that bind objects to the loop they were created in. All cast operations now dispatch synchronously to this background loop.
 
 **Update 2025-12-10**: Internal player buffering retuned for low-latency startup. Network caching now targets roughly 6–8 seconds for live streams (including Xtream `.ts`), so channels join faster while still maintaining at least ~6 seconds of buffered content once playback has started to avoid constant rebuffering.
+
+**Update 2025-12-12**: Removed the `sitecustomize.py` monkey-patch that re-implemented the internal player. `sitecustomize` now just re-exports the canonical `InternalPlayerFrame` from `internal_player.py` to avoid drift and duplicated buffering logic.

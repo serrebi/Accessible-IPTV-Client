@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import hashlib
+from dataclasses import dataclass
 import datetime
 import re
 import time
@@ -223,6 +224,37 @@ def _apply_internal_player_bounds(cfg: Dict) -> None:
         variant_cap = max(0.25, min(variant_cap, 500.0))
     cfg["internal_player_variant_max_mbps"] = variant_cap
 
+
+@dataclass(frozen=True)
+class InternalPlayerSettings:
+    base_buffer_seconds: float
+    max_buffer_seconds: float
+    variant_max_mbps: float
+
+    def as_dict(self) -> Dict[str, float]:
+        return {
+            "internal_player_buffer_seconds": self.base_buffer_seconds,
+            "internal_player_max_buffer_seconds": self.max_buffer_seconds,
+            "internal_player_variant_max_mbps": self.variant_max_mbps,
+        }
+
+
+def resolve_internal_player_settings(cfg: Dict) -> InternalPlayerSettings:
+    """
+    Normalize internal player buffer/variant settings and sync them back to cfg.
+    This keeps a single place that clamps values before they reach the player.
+    """
+    if cfg is None:
+        cfg = {}
+    _apply_internal_player_bounds(cfg)
+    settings = InternalPlayerSettings(
+        base_buffer_seconds=float(cfg["internal_player_buffer_seconds"]),
+        max_buffer_seconds=float(cfg["internal_player_max_buffer_seconds"]),
+        variant_max_mbps=float(cfg["internal_player_variant_max_mbps"]),
+    )
+    cfg.update(settings.as_dict())
+    return settings
+
 def load_config() -> Dict:
     global _CONFIG_PATH
     default = {
@@ -235,8 +267,9 @@ def load_config() -> Dict:
         "internal_player_variant_max_mbps": 0.0,
         "minimize_to_tray": False,
         "epg_enabled": True,
+        "show_player_on_enter": True,
     }
-    _apply_internal_player_bounds(default)
+    resolve_internal_player_settings(default)
     for p in get_config_read_candidates():
         if os.path.exists(p):
             try:
@@ -248,7 +281,7 @@ def load_config() -> Dict:
                         data.setdefault(k, v)
                     if data.get("internal_player_buffer_seconds") == 12.0:
                         data["internal_player_buffer_seconds"] = 2.0
-                    _apply_internal_player_bounds(data)
+                    resolve_internal_player_settings(data)
                     _CONFIG_PATH = p
                     return data
             except Exception as e:
@@ -265,7 +298,7 @@ def load_config() -> Dict:
 
 def save_config(cfg: Dict):
     global _CONFIG_PATH
-    _apply_internal_player_bounds(cfg)
+    resolve_internal_player_settings(cfg)
     path = get_config_write_target()
     try:
         # Ensure the directory exists before writing; skip if writing to CWD

@@ -90,12 +90,15 @@ class InternalPlayerFrame(wx.Frame):
         max_buffer_seconds: Optional[float] = None,
         variant_max_mbps: Optional[float] = None,
         on_close: Optional[Callable[[], None]] = None,
+        on_cast: Optional[Callable[[str, str, Dict[str, object]], None]] = None,
     ) -> None:
         _prepare_vlc_runtime()
         if vlc is None:
             raise InternalPlayerUnavailableError("python-vlc (libVLC) is not available.")
         super().__init__(parent, title="Built-in IPTV Player", size=(960, 540))
         self._on_close_cb = on_close
+        self._on_cast_cb = on_cast
+        self._allow_close = False
         base_value = self._coerce_seconds(base_buffer_seconds, fallback=0.0)
         self._last_bitrate_mbps: Optional[float] = None
         self._current_url: Optional[str] = None
@@ -147,6 +150,16 @@ class InternalPlayerFrame(wx.Frame):
         self._restart_cooldown = 2.0
         self._reconnect_reset_window = 120.0
         self._end_near_threshold_ms = 10_000
+        # Sensible defaults for servers that expect browser-like headers.
+        self._default_user_agent = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/118.0.0.0 Safari/537.36"
+        )
+        self._default_accept = (
+            "application/x-mpegURL,application/vnd.apple.mpegurl,"
+            "application/json,text/plain,*/*"
+        )
         self._buffer_start_ts: Optional[float] = None
         self._early_buffer_fix_applied = False
         self._has_seen_playing = False
@@ -215,6 +228,11 @@ class InternalPlayerFrame(wx.Frame):
         self.stop_btn.Bind(wx.EVT_NAVIGATION_KEY, self._on_navigation_key)
         self.stop_btn.Bind(wx.EVT_CHAR_HOOK, self._on_key_down)
 
+        self.cast_btn = wx.Button(self.controls_panel, label="Cast")
+        self.cast_btn.Bind(wx.EVT_BUTTON, self._on_cast)
+        self.cast_btn.Bind(wx.EVT_NAVIGATION_KEY, self._on_navigation_key)
+        self.cast_btn.Bind(wx.EVT_CHAR_HOOK, self._on_key_down)
+
         self.fullscreen_btn = wx.Button(self.controls_panel, label="Full Screen")
         self.fullscreen_btn.Bind(wx.EVT_BUTTON, self._on_toggle_fullscreen)
         self.fullscreen_btn.Bind(wx.EVT_NAVIGATION_KEY, self._on_navigation_key)
@@ -231,6 +249,7 @@ class InternalPlayerFrame(wx.Frame):
 
         controls.Add(self.play_pause_btn, 0, wx.ALL, 5)
         controls.Add(self.stop_btn, 0, wx.ALL, 5)
+        controls.Add(self.cast_btn, 0, wx.ALL, 5)
         controls.Add(self.fullscreen_btn, 0, wx.ALL, 5)
         # Expand horizontally; avoid mixing ALIGN_* with EXPAND to prevent wx assertions.
         controls.Add(self.volume_slider, 1, wx.ALL | wx.EXPAND, 5)
@@ -249,9 +268,12 @@ class InternalPlayerFrame(wx.Frame):
         self._controls_focus_order = [
             self.play_pause_btn,
             self.stop_btn,
+            self.cast_btn,
             self.fullscreen_btn,
             self.volume_slider,
         ]
+
+        self._build_menu_bar()
 
         self._status_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_timer, self._status_timer)
@@ -259,6 +281,29 @@ class InternalPlayerFrame(wx.Frame):
         wx.CallAfter(self._ensure_player_window)
         wx.CallAfter(self.play_pause_btn.SetFocus)
         self._update_status_label("Idle")
+
+    def _build_menu_bar(self) -> None:
+        menu_bar = wx.MenuBar()
+
+        playback_menu = wx.Menu()
+        m_play_pause = playback_menu.Append(wx.ID_ANY, "Play/Pause\tCtrl+P")
+        m_stop = playback_menu.Append(wx.ID_ANY, "Stop\tCtrl+S")
+        playback_menu.AppendSeparator()
+        m_cast = playback_menu.Append(wx.ID_ANY, "Cast...\tCtrl+C")
+        m_full = playback_menu.Append(wx.ID_ANY, "Toggle Full Screen\tF11")
+        playback_menu.AppendSeparator()
+        m_hide = playback_menu.Append(wx.ID_ANY, "Hide Window\tCtrl+W")
+        m_exit = playback_menu.Append(wx.ID_EXIT, "Exit Player\tCtrl+Q")
+
+        self.Bind(wx.EVT_MENU, lambda _evt: self._on_toggle_pause(), m_play_pause)
+        self.Bind(wx.EVT_MENU, lambda _evt: self.stop(manual=True), m_stop)
+        self.Bind(wx.EVT_MENU, lambda _evt: self._on_cast(), m_cast)
+        self.Bind(wx.EVT_MENU, lambda _evt: self._on_toggle_fullscreen(), m_full)
+        self.Bind(wx.EVT_MENU, lambda _evt: self._hide_player(), m_hide)
+        self.Bind(wx.EVT_MENU, lambda _evt: self._exit_player(), m_exit)
+
+        menu_bar.Append(playback_menu, "&Playback")
+        self.SetMenuBar(menu_bar)
 
     # ------------------------------------------------------------------ public
     def play(
@@ -269,6 +314,7 @@ class InternalPlayerFrame(wx.Frame):
         stream_kind: Optional[str] = None,
         headers: Optional[Dict[str, object]] = None,
         _retry: bool = False,
+        video_visible: bool = True,
     ) -> None:
         """Start playback of the given URL with buffering and recovery hooks."""
         if self._destroyed:
@@ -315,12 +361,31 @@ class InternalPlayerFrame(wx.Frame):
         media = self.instance.media_new(playback_url)
         self._apply_cache_options(media, cache_profile)
         self._apply_stream_headers(media, merged_headers)
+        if not video_visible:
+            media.add_option(":no-video")
+            media.add_option(":vout=dummy")
+            media.add_option(":intf=dummy")
         try:
             self.player.stop()
         except Exception:
             pass
         self.player.set_media(media)
-        self._ensure_player_window()
+        if video_visible:
+            self._ensure_player_window()
+        else:
+            # Prevent libVLC from auto-spawning a video window
+            try:
+                self.player.set_nsobject(None)  # macOS
+            except Exception:
+                pass
+            try:
+                self.player.set_hwnd(0)  # Windows
+            except Exception:
+                pass
+            try:
+                self.player.set_xwindow(0)  # Linux
+            except Exception:
+                pass
         self.player.play()
         self._is_paused = False
         self.play_pause_btn.SetLabel("Pause")
@@ -334,7 +399,6 @@ class InternalPlayerFrame(wx.Frame):
             self._manual_stop = True
             self._reconnect_attempts = 0
             self._last_restart_reason = ""
-            self._current_url = None
             self._gave_up = False
         self._pending_restart = False
         self._status_timer.Stop()
@@ -342,9 +406,9 @@ class InternalPlayerFrame(wx.Frame):
             self.player.stop()
         except Exception:
             pass
-        self._is_paused = False
+        self._is_paused = True
         self._has_seen_playing = False
-        self.play_pause_btn.SetLabel("Pause")
+        self.play_pause_btn.SetLabel("Play")
         self._update_status_label("Stopped")
 
     def update_base_buffer(self, seconds: float) -> None:
@@ -462,51 +526,42 @@ class InternalPlayerFrame(wx.Frame):
         return deduped
 
     def _apply_stream_headers(self, media: "vlc.Media", headers: Dict[str, object]) -> None:
-        if not headers:
-            return
-        ua = headers.get("user-agent")
-        if ua:
-            media.add_option(f":http-user-agent={ua}")
-        ref = headers.get("referer")
+        # Always send browser-like defaults to reduce CDN disconnects.
+        ua = (headers or {}).get("user-agent") or self._default_user_agent
+        media.add_option(f":http-user-agent={ua}")
+
+        ref = headers.get("referer") if headers else None
         if ref:
             media.add_option(f":http-referrer={ref}")
-        cookie = headers.get("cookie")
+        cookie = headers.get("cookie") if headers else None
         if cookie:
             media.add_option(f":http-cookie={cookie}")
-        origin = headers.get("origin")
+        origin = headers.get("origin") if headers else None
         if origin:
             media.add_option(f":http-header=Origin: {origin}")
-        auth = headers.get("authorization")
+        auth = headers.get("authorization") if headers else None
         if auth:
             media.add_option(f":http-header=Authorization: {auth}")
-        accept = headers.get("accept")
+        accept = (headers or {}).get("accept") or self._default_accept
         if accept:
             media.add_option(f":http-header=Accept: {accept}")
-        xff = headers.get("x-forwarded-for")
+        xff = headers.get("x-forwarded-for") if headers else None
         if xff:
             media.add_option(f":http-header=X-Forwarded-For: {xff}")
-        range_header = headers.get("range")
+        range_header = headers.get("range") if headers else None
         if range_header:
             media.add_option(f":http-header=Range: {range_header}")
-        extras = headers.get("_extra") or []
+        extras = headers.get("_extra") if headers else None
         if isinstance(extras, list):
             for hdr in extras:
                 media.add_option(f":http-header={hdr}")
 
     def _request_headers(self, headers: Optional[Dict[str, object]], *, include_accept: bool = True) -> dict:
-        ua = None
-        req_headers = {}
-        if headers:
-            ua = headers.get("user-agent")
-        if ua:
-            req_headers["User-Agent"] = str(ua)
-        else:
-            req_headers["User-Agent"] = "IPTVClient/1.0"
+        req_headers: Dict[str, str] = {}
+        ua = (headers or {}).get("user-agent") or self._default_user_agent
+        req_headers["User-Agent"] = str(ua)
         if include_accept:
-            if headers and headers.get("accept"):
-                req_headers["Accept"] = str(headers.get("accept"))
-            else:
-                req_headers["Accept"] = "application/x-mpegURL,application/vnd.apple.mpegurl,text/plain,*/*"
+            req_headers["Accept"] = str((headers or {}).get("accept") or self._default_accept)
         if headers:
             ref = headers.get("referer")
             if ref:
@@ -1035,12 +1090,67 @@ class InternalPlayerFrame(wx.Frame):
             target.SetFocus()
 
     def _on_toggle_pause(self, _event: Optional[wx.Event] = None) -> None:
+        state = None
+        try:
+            state = self.player.get_state()
+        except Exception:
+            state = None
+
+        can_resume = bool(self._current_url or self._last_resolved_url)
+        is_stopped_state = False
+        try:
+            is_stopped_state = bool(state in (vlc.State.Stopped, vlc.State.Ended))  # type: ignore[attr-defined]
+        except Exception:
+            # If vlc.State is unavailable, fall back to simple string check
+            is_stopped_state = str(state).lower() in {"state.stopped", "stopped", "ended"}
+
+        if self._manual_stop and can_resume:
+            # Manual stop: treat the button as Play to resume the last media.
+            self._manual_stop = False
+            self._gave_up = False
+            self._pending_restart = False
+            self._reconnect_attempts = 0
+            self._status_timer.Start(500)
+            try:
+                self.player.play()
+                self._is_paused = False
+                self.play_pause_btn.SetLabel("Pause")
+                self._update_status_label("Buffering...")
+            except Exception:
+                pass
+            return
+
+        if is_stopped_state and can_resume:
+            # VLC reports stopped but not from a manual stop; try to restart.
+            try:
+                self.player.play()
+                self._is_paused = False
+                self.play_pause_btn.SetLabel("Pause")
+                self._status_timer.Start(500)
+                self._update_status_label("Buffering...")
+            except Exception:
+                pass
+            return
+
         try:
             self.player.pause()
             self._is_paused = not self._is_paused
             self.play_pause_btn.SetLabel("Resume" if self._is_paused else "Pause")
         except Exception:
             pass
+
+    def _on_cast(self, _event: Optional[wx.Event] = None) -> None:
+        if not self._on_cast_cb:
+            wx.MessageBox("Casting is unavailable because the caster is not initialised.", "Casting", wx.OK | wx.ICON_INFORMATION)
+            return
+        url = self._current_url or self._last_resolved_url or ""
+        if not url:
+            wx.MessageBox("No active stream to cast.", "Casting", wx.OK | wx.ICON_WARNING)
+            return
+        try:
+            self._on_cast_cb(url, self._current_title or "IPTV Stream", self._current_headers)
+        except Exception as exc:
+            LOG.error("Cast callback failed: %s", exc)
 
     def _update_status_label(self, prefix: str = "", volume_override: Optional[int] = None) -> None:
         bitrate_txt = ""
@@ -1271,7 +1381,40 @@ class InternalPlayerFrame(wx.Frame):
     def _on_toggle_fullscreen(self, _event: Optional[wx.Event] = None) -> None:
         self._set_fullscreen(not self._fullscreen)
 
+    def _hide_player(self) -> None:
+        # Keep playback running; just hide the window.
+        try:
+            self.Hide()
+        except Exception:
+            pass
+        try:
+            self._status_timer.Start(500)
+        except Exception:
+            pass
+
+    def _exit_player(self) -> None:
+        # Stop playback and destroy window explicitly.
+        self._allow_close = True
+        try:
+            self._status_timer.Stop()
+        except Exception:
+            pass
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+        if self._on_close_cb:
+            try:
+                self._on_close_cb()
+            except Exception:
+                pass
+        self.Destroy()
+
     def _on_close(self, event: wx.CloseEvent) -> None:
+        if not self._allow_close and event.CanVeto():
+            event.Veto()
+            self._hide_player()
+            return
         self._status_timer.Stop()
         try:
             self.player.stop()
@@ -1289,6 +1432,7 @@ class InternalPlayerFrame(wx.Frame):
         if self._destroyed:
             return super().Destroy()
         self._destroyed = True
+        self._allow_close = True
         self._status_timer.Stop()
         try:
             self.player.stop()

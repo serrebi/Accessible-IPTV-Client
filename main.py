@@ -24,7 +24,7 @@ import wx.adv
 from options import (
     load_config, save_config, get_cache_path_for_url, get_cache_dir,
     get_db_path, canonicalize_name, extract_group, utc_to_local,
-    CustomPlayerDialog
+    CustomPlayerDialog, resolve_internal_player_settings
 )
 from playlist import (
     EPGDatabase, EPGManagerDialog, PlaylistManagerDialog
@@ -35,6 +35,8 @@ from providers import (
     ProviderError, generate_provider_id
 )
 from casting import CastingManager, CastDevice, CastProtocol
+from http_headers import channel_http_headers
+from external_player import ExternalPlayerLauncher
 
 try:
     from internal_player import (
@@ -108,17 +110,108 @@ def set_linux_env():
     elif distro == "popos":
         os.environ["GDK_BACKEND"] = os.environ.get("GDK_BACKEND", "x11")
 
+def check_ffmpeg() -> bool:
+    try:
+        creation_flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, timeout=10, creationflags=creation_flags)
+        return result.returncode == 0
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+def install_ffmpeg():
+    system = platform.system()
+    if system == 'Windows':
+        # Helper to check if choco is available
+        def check_choco():
+            try:
+                subprocess.run(['choco', '--version'], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+                return True
+            except (FileNotFoundError, OSError):
+                return False
+
+        # Helper to install choco
+        def install_choco():
+            print("Chocolatey not found. Installing Chocolatey...")
+            ps_command = "Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))"
+            try:
+                subprocess.run(["powershell", "-NoProfile", "-InputFormat", "None", "-ExecutionPolicy", "Bypass", "-Command", ps_command], check=True, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"Failed to install Chocolatey: {e}")
+
+        # Install ffmpeg using choco
+        try:
+            if not check_choco():
+                install_choco()
+                # Refresh path? The current process might not see the new path immediately.
+                # However, choco usually adds to path. We might need to restart or use full path.
+                # For now, let's assume it works or the user restarts.
+                # Or try to run it via refreshing env vars.
+                pass
+            
+            print("Installing ffmpeg via Chocolatey...")
+            subprocess.run(['choco', 'install', 'ffmpeg', '-y'], check=True, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Failed to install ffmpeg via Chocolatey: {e}")
+
+    elif system == 'Linux':
+        distro = os.environ.get("MYAPP_DISTRO", "unknown")
+        if distro in ("ubuntu", "debian", "mint", "popos"):
+            try:
+                subprocess.run(['sudo', 'apt-get', 'update'], check=True)
+                subprocess.run(['sudo', 'apt-get', 'install', '-y', 'ffmpeg'], check=True)
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"Failed to install ffmpeg on {distro}: {e}")
+        elif distro in ("fedora",):
+            try:
+                subprocess.run(['sudo', 'dnf', 'install', '-y', 'ffmpeg'], check=True)
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"Failed to install ffmpeg on {distro}: {e}")
+        elif distro in ("centos", "rhel"):
+            # CentOS 7 uses yum, CentOS 8 uses dnf
+            try:
+                subprocess.run(['sudo', 'dnf', 'install', '-y', 'ffmpeg'], check=True)
+            except subprocess.CalledProcessError:
+                subprocess.run(['sudo', 'yum', 'install', '-y', 'ffmpeg'], check=True)
+        elif distro in ("arch", "manjaro"):
+            try:
+                subprocess.run(['sudo', 'pacman', '-S', '--noconfirm', 'ffmpeg'], check=True)
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"Failed to install ffmpeg on {distro}: {e}")
+        elif distro == "opensuse":
+            try:
+                subprocess.run(['sudo', 'zypper', 'install', '-y', 'ffmpeg'], check=True)
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"Failed to install ffmpeg on {distro}: {e}")
+        else:
+            raise RuntimeError(f"Unsupported Linux distribution: {distro}. Please install ffmpeg manually.")
+    else:
+        raise RuntimeError(f"Unsupported OS: {system}. Please install ffmpeg manually.")
+
 set_linux_env()
+
+if not check_ffmpeg():
+    try:
+        install_ffmpeg()
+    except Exception as e:
+        print(f"Warning: ffmpeg not found and installation failed: {e}")
 
 class TrayIcon(wx.adv.TaskBarIcon):
     TBMENU_RESTORE = wx.NewIdRef()
     TBMENU_EXIT = wx.NewIdRef()
+    TBMENU_PLAYER_SHOW = wx.NewIdRef()
+    TBMENU_PLAYER_TOGGLE = wx.NewIdRef()
+    TBMENU_PLAYER_STOP = wx.NewIdRef()
+    TBMENU_CAST = wx.NewIdRef()
 
-    def __init__(self, parent, on_restore, on_exit):
+    def __init__(self, parent, on_restore, on_exit, *, on_player_show=None, on_player_toggle=None, on_player_stop=None, on_cast=None):
         super().__init__()
         self.parent = parent
         self.on_restore = on_restore
         self.on_exit = on_exit
+        self.on_player_show = on_player_show
+        self.on_player_toggle = on_player_toggle
+        self.on_player_stop = on_player_stop
+        self.on_cast = on_cast
         self.Bind(wx.adv.EVT_TASKBAR_LEFT_DCLICK, self.on_taskbar_activate)
         self.Bind(wx.adv.EVT_TASKBAR_LEFT_UP, self.on_taskbar_activate)
         self.Bind(wx.EVT_MENU, self.on_menu_select)
@@ -131,6 +224,13 @@ class TrayIcon(wx.adv.TaskBarIcon):
     def CreatePopupMenu(self):
         menu = wx.Menu()
         menu.Append(self.TBMENU_RESTORE, "Restore")
+        player_menu = wx.Menu()
+        player_menu.Append(self.TBMENU_PLAYER_SHOW, "Show Player")
+        player_menu.Append(self.TBMENU_PLAYER_TOGGLE, "Play/Pause")
+        player_menu.Append(self.TBMENU_PLAYER_STOP, "Stop")
+        player_menu.AppendSeparator()
+        player_menu.Append(self.TBMENU_CAST, "Cast / Connect...")
+        menu.AppendSubMenu(player_menu, "Player Controls")
         menu.AppendSeparator()
         menu.Append(self.TBMENU_EXIT, "Exit")
         return menu
@@ -148,6 +248,14 @@ class TrayIcon(wx.adv.TaskBarIcon):
         eid = event.GetId()
         if eid == self.TBMENU_RESTORE:
             self.on_restore()
+        elif eid == self.TBMENU_PLAYER_SHOW and self.on_player_show:
+            self.on_player_show()
+        elif eid == self.TBMENU_PLAYER_TOGGLE and self.on_player_toggle:
+            self.on_player_toggle()
+        elif eid == self.TBMENU_PLAYER_STOP and self.on_player_stop:
+            self.on_player_stop()
+        elif eid == self.TBMENU_CAST and self.on_cast:
+            self.on_cast()
         elif eid == self.TBMENU_EXIT:
             self.on_exit()
 
@@ -202,6 +310,7 @@ class IPTVClient(wx.Frame):
         self.current_group = "All Channels"
         self.default_player = self.config.get("media_player", "Built-in Player")
         self.custom_player_path = self.config.get("custom_player_path", "")
+        self.show_player_on_enter = self._bool_pref(self.config.get("show_player_on_enter", True), default=True)
         self.epg_importing = False
         self.epg_cache = {}
         self.epg_cache_lock = threading.Lock()
@@ -217,6 +326,8 @@ class IPTVClient(wx.Frame):
         # Casting Manager
         self.caster = CastingManager()
         self.caster.start()
+
+        self.player_launcher = ExternalPlayerLauncher()
 
         # batch-population state to avoid UI hangs
         self._populate_token = 0
@@ -310,6 +421,12 @@ class IPTVClient(wx.Frame):
         if hasattr(self, "min_to_tray_item"):
             self.minimize_to_tray = bool(self.config.get("minimize_to_tray", False))
             self.min_to_tray_item.Check(self.minimize_to_tray)
+        self.show_player_on_enter = self._bool_pref(self.config.get("show_player_on_enter", True), default=True)
+        if hasattr(self, "show_player_on_enter_item"):
+            try:
+                self.show_player_on_enter_item.Check(self.show_player_on_enter)
+            except Exception:
+                pass
         event.Skip()
 
     def start_refresh_timer(self):
@@ -345,7 +462,55 @@ class IPTVClient(wx.Frame):
         all_channels: List[Dict[str, str]] = []
         valid_caches = set()
         seen_channel_keys = set()
-        
+
+        # Fast prefill from parsed caches (no network) so UI shows something immediately.
+        prefilled_by_group: Dict[str, List[Dict[str, str]]] = {}
+        prefilled_all: List[Dict[str, str]] = []
+        prefill_seen = set()
+
+        def _prefill_from_cache(src) -> None:
+            parsed_cache = None
+            provider_meta = None
+            if isinstance(src, dict):
+                stype = (src.get("type") or "").lower()
+                provider_id = src.get("id") or src.get("provider_id")
+                if stype in ("xtream", "stalker"):
+                    cache_key = provider_id or f"{stype}:{src.get('base_url') or src.get('url') or ''}:{src.get('username', '')}"
+                    parsed_cache = self._parsed_cache_path_for_key(f"provider:{cache_key}")
+                    provider_meta = {"provider-type": stype, "provider-id": provider_id}
+            elif isinstance(src, str) and src.startswith(("http://", "https://")):
+                parsed_cache = self._parsed_cache_path_for_key(src)
+            elif isinstance(src, str) and os.path.exists(src):
+                parsed_cache = self._parsed_cache_path_for_key(f"file:{os.path.abspath(src)}")
+            if not parsed_cache or not os.path.exists(parsed_cache):
+                return
+            cached = self._load_cached_playlist(parsed_cache, text_hash=None, provider_meta=provider_meta, skip_hash=True)
+            if not cached:
+                return
+            for ch in cached:
+                key = (ch.get("name", ""), ch.get("url", ""), ch.get("provider-id", ""))
+                if key in prefill_seen:
+                    continue
+                prefill_seen.add(key)
+                grp = ch.get("group") or "Uncategorized"
+                prefilled_by_group.setdefault(grp, []).append(ch)
+                prefilled_all.append(ch)
+
+        for _src in playlist_sources:
+            _prefill_from_cache(_src)
+
+        if prefilled_all:
+            seen_channel_keys.update(prefill_seen)
+            channels_by_group = {grp: lst.copy() for grp, lst in prefilled_by_group.items()}
+            all_channels = list(prefilled_all)
+
+            def apply_prefill(pref_by_group, pref_all):
+                self.channels_by_group = pref_by_group
+                self.all_channels = pref_all
+                self._refresh_group_ui()
+
+            wx.CallAfter(apply_prefill, prefilled_by_group, prefilled_all)
+
         # We will collect these from the workers
         provider_clients_local: Dict[str, object] = {}
         provider_epg_sources: List[str] = []
@@ -575,6 +740,17 @@ class IPTVClient(wx.Frame):
                 menu.Append(1002, "EPG Manager\tCtrl+E")
                 menu.Append(1003, "Import EPG to DB\tCtrl+I")
                 menu.AppendSeparator()
+                player_ctrl_menu = wx.Menu()
+                player_ctrl_menu.Append(1201, "Show Built-in Player")
+                player_ctrl_menu.Append(1202, "Play/Pause")
+                player_ctrl_menu.Append(1203, "Stop")
+                player_ctrl_menu.Append(1204, "Cast / Connect...")
+                menu.AppendSubMenu(player_ctrl_menu, "Player")
+                self.Bind(wx.EVT_MENU, self._menu_show_player, id=1201)
+                self.Bind(wx.EVT_MENU, self._menu_toggle_player, id=1202)
+                self.Bind(wx.EVT_MENU, self._menu_stop_player, id=1203)
+                self.Bind(wx.EVT_MENU, self._menu_cast_from_player, id=1204)
+                menu.AppendSeparator()
                 player_menu = wx.Menu()
                 for idx, (label, attr) in enumerate(self.PLAYER_KEYS):
                     itemid = 2000 + idx
@@ -593,6 +769,11 @@ class IPTVClient(wx.Frame):
                 min_item = menu.AppendCheckItem(min_to_tray_id, "Minimize to System Tray")
                 min_item.Check(self.minimize_to_tray)
                 self.Bind(wx.EVT_MENU, self.on_toggle_min_to_tray, id=min_to_tray_id)
+                menu.AppendSeparator()
+                show_enter_id = 1102
+                show_enter_item = menu.AppendCheckItem(show_enter_id, "Show Player on Enter")
+                show_enter_item.Check(self.show_player_on_enter)
+                self.Bind(wx.EVT_MENU, self.on_toggle_show_player_on_enter, id=show_enter_id)
                 menu.AppendSeparator()
                 
                 # Casting Menu Item (Linux)
@@ -623,6 +804,12 @@ class IPTVClient(wx.Frame):
             fm.AppendSeparator()
             m_exit = fm.Append(wx.ID_EXIT, "Exit\tCtrl+Q")
             mb.Append(fm, "File")
+            pm = wx.Menu()
+            pm_show = pm.Append(wx.ID_ANY, "Show Built-in Player\tCtrl+Shift+J")
+            pm_toggle = pm.Append(wx.ID_ANY, "Play/Pause\tCtrl+Shift+P")
+            pm_stop = pm.Append(wx.ID_ANY, "Stop\tCtrl+Shift+S")
+            pm_cast = pm.Append(wx.ID_ANY, "Cast / Connect...\tCtrl+Shift+C")
+            mb.Append(pm, "Player")
             om = wx.Menu()
             player_menu = wx.Menu()
             self.player_menu_items = []
@@ -633,6 +820,7 @@ class IPTVClient(wx.Frame):
             self.player_Custom = player_menu.AppendRadioItem(wx.ID_ANY, "Custom Player...")
             om.AppendSubMenu(player_menu, "Media Player to Use")
             self.min_to_tray_item = om.AppendCheckItem(wx.ID_ANY, "Minimize to System Tray")
+            self.show_player_on_enter_item = om.AppendCheckItem(wx.ID_ANY, "Show Player on Enter")
             om.AppendSeparator()
             mb.Append(om, "Options")
             self.SetMenuBar(mb)
@@ -641,13 +829,19 @@ class IPTVClient(wx.Frame):
             self.Bind(wx.EVT_MENU, self.import_epg, m_imp)
             self.Bind(wx.EVT_MENU, self.show_cast_dialog, m_cast)
             self.Bind(wx.EVT_MENU, lambda _: self.Close(), m_exit)
+            self.Bind(wx.EVT_MENU, self._menu_show_player, pm_show)
+            self.Bind(wx.EVT_MENU, self._menu_toggle_player, pm_toggle)
+            self.Bind(wx.EVT_MENU, self._menu_stop_player, pm_stop)
+            self.Bind(wx.EVT_MENU, self._menu_cast_from_player, pm_cast)
             for item, key in self.player_menu_items:
                 self.Bind(wx.EVT_MENU, lambda evt, attr=key: self._select_player(attr), item)
             self.Bind(wx.EVT_MENU, self._select_custom_player, self.player_Custom)
             self.Bind(wx.EVT_MENU, self.on_toggle_min_to_tray, self.min_to_tray_item)
+            self.Bind(wx.EVT_MENU, self.on_toggle_show_player_on_enter, self.show_player_on_enter_item)
             self.Bind(wx.EVT_MENU_OPEN, self.on_menu_open)
             self._sync_player_menu_from_config()
             self.min_to_tray_item.Check(self.minimize_to_tray)
+            self.show_player_on_enter_item.Check(self.show_player_on_enter)
 
         self.group_list.Bind(wx.EVT_LISTBOX, lambda _: self.on_group_select())
         self.filter_box.Bind(wx.EVT_TEXT_ENTER, lambda _: self.apply_filter())
@@ -657,6 +851,13 @@ class IPTVClient(wx.Frame):
             (wx.ACCEL_CTRL, ord('E'), 4002),
             (wx.ACCEL_CTRL, ord('I'), 4003),
             (wx.ACCEL_CTRL, ord('Q'), 4004),
+            (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord('P'), 4010),  # Play/Pause
+            (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord('S'), 4011),  # Stop
+            (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord('C'), 4012),  # Cast/connect
+            (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord('K'), 4013),  # Volume up
+            (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord('J'), 4014),  # Volume down
+            (wx.ACCEL_CTRL, wx.WXK_UP, 4015),   # Volume up (Ctrl+Up)
+            (wx.ACCEL_CTRL, wx.WXK_DOWN, 4016), # Volume down (Ctrl+Down)
         ]
         atable = wx.AcceleratorTable(entries)
         self.SetAcceleratorTable(atable)
@@ -664,6 +865,13 @@ class IPTVClient(wx.Frame):
         self.Bind(wx.EVT_MENU, self.show_epg_manager, id=4002)
         self.Bind(wx.EVT_MENU, self.import_epg, id=4003)
         self.Bind(wx.EVT_MENU, lambda evt: self.Close(), id=4004)
+        self.Bind(wx.EVT_MENU, self._menu_toggle_player, id=4010)
+        self.Bind(wx.EVT_MENU, self._menu_stop_player, id=4011)
+        self.Bind(wx.EVT_MENU, self._menu_cast_from_player, id=4012)
+        self.Bind(wx.EVT_MENU, lambda _: self._adjust_internal_volume(+2), id=4013)
+        self.Bind(wx.EVT_MENU, lambda _: self._adjust_internal_volume(-2), id=4014)
+        self.Bind(wx.EVT_MENU, lambda _: self._adjust_internal_volume(+2), id=4015)
+        self.Bind(wx.EVT_MENU, lambda _: self._adjust_internal_volume(-2), id=4016)
 
     def _on_lb_activate(self, event):
         # Called on generic left double click to ensure activation on GTK/mac too
@@ -673,7 +881,7 @@ class IPTVClient(wx.Frame):
     def _on_channel_key_down(self, event):
         key = event.GetKeyCode()
         if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
-            self.play_selected()
+            self.play_selected(show_internal_player=self.show_player_on_enter)
             return  # swallow to prevent beep/focus issues
         event.Skip()
 
@@ -754,6 +962,26 @@ class IPTVClient(wx.Frame):
         self.config["minimize_to_tray"] = self.minimize_to_tray
         save_config(self.config)
 
+    def on_toggle_show_player_on_enter(self, event):
+        self.show_player_on_enter = event.IsChecked()
+        self.config["show_player_on_enter"] = self.show_player_on_enter
+        save_config(self.config)
+        if not self.show_player_on_enter:
+            frame = getattr(self, "_internal_player_frame", None)
+            if frame and frame.IsShown():
+                frame.Hide()
+
+    @staticmethod
+    def _bool_pref(value, default: bool = False) -> bool:
+        """Coerce config values that might be stored as bools/strings/ints."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(default)
+
     def show_tray_icon(self):
         self._tray_allow_restore = False
         self._cancel_tray_ready_timer()
@@ -761,7 +989,11 @@ class IPTVClient(wx.Frame):
             self.tray_icon = TrayIcon(
                 self,
                 on_restore=self.restore_from_tray,
-                on_exit=self.exit_from_tray
+                on_exit=self.exit_from_tray,
+                on_player_show=self._tray_show_player,
+                on_player_toggle=self._tray_toggle_play_pause,
+                on_player_stop=self._tray_stop_player,
+                on_cast=self._tray_cast
             )
         self.Hide()
         self._tray_ready_timer = wx.CallLater(250, self._enable_tray_restore)
@@ -779,6 +1011,57 @@ class IPTVClient(wx.Frame):
         self.Show()
         self.Raise()
         self.Iconize(False)
+
+    def _tray_show_player(self):
+        try:
+            frame = self._ensure_internal_player()
+        except Exception:
+            return
+        frame.Show()
+        frame.Raise()
+
+    def _tray_toggle_play_pause(self):
+        frame = getattr(self, "_internal_player_frame", None)
+        if frame:
+            wx.CallAfter(frame._on_toggle_pause)
+
+    def _tray_stop_player(self):
+        frame = getattr(self, "_internal_player_frame", None)
+        if frame:
+            wx.CallAfter(lambda: frame.stop(manual=True))
+
+    def _tray_cast(self):
+        frame = getattr(self, "_internal_player_frame", None)
+        if frame:
+            wx.CallAfter(lambda: frame._on_cast())
+
+    def _menu_show_player(self, _=None):
+        try:
+            frame = self._ensure_internal_player()
+        except Exception:
+            return
+        frame.Show()
+        frame.Raise()
+
+    def _menu_toggle_player(self, _=None):
+        frame = getattr(self, "_internal_player_frame", None)
+        if frame:
+            frame._on_toggle_pause()
+
+    def _menu_stop_player(self, _=None):
+        frame = getattr(self, "_internal_player_frame", None)
+        if frame:
+            frame.stop(manual=True)
+
+    def _menu_cast_from_player(self, _=None):
+        frame = getattr(self, "_internal_player_frame", None)
+        if frame:
+            frame._on_cast()
+
+    def _adjust_internal_volume(self, delta: int):
+        frame = getattr(self, "_internal_player_frame", None)
+        if frame:
+            wx.CallAfter(frame._adjust_volume, delta)
 
     def exit_from_tray(self):
         self._tray_allow_restore = False
@@ -1343,13 +1626,14 @@ class IPTVClient(wx.Frame):
     def _load_cached_playlist(
         self,
         cache_path: str,
-        text_hash: str,
+        text_hash: Optional[str],
         provider_meta: Optional[Dict[str, str]] = None,
+        skip_hash: bool = False,
     ) -> Optional[List[Dict[str, str]]]:
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if data.get("hash") != text_hash:
+            if not skip_hash and text_hash is not None and data.get("hash") != text_hash:
                 return None
             channels = data.get("channels")
             if not isinstance(channels, list):
@@ -1846,27 +2130,6 @@ class IPTVClient(wx.Frame):
         now = datetime.datetime.now(datetime.timezone.utc)
         return start_dt >= now - datetime.timedelta(days=span)
 
-    def _channel_http_headers(self, channel: Optional[Dict[str, str]]) -> Dict[str, object]:
-        """Collect per-channel HTTP headers for the built-in player."""
-        headers: Dict[str, object] = {}
-        if not channel:
-            return headers
-        def _copy(key: str, target: str) -> None:
-            val = channel.get(key)
-            if val:
-                headers[target] = val
-        _copy("http-user-agent", "user-agent")
-        _copy("http-referrer", "referer")
-        _copy("http-referer", "referer")
-        _copy("http-origin", "origin")
-        _copy("http-cookie", "cookie")
-        _copy("http-authorization", "authorization")
-        _copy("http-accept", "accept")
-        extra = channel.get("http-headers")
-        if isinstance(extra, list):
-            headers["_extra"] = [str(h) for h in extra if h]
-        return headers
-
     def _resolve_live_url(self, channel: Dict[str, str]) -> str:
         url = channel.get("url", "")
         provider_type = channel.get("provider-type")
@@ -1945,70 +2208,7 @@ class IPTVClient(wx.Frame):
                 url = f"{url}|User-Agent={urllib.parse.quote(ua)}"
         return url
 
-    def _spawn_posix(self, argv):
-        try:
-            subprocess.Popen(argv, close_fds=True)
-            return True, ""
-        except FileNotFoundError:
-            return False, f"Executable not found: {argv[0]}"
-        except Exception as e:
-            return False, str(e)
-
-    def _spawn_windows(self, argv):
-        """Launch player on Windows with a normal, visible window."""
-        try:
-            subprocess.Popen(argv)
-            return True, ""
-        except FileNotFoundError:
-            return False, f"Executable not found: {argv[0]}"
-        except Exception as e:
-            return False, str(e)
-
-    def _mpv_ipc_path(self) -> str:
-        if platform.system() == "Windows":
-            return r"\\.\pipe\iptvclient-mpv"
-        # POSIX: use a socket in temp
-        return os.path.join(tempfile.gettempdir(), "iptvclient-mpv.sock")
-
-    def _mpv_try_send(self, url: str) -> bool:
-        """If an mpv instance with our IPC is running, send loadfile and return True."""
-        ipc = self._mpv_ipc_path()
-        payload = (json.dumps({"command": ["loadfile", url, "replace"]}) + "\n").encode("utf-8")
-        if platform.system() == "Windows":
-            try:
-                # Minimal win32 named pipe client via ctypes
-                from ctypes import wintypes
-                GENERIC_WRITE = 0x40000000
-                OPEN_EXISTING = 3
-                INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-                CreateFileW = ctypes.windll.kernel32.CreateFileW
-                CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
-                CreateFileW.restype = wintypes.HANDLE
-                h = CreateFileW(ipc, GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None)
-                if h == 0 or h == INVALID_HANDLE_VALUE:
-                    return False
-                try:
-                    WriteFile = ctypes.windll.kernel32.WriteFile
-                    WriteFile.argtypes = [wintypes.HANDLE, wintypes.LPCVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
-                    written = wintypes.DWORD(0)
-                    ok = WriteFile(h, payload, len(payload), ctypes.byref(written), None)
-                    return bool(ok and written.value == len(payload))
-                finally:
-                    ctypes.windll.kernel32.CloseHandle(h)
-            except Exception:
-                return False
-        else:
-            try:
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                s.settimeout(0.25)
-                s.connect(ipc)
-                s.sendall(payload)
-                s.close()
-                return True
-            except Exception:
-                return False
-
-    def play_selected(self):
+    def play_selected(self, *, show_internal_player: Optional[bool] = None):
         i = self.channel_list.GetSelection()
         if not (0 <= i < len(self.displayed)):
             return
@@ -2057,7 +2257,16 @@ class IPTVClient(wx.Frame):
                     display_name = show_title
         if not display_name:
             display_name = "IPTV Stream"
-        self._launch_stream(url, display_name, stream_kind=stream_kind, channel=channel)
+        if show_internal_player is None:
+            show_internal_player = self.show_player_on_enter
+
+        self._launch_stream(
+            url,
+            display_name,
+            stream_kind=stream_kind,
+            channel=channel,
+            show_internal_player=show_internal_player,
+        )
 
     def _on_internal_player_closed(self) -> None:
         self._internal_player_frame = None
@@ -2075,157 +2284,33 @@ class IPTVClient(wx.Frame):
                 frame = None
         if frame:
             return frame
-        try:
-            base_buffer = float(self.config.get("internal_player_buffer_seconds", 12.0))
-        except Exception:
-            base_buffer = 0.0
-        try:
-            max_buffer = float(self.config.get("internal_player_max_buffer_seconds", 0.0))
-        except Exception:
-            max_buffer = 0.0
-        if max_buffer <= 0:
-            max_buffer = 0.0
-        try:
-            variant_cap = float(self.config.get("internal_player_variant_max_mbps", 0.0))
-        except Exception:
-            variant_cap = 0.0
+        settings = resolve_internal_player_settings(self.config)
         frame = InternalPlayerFrame(
             self,
-            base_buffer_seconds=base_buffer,
-            max_buffer_seconds=max_buffer,
-            variant_max_mbps=variant_cap,
+            base_buffer_seconds=settings.base_buffer_seconds,
+            max_buffer_seconds=settings.max_buffer_seconds,
+            variant_max_mbps=settings.variant_max_mbps,
+            on_cast=self._cast_from_internal_player,
             on_close=self._on_internal_player_closed,
         )
         self._internal_player_frame = frame
         return frame
 
-    def _get_install_cmd(self, player_name):
-        system = platform.system()
-        if system == "Windows":
-            ids = {
-                "VLC": "VideoLAN.VLC",
-                "MPC": "clsid2.mpc-hc",
-                "MPC-BE": "MPC-BE.MPC-BE",
-                "Kodi": "Kodi.Kodi",
-                "Winamp": "Winamp.Winamp",
-                "Foobar2000": "PeterPawlowski.foobar2000",
-                "MPV": "mpv.mpv",
-                "SMPlayer": "smplayer.smplayer",
-                "iTunes/Apple Music": "Apple.iTunes",
-                "PotPlayer": "Daum.PotPlayer",
-                "KMPlayer": "Pandora.KMPlayer",
-                "AIMP": "AIMP.AIMP",
-                "QMPlay2": "zenyth.QMPlay2",
-                "GOM Player": "GOMLab.GOMPlayer",
-                "Clementine": "Clementine.Clementine",
-                "Strawberry": "StrawberryMusicPlayer.Strawberry"
-            }
-            if player_name in ids:
-                # Return the package ID
-                return ids[player_name]
-        elif system == "Darwin":
-            casks = {
-                "VLC": "vlc",
-                "Kodi": "kodi",
-                "MPV": "mpv",
-                "SMPlayer": "smplayer",
-                "IINA": "iina",
-                "Clementine": "clementine",
-                "Strawberry": "strawberry",
-                "QMPlay2": "qmplay2"
-            }
-            if player_name in casks:
-                return ["brew", "install", "--cask", casks[player_name]]
-        else: # Linux
-            pkgs = {
-                "VLC": "vlc",
-                "MPV": "mpv",
-                "Kodi": "kodi",
-                "SMPlayer": "smplayer",
-                "Totem": "totem",
-                "Audacious": "audacious",
-                "Clementine": "clementine",
-                "Strawberry": "strawberry",
-                "Rhythmbox": "rhythmbox",
-                "Vocal": "vocal",
-                "Celluloid": "celluloid",
-                "Haruna": "haruna"
-            }
-            if player_name in pkgs:
-                # Try generic apt/flatpak (needs terminal)
-                # We return a list of candidate commands; installer will pick one
-                p = pkgs[player_name]
-                return [
-                    f"sudo apt-get install -y {p}",
-                    f"flatpak install -y {p}",
-                    f"snap install {p}"
-                ]
-        return None
-
-    def _try_install_player(self, player_name, install_info):
-        """
-        Blocking, silent, fully automatic installation.
-        Returns True if exit code is 0.
-        """
-        system = platform.system()
-        try:
-            if system == "Windows":
-                # Winget silent install
-                # --force to ensure it doesn't prompt
-                cmd = f"winget install -e --id {install_info} --silent --force --accept-source-agreements --accept-package-agreements --disable-interactivity"
-                # CREATE_NO_WINDOW = 0x08000000
-                subprocess.run(cmd, shell=True, check=True, creationflags=0x08000000,
-                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                return True
-
-            elif system == "Darwin":
-                # Brew silent install
-                cmd = list(install_info)
-                if "brew" in cmd:
-                    # Ensure non-interactive
-                    if "--quiet" not in cmd: cmd.append("--quiet")
-                    if "--force" not in cmd: cmd.append("--force")
-                    env = os.environ.copy()
-                    env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
-                    subprocess.run(cmd, check=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                else:
-                    # Fallback for raw commands
-                    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                return True
-
-            else: # Linux
-                # Try to find a working command from the candidates
-                candidates = install_info if isinstance(install_info, list) else [install_info]
-                
-                for base_cmd in candidates:
-                    # Inject non-interactive flags
-                    cmd = base_cmd
-                    if "apt" in cmd:
-                        cmd = f"DEBIAN_FRONTEND=noninteractive {cmd} -y -q"
-                    elif "flatpak" in cmd:
-                        cmd = f"{cmd} -y --noninteractive"
-                    
-                    # Try pkexec for privilege escalation without terminal window (GUI prompt)
-                    # If user is already root, pkexec is fine or unnecessary.
-                    final_cmd = cmd
-                    if shutil.which("pkexec") and os.geteuid() != 0:
-                        final_cmd = f"pkexec {cmd}"
-                    
-                    try:
-                        subprocess.run(final_cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        return True
-                    except subprocess.CalledProcessError:
-                        continue
-                return False
-
-        except Exception as e:
-            return False
-
-    def _launch_stream(self, url: str, title: Optional[str] = None, *, stream_kind: str = "live", channel: Optional[Dict[str, str]] = None):
+    def _launch_stream(
+        self,
+        url: str,
+        title: Optional[str] = None,
+        *,
+        stream_kind: str = "live",
+        channel: Optional[Dict[str, str]] = None,
+        show_internal_player: Optional[bool] = None,
+    ):
         if not url:
             wx.MessageBox("Could not find stream URL for this selection.", "Not Found",
                           wx.OK | wx.ICON_WARNING)
             return
+        if show_internal_player is None:
+            show_internal_player = self.show_player_on_enter
 
         # Check if casting
         if self.caster.is_connected():
@@ -2248,7 +2333,7 @@ class IPTVClient(wx.Frame):
                 return
 
         player = self.default_player
-        stream_headers = self._channel_http_headers(channel)
+        stream_headers = channel_http_headers(channel)
         custom_path = self.config.get("custom_player_path", "")
 
         if player in {"Built-in Player", "player_Internal", "internal", "Internal"}:
@@ -2261,153 +2346,115 @@ class IPTVClient(wx.Frame):
                 return
             display_title = title or "IPTV Stream"
             try:
-                frame.Show()
-                frame.Raise()
-                frame.SetFocus()
-                frame.play(url, display_title, stream_kind=stream_kind, headers=stream_headers)
+                if show_internal_player:
+                    frame.Enable(True)
+                    frame.Show()
+                    frame.Raise()
+                    frame.SetFocus()
+                else:
+                    # Keep frame disabled and hidden to avoid accessibility focus.
+                    frame.Enable(False)
+                    frame.Hide()
+                frame.play(
+                    url,
+                    display_title,
+                    stream_kind=stream_kind,
+                    headers=stream_headers,
+                    video_visible=show_internal_player,
+                )
+                if not show_internal_player:
+                    wx.CallAfter(self._restore_main_focus)
             except Exception as err:
                 wx.MessageBox(f"Failed to start built-in player:\n{err}", "Launch Error", wx.OK | wx.ICON_ERROR)
             return
 
-        # If using mpv, try to reuse an existing instance via IPC first.
-        if player == "MPV":
-            try:
-                if self._mpv_try_send(url):
-                    return
-            except Exception:
-                pass
+        # External player launch
+        ok, err = self.player_launcher.launch(player, url, custom_path)
+        if not ok:
+            wx.MessageBox(f"Failed to launch {player}:\n{err}", "Launch Error", wx.OK | wx.ICON_ERROR)
 
-        # Guard against accidental double-invocation (applies to spawn path only)
+    def _restore_main_focus(self) -> None:
         try:
-            if not hasattr(self, "_launch_guard_lock"):
-                self._launch_guard_lock = threading.Lock()
-                self._last_launch_ts = 0.0
-            with getattr(self, "_launch_guard_lock"):
-                now = time.time()
-                if (now - getattr(self, "_last_launch_ts", 0.0)) < 0.75:
-                    return
-                self._last_launch_ts = now
+            if self.IsShown():
+                self.Raise()
+                self.SetFocus()
+                self.channel_list.SetFocus()
         except Exception:
             pass
 
-        win_paths = {
-            "VLC": [r"C:\Program Files\VideoLAN\VLC\vlc.exe", r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"],
-            "MPC": [r"C:\Program Files\MPC-HC\mpc-hc64.exe", r"C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe", r"C:\Program Files (x86)\MPC-HC\mpc-hc.exe"],
-            "MPC-BE": [r"C:\Program Files\MPC-BE\mpc-be64.exe", r"C:\Program Files (x86)\MPC-BE\mpc-be.exe", r"C:\Program Files\MPC-BE x64\mpc-be64.exe", r"C:\Program Files\MPC-BE\mpc-be.exe"],
-            "Kodi": [r"C:\Program Files\Kodi\kodi.exe"],
-            "Winamp": [r"C:\Program Files\Winamp\winamp.exe"],
-            "Foobar2000": [r"C:\Program Files\foobar2000\foobar2000.exe"],
-            "MPV": [r"C:\Program Files\mpv\mpv.exe", r"C:\Program Files (x86)\mpv\mpv.exe"],
-            "SMPlayer": [r"C:\Program Files\SMPlayer\smplayer.exe", r"C:\Program Files (x86)\SMPlayer\smplayer.exe"],
-            "QuickTime": [r"C:\Program Files\QuickTime\QuickTimePlayer.exe", r"C:\Program Files (x86)\QuickTime\QuickTimePlayer.exe"],
-            "iTunes/Apple Music": [r"C:\Program Files\iTunes\iTunes.exe", r"C:\Program Files (x86)\iTunes\iTunes.exe", r"C:\Program Files\Apple\Music\AppleMusic.exe"],
-            "PotPlayer": [r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe", r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini.exe"],
-            "KMPlayer": [r"C:\Program Files\KMP Media\KMPlayer\KMPlayer64.exe", r"C:\Program Files (x86)\KMP Media\KMPlayer\KMPlayer.exe"],
-            "AIMP": [r"C:\Program Files\AIMP\AIMP.exe", r"C:\Program Files (x86)\AIMP\AIMP.exe"],
-            "QMPlay2": [r"C:\Program Files\QMPlay2\QMPlay2.exe", r"C:\Program Files (x86)\QMPlay2\QMPlay2.exe"],
-            "GOM Player": [r"C:\Program Files\GRETECH\GomPlayer\GOM.exe", r"C:\Program Files (x86)\GRETECH\GomPlayer\GOM.exe"],
-            "Clementine": [r"C:\Program Files\Clementine\clementine.exe"],
-            "Strawberry": [r"C:\Program Files\Strawberry\strawberry.exe"],
-        }
+    def _cast_from_internal_player(self, url: str, title: str, headers: Dict[str, object]) -> None:
+        if not url:
+            wx.MessageBox("No active stream to cast.", "Casting", wx.OK | wx.ICON_WARNING)
+            return
+
+        def do_cast(device: CastDevice):
+            try:
+                creds = self.config.get("cast_credentials", {}).get(device.identifier)
+                self.caster.connect(device, credentials=creds)
+                # Use the active caster directly so we can forward headers from the current stream.
+                if self.caster.active_caster:
+                    self.caster.dispatch(self.caster.active_caster.play(url, title, headers=headers))
+                else:
+                    raise RuntimeError("Caster not connected.")
+                wx.CallAfter(self._handoff_internal_player_after_cast, url, title)
+                wx.CallAfter(lambda: wx.MessageBox(f"Casting to {device.display_name}...", "Casting", wx.OK | wx.ICON_INFORMATION))
+            except Exception as e:
+                wx.CallAfter(lambda: wx.MessageBox(f"Failed to cast: {e}", "Casting Error", wx.OK | wx.ICON_ERROR))
+
+        if self.caster.is_connected() and self.caster.active_device:
+            threading.Thread(target=lambda: do_cast(self.caster.active_device), daemon=True).start()
+            return
+
+        dlg = CastDiscoveryDialog(self, self.caster)
+        try:
+            if dlg.ShowModal() == wx.ID_OK:
+                device = dlg.get_selected_device()
+                if device:
+                    threading.Thread(target=lambda: do_cast(device), daemon=True).start()
+        finally:
+            dlg.Destroy()
+
+    def _handoff_internal_player_after_cast(self, url=None, title=None, stream_kind=None, channel=None):
+        # Stop and hide the built-in player, then (optionally) relaunch the stream
+        # in the user's preferred external player. Guard all variables to avoid
+        # NameErrors when called without arguments.
+        frame = getattr(self, "_internal_player_frame", None)
+        if frame:
+            try:
+                if url is None:
+                    url = getattr(frame, "_current_url", None) or getattr(frame, "_last_resolved_url", None)
+                if title is None:
+                    title = getattr(frame, "_current_title", None)
+                if stream_kind is None:
+                    stream_kind = getattr(frame, "_current_stream_kind", None)
+            except Exception:
+                pass
+            try:
+                frame.stop(manual=True)
+            except Exception:
+                pass
+            try:
+                frame.Hide()
+            except Exception:
+                pass
+
+        player = self.default_player
         
-        linux_players = { "VLC": "vlc", "MPV": "mpv", "Kodi": "kodi", "SMPlayer": "smplayer", "Totem": "totem", "PotPlayer": "potplayer", "KMPlayer": "kmplayer", "AIMP": "aimp", "QMPlay2": "qmplay2", "GOM Player": "gomplayer", "Audacious": "audacious", "Fauxdacious": "fauxdacious", "MPC-BE": "mpc-be", "Clementine": "clementine", "Strawberry": "strawberry", "Amarok": "amarok", "Rhythmbox": "rhythmbox", "Pragha": "pragha", "Lollypop": "lollypop", "Exaile": "exaile", "Quod Libet": "quodlibet", "Gmusicbrowser": "gmusicbrowser", "Xmms": "xmms", "Vocal": "vocal", "Haruna": "haruna", "Celluloid": "celluloid" }
-        mac_paths = { "VLC": ["/Applications/VLC.app/Contents/MacOS/VLC"], "QuickTime": ["/Applications/QuickTime Player.app/Contents/MacOS/QuickTime Player"], "iTunes/Apple Music": ["/Applications/Music.app/Contents/MacOS/Music", "/Applications/iTunes.app/Contents/MacOS/iTunes"], "QMPlay2": ["/Applications/QMPlay2.app/Contents/MacOS/QMPlay2"], "Audacious": ["/Applications/Audacious.app/Contents/MacOS/Audacious"], "Fauxdacious": ["/Applications/Fauxdacious.app/Contents/MacOS/Fauxdacious"] }
+        # If the user prefers the built-in player, just stop/hide and return.
+        if player in {"Built-in Player", "player_Internal", "internal", "Internal"}:
+            return
 
-        ok, err = False, ""
+        # Ensure we have sane defaults.
+        if not title:
+            title = "IPTV Stream"
+        if not stream_kind:
+            stream_kind = "live"
+        # If we don't have a URL, there's nothing to hand off.
+        if not url:
+            return
 
-        def _argv_for(player_name: str, exe_or_cmd: str, is_windows: bool) -> list:
-            # Build argv with best-effort single-instance/enqueue flags where supported.
-            if player_name == "VLC":
-                # Use single-instance flags, but do NOT enqueue so the new stream replaces playback.
-                flags = ["--one-instance", "--one-instance-when-started-from-file"]
-                return [exe_or_cmd, *flags, url]
-            if player_name in ("MPC", "MPC-BE"):
-                # Keep it simple and robust: let MPC's own single-instance setting
-                # handle reuse; always pass the URL directly for predictable playback.
-                return [exe_or_cmd, url]
-            if player_name == "MPV":
-                ipc = self._mpv_ipc_path()
-                flags = [f"--input-ipc-server={ipc}", "--force-window=yes", "--idle=yes", "--no-terminal"]
-                # On POSIX, if the IPC socket path exists but connect failed above, it's likely stale; try to remove it.
-                if not is_windows and os.path.exists(ipc):
-                    try:
-                        os.unlink(ipc)
-                    except Exception:
-                        pass
-                return [exe_or_cmd, *flags, url]
-            # Default: just pass URL
-            return [exe_or_cmd, url]
-        if self.default_player == "Custom" and custom_path:
-            exe = custom_path
-            # Heuristically detect known players from custom path for better flags
-            pname = os.path.basename(exe).lower()
-            detected = player
-            if "mpv" in pname:
-                detected = "MPV"
-            elif "vlc" in pname:
-                detected = "VLC"
-            elif "mpc-be" in pname or "mpcbe" in pname:
-                detected = "MPC-BE"
-            elif pname.startswith("mpc-hc") or pname.startswith("mpc"):
-                detected = "MPC"
-            argv = _argv_for(detected, exe, platform.system() == "Windows")
-            ok, err = self._spawn_windows(argv) if platform.system() == "Windows" else self._spawn_posix(argv)
-        else:
-            system = platform.system()
-            if system == "Windows":
-                choices = win_paths.get(player, [])
-                for exe in choices:
-                    if os.path.exists(exe):
-                        argv = _argv_for(player, exe, True)
-                        ok, err = self._spawn_windows(argv)
-                        if ok: break
-                if not ok: err = err or f"Could not locate {player} executable."
-            elif system == "Darwin":
-                choices = mac_paths.get(player, [])
-                for exe in choices:
-                    if os.path.exists(exe):
-                        argv = _argv_for(player, exe, False)
-                        ok, err = self._spawn_posix(argv)
-                        if ok: break
-                if not ok: err = err or f"Could not locate {player} app."
-            else:
-                cmd = linux_players.get(player)
-                if cmd:
-                    argv = _argv_for(player, cmd, False)
-                    ok, err = self._spawn_posix(argv)
-                else: err = f"{player} is not configured for Linux."
-
-        if not ok:
-            # If manual launch failed, check for auto-install capability
-            install_info = self._get_install_cmd(player)
-            if install_info:
-                # Check if we are already installing this player to avoid loops
-                if getattr(self, "_installing_player", None) == player:
-                    wx.MessageBox(f"Installation of {player} appears to have failed.", "Install Error", wx.OK | wx.ICON_ERROR)
-                    self._installing_player = None
-                    return
-
-                # Start invisible install
-                self._installing_player = player
-                old_title = self.GetTitle()
-                self.SetTitle(f"Installing {player}... please wait")
-                
-                def do_install():
-                    success = self._try_install_player(player, install_info)
-                    def on_complete():
-                        self.SetTitle(old_title)
-                        if success:
-                            # Retry launch
-                            self._launch_stream(url, title, stream_kind=stream_kind, channel=channel)
-                        else:
-                            self._installing_player = None
-                            wx.MessageBox(f"Automatic installation of {player} failed.", "Install Error", wx.OK | wx.ICON_ERROR)
-                    wx.CallAfter(on_complete)
-                
-                threading.Thread(target=do_install, daemon=True).start()
-                return
-            
-            wx.MessageBox(f"Failed to launch {self.default_player}:\n{err}", "Launch Error", wx.OK | wx.ICON_ERROR)
+        # Use generic launch method for external player
+        self._launch_stream(url, title, stream_kind=stream_kind, channel=channel, show_internal_player=False)
 
     def _open_catchup_dialog(self, channel: Dict[str, str]):
         programmes = self._get_catchup_programmes(channel)
@@ -2754,6 +2801,7 @@ class ChannelEPGDialog(wx.Dialog):
                 pass
 
 if __name__ == "__main__":
+    set_linux_env()
     app = wx.App()
     app.SetAppName("IPTVClient")
     IPTVClient()

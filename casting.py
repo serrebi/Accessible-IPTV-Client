@@ -130,6 +130,7 @@ except ImportError:
     pychromecast = None
 
 from stream_proxy import get_proxy
+from http_headers import channel_http_headers
 
 class ChromecastCaster(BaseCaster):
     """Chromecast protocol implementation."""
@@ -728,41 +729,50 @@ class AirPlayCaster(BaseCaster):
 
 
 def _detect_mime_type(url: str, default: str = "video/mp2t") -> str:
-    """Detect MIME type from URL with improved heuristics for IPTV."""
+    """Detect MIME type from URL with improved heuristics for IPTV and audio."""
     u = url.lower()
     if ".m3u8" in u:
         return "application/x-mpegURL"
-    elif ".ts" in u:
+    if ".ts" in u:
         return "video/mp2t"
-    elif ".mp4" in u:
+    if ".mp4" in u:
         return "video/mp4"
-    elif ".mkv" in u:
+    if ".mkv" in u:
         return "video/x-matroska"
-    elif ".avi" in u:
+    if ".avi" in u:
         return "video/x-msvideo"
+    if u.endswith((".mp3", ".m3u", ".pls")):
+        return "audio/mpeg"
+    if u.endswith((".aac", ".m4a")):
+        return "audio/aac"
+    if u.endswith((".ogg", ".oga")):
+        return "audio/ogg"
+    if u.endswith(".opus"):
+        return "audio/opus"
+    if u.endswith(".flac"):
+        return "audio/flac"
+    if u.endswith((".wav", ".wave")):
+        return "audio/wav"
+
+    # Try a lightweight HEAD request to infer content-type for opaque radio/stream URLs.
+    # Keep it best-effort and non-fatal so casting keeps working offline.
+    try:
+        if url.startswith("http"):
+            import urllib.request
+
+            req = urllib.request.Request(url, method="HEAD")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                ctype = resp.headers.get("Content-Type", "")
+                if ctype:
+                    ctype = ctype.split(";")[0].strip().lower()
+                    return ctype
+    except Exception:
+        pass
+
+    # Heuristic for common radio/stream endpoints without extensions
+    if any(token in u for token in ("/listen/", "/stream", "radio", "/live")):
+        return "audio/mpeg"
     return default
-
-
-def _channel_http_headers(channel: Optional[Dict[str, str]]) -> Dict[str, object]:
-    """Collect per-channel HTTP headers for casters."""
-    headers: Dict[str, object] = {}
-    if not channel:
-        return headers
-    def _copy(key: str, target: str) -> None:
-        val = channel.get(key)
-        if val:
-            headers[target] = val
-    _copy("http-user-agent", "user-agent")
-    _copy("http-referrer", "referer")
-    _copy("http-referer", "referer")
-    _copy("http-origin", "origin")
-    _copy("http-cookie", "cookie")
-    _copy("http-authorization", "authorization")
-    _copy("http-accept", "accept")
-    extra = channel.get("http-headers")
-    if isinstance(extra, list):
-        headers["_extra"] = [str(h) for h in extra if h]
-    return headers
 
 
 # ============================================================================
@@ -881,8 +891,8 @@ class CastingManager:
     async def _play_async(self, url: str, title: str, channel: Optional[Dict[str, str]]) -> None:
         if not self.active_caster:
             raise ConnectionError("No active cast device")
-        
-        headers = _channel_http_headers(channel)
+
+        headers = channel_http_headers(channel)
         await self.active_caster.play(url, title, headers=headers)
 
     def stop_playback(self) -> None:
