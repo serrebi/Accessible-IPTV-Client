@@ -1017,6 +1017,7 @@ class IPTVClient(wx.Frame):
             frame = self._ensure_internal_player()
         except Exception:
             return
+        frame.Enable(True)
         frame.Show()
         frame.Raise()
 
@@ -1040,6 +1041,7 @@ class IPTVClient(wx.Frame):
             frame = self._ensure_internal_player()
         except Exception:
             return
+        frame.Enable(True)
         frame.Show()
         frame.Raise()
 

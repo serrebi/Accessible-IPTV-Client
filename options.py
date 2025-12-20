@@ -159,6 +159,10 @@ def get_config_read_candidates():
     if user_dir:
         candidates.append(os.path.join(user_dir, CONFIG_FILE))
 
+    # 4) Bundled resource dir (PyInstaller _MEIPASS)
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        candidates.append(os.path.join(sys._MEIPASS, CONFIG_FILE))
+
     # De-duplicate paths while preserving order
     unique_candidates = []
     seen = set()

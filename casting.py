@@ -243,29 +243,25 @@ class ChromecastCaster(BaseCaster):
         def do_play():
             mc = self._cast.media_controller
             
+            # 1. Best-effort MIME detection (probes if URL is opaque)
             content_type_actual = _detect_mime_type(url, content_type)
             
-            # Determine stream type
-            stream_type = "LIVE" if content_type_actual == "application/x-mpegURL" else "BUFFERED"
-            
-            # Use local proxy to handle headers and format compatibility
-            if content_type_actual == "video/mp2t":
-                # Transcode MPEG-TS to HLS for better Chromecast compatibility
-                proxied_url = get_proxy().get_transcoded_url(url, headers)
-                stream_type = "LIVE" # HLS is live
-                content_type_actual = "application/x-mpegURL" # We are serving HLS now
-                LOG.info(f"Remuxing MPEG-TS to HLS via proxy: {proxied_url}")
+            # 2. Selection of optimal proxy path (High-speed direct TS proxy)
+            # This provides instant start and 320k AAC audio while keeping original video.
+            if content_type_actual.startswith("audio/"):
+                proxied_url = get_proxy().get_audio_url(url, headers)
+                LOG.info(f"Casting Radio to Chromecast via DIRECT proxy (TS): {proxied_url} -> {url}")
             else:
-                # Just proxy headers
-                proxied_url = get_proxy().get_proxied_url(url, headers)
-                LOG.info(f"Casting to Chromecast via proxy: {proxied_url} -> {url}")
+                proxied_url = get_proxy().get_transcoded_url(url, headers)
+                LOG.info(f"Casting Video to Chromecast via DIRECT proxy (TS): {proxied_url} -> {url}")
             
-            # Note: Older/Standard versions of pychromecast's play_media do not support custom_data kwarg.
-            # It was added in newer versions or specific forks. We'll omit it to be safe.
-            # If headers are absolutely required, a custom receiver or proxy is needed.
+            # MPEG-TS is the most reliable format for both audio and video on modern TVs.
+            content_type_cast = "video/mp2t"
+            stream_type = "LIVE" 
+            
             mc.play_media(
                 proxied_url,
-                content_type_actual,
+                content_type_cast,
                 title=title,
                 stream_type=stream_type
             )
@@ -474,40 +470,34 @@ class DLNACaster(BaseCaster):
         if not self._device:
             raise ConnectionError("Not connected to a DLNA device")
         
-        # Improved MIME type detection
-        content_type = _detect_mime_type(url, content_type)
+        # 1. Detect type and get proxied URL
+        content_type_actual = _detect_mime_type(url, content_type)
+        if content_type_actual.startswith("audio/"):
+            proxied_url = get_proxy().get_audio_url(url, headers)
+            # Standard DLNA audio class
+            upnp_class = "object.item.audioItem.musicTrack"
+        else:
+            # For DLNA we use the Direct Proxy (headers only) unless it's a known TS requiring remux
+            # but usually Direct Proxy is safer for DLNA TVs.
+            proxied_url = get_proxy().get_audio_url(url, headers) # Using /audio path for simple proxying too
+            upnp_class = "object.item.videoItem.videoBroadcast"
         
         try:
             # Build DIDL-Lite metadata
-            # Add DLNA flags for better compatibility (Samsung, LG, Sony)
-            # DLNA.ORG_OP=01 (Seek supported), DLNA.ORG_CI=0 (Transcoded=0)
             dlna_features = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
-            res_attrs = f'protocolInfo="http-get:*:{content_type}:{dlna_features}"'
-            
-            if headers:
-                # Common headers might be passed as a custom element or as part of protocolInfo
-                # This is a best-effort attempt as standard doesn't define well.
-                # User-Agent, Referer are most common.
-                user_agent = headers.get("user-agent")
-                referer = headers.get("referer")
-                
-                if user_agent:
-                    res_attrs += f' http-user-agent="{user_agent}"'
-                if referer:
-                    res_attrs += f' http-referer="{referer}"'
-                # Other headers are harder to embed portably.
+            res_attrs = f'protocolInfo="http-get:*:{content_type_actual}:{dlna_features}"'
             
             didl = f'''<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
                 xmlns:dc="http://purl.org/dc/elements/1.1/"
                 xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
                 <item id="1" parentID="0" restricted="1">
                     <dc:title>{title}</dc:title>
-                    <upnp:class>object.item.videoItem.videoBroadcast</upnp:class>
-                    <res {res_attrs}>{url}</res>
+                    <upnp:class>{upnp_class}</upnp:class>
+                    <res {res_attrs}>{proxied_url}</res>
                 </item>
             </DIDL-Lite>'''
             
-            await self._device.async_set_transport_uri(url, title, didl)
+            await self._device.async_set_transport_uri(proxied_url, title, didl)
             await self._device.async_play()
             
         except Exception as e:
@@ -731,6 +721,12 @@ class AirPlayCaster(BaseCaster):
 def _detect_mime_type(url: str, default: str = "video/mp2t") -> str:
     """Detect MIME type from URL with improved heuristics for IPTV and audio."""
     u = url.lower()
+    
+    # High-priority heuristics for radio/audio-only endpoints
+    if any(token in u for token in ("serrebiradio", "radio.", "streamon.fm", "/listen/", "icecast", "shoutcast")):
+        if ".m3u8" not in u:
+            return "audio/mpeg"
+
     if ".m3u8" in u:
         return "application/x-mpegURL"
     if ".ts" in u:
@@ -745,10 +741,8 @@ def _detect_mime_type(url: str, default: str = "video/mp2t") -> str:
         return "audio/mpeg"
     if u.endswith((".aac", ".m4a")):
         return "audio/aac"
-    if u.endswith((".ogg", ".oga")):
+    if u.endswith((".ogg", ".oga", ".opus")):
         return "audio/ogg"
-    if u.endswith(".opus"):
-        return "audio/opus"
     if u.endswith(".flac"):
         return "audio/flac"
     if u.endswith((".wav", ".wave")):
@@ -765,12 +759,16 @@ def _detect_mime_type(url: str, default: str = "video/mp2t") -> str:
                 ctype = resp.headers.get("Content-Type", "")
                 if ctype:
                     ctype = ctype.split(";")[0].strip().lower()
+                    # Many IPTV origins return generic octet-stream for TS.
+                    # Treat it as the default (usually video/mp2t) so Chromecast gets an HLS remux.
+                    if ctype in ("application/octet-stream", "binary/octet-stream", "application/octetstream"):
+                        return default
                     return ctype
     except Exception:
         pass
 
     # Heuristic for common radio/stream endpoints without extensions
-    if any(token in u for token in ("/listen/", "/stream", "radio", "/live")):
+    if any(token in u for token in ("/stream", "radio", "/live")):
         return "audio/mpeg"
     return default
 

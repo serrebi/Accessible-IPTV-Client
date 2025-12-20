@@ -219,21 +219,25 @@ class InternalPlayerFrame(wx.Frame):
         controls = wx.BoxSizer(wx.HORIZONTAL)
 
         self.play_pause_btn = wx.Button(self.controls_panel, label="Pause")
+        self.play_pause_btn.SetName("Play or Pause")
         self.play_pause_btn.Bind(wx.EVT_BUTTON, self._on_toggle_pause)
         self.play_pause_btn.Bind(wx.EVT_NAVIGATION_KEY, self._on_navigation_key)
         self.play_pause_btn.Bind(wx.EVT_CHAR_HOOK, self._on_key_down)
 
         self.stop_btn = wx.Button(self.controls_panel, label="Stop")
+        self.stop_btn.SetName("Stop Playback")
         self.stop_btn.Bind(wx.EVT_BUTTON, lambda evt: self.stop(evt, manual=True))
         self.stop_btn.Bind(wx.EVT_NAVIGATION_KEY, self._on_navigation_key)
         self.stop_btn.Bind(wx.EVT_CHAR_HOOK, self._on_key_down)
 
         self.cast_btn = wx.Button(self.controls_panel, label="Cast")
+        self.cast_btn.SetName("Cast to Device")
         self.cast_btn.Bind(wx.EVT_BUTTON, self._on_cast)
         self.cast_btn.Bind(wx.EVT_NAVIGATION_KEY, self._on_navigation_key)
         self.cast_btn.Bind(wx.EVT_CHAR_HOOK, self._on_key_down)
 
         self.fullscreen_btn = wx.Button(self.controls_panel, label="Full Screen")
+        self.fullscreen_btn.SetName("Toggle Full Screen")
         self.fullscreen_btn.Bind(wx.EVT_BUTTON, self._on_toggle_fullscreen)
         self.fullscreen_btn.Bind(wx.EVT_NAVIGATION_KEY, self._on_navigation_key)
         self.fullscreen_btn.Bind(wx.EVT_CHAR_HOOK, self._on_key_down)
@@ -245,6 +249,7 @@ class InternalPlayerFrame(wx.Frame):
             maxValue=100,
             style=wx.SL_HORIZONTAL,
         )
+        self.volume_slider.SetName("Volume Control")
         self.volume_slider.Bind(wx.EVT_SLIDER, self._on_volume_slider)
 
         controls.Add(self.play_pause_btn, 0, wx.ALL, 5)
@@ -392,6 +397,10 @@ class InternalPlayerFrame(wx.Frame):
         self._schedule_volume_apply()
         self._status_timer.Start(500)
         self._update_status_label("Buffering...")
+        
+        # Ensure focus returns to the controls for screen readers
+        if video_visible:
+            wx.CallAfter(self.play_pause_btn.SetFocus)
 
     def stop(self, _evt: Optional[wx.Event] = None, manual: bool = False) -> None:
         manual_stop = manual or (_evt is not None)
@@ -1296,9 +1305,6 @@ class InternalPlayerFrame(wx.Frame):
 
     def _on_key_down(self, event: wx.KeyEvent) -> None:
         key = event.GetKeyCode()
-        if key == wx.WXK_TAB:
-            self._focus_control_step(not event.ShiftDown())
-            return
         
         # Volume control with optional Ctrl modifier for speed
         if key in (wx.WXK_UP, wx.WXK_NUMPAD_UP):

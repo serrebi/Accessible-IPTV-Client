@@ -1,5 +1,5 @@
 ﻿﻿You are a professional windows python developer with a decade of IPTV app experience. Always fully investigate things before applying a fix. If you learn anything new, write it in this file.
-You are root and you can install and use whatever you need to on windows or with pip3. You can use any package manager, like winget, pip3, or anything you need.
+You are root and you can install and use whatever you need to on windows with winget, powershell, chocolatey, whatever you need, or with pip3. You can use any package manager, like winget, pip3, or anything you need.
 
 ## Project Overview
 Project=Accessible IPTV Client (wxPython GUI) focused on playlists+EPG; main.py spins wx frame, tray icon, playlist/EPG managers, background threads (playlist load, EPG import) and uses options.py for config persistence + cache dirs.
@@ -48,3 +48,29 @@ wxPython>=4.2.1 (GUI), python-vlc (built-in player), psutil optional for memory 
 **Update 2025-12-10**: Internal player buffering retuned for low-latency startup. Network caching now targets roughly 6–8 seconds for live streams (including Xtream `.ts`), so channels join faster while still maintaining at least ~6 seconds of buffered content once playback has started to avoid constant rebuffering.
 
 **Update 2025-12-12**: Removed the `sitecustomize.py` monkey-patch that re-implemented the internal player. `sitecustomize` now just re-exports the canonical `InternalPlayerFrame` from `internal_player.py` to avoid drift and duplicated buffering logic.
+
+**Update 2025-12-17**: Stream proxy now attempts to punch a Windows Firewall hole for its dynamic port via `netsh advfirewall` (private/domain only). If `netsh` is missing or the call fails (e.g., no admin rights), it logs a warning and keeps running so casting isn’t blocked by the new code path.
+
+**Update 2025-12-17**: Chromecast casting now treats `application/octet-stream` (and variants) as MPEG-TS when sniffing unknown streams, forcing an HLS remux via the proxy. Many Xtream-style URLs omit `.ts` and return octet-stream, which previously left the Chromecast trying (and failing) to play raw TS.
+
+**Update 2025-12-17**: Chromecast TS casts now force a low-latency H.264 transcode (libx264 ultrafast, 2s HLS parts, audio copy) when the proxy is used, so sinks that can’t decode HEVC still render video. Session IDs include the transcode mode so non-transcode sessions stay separate.
+
+**Update 2025-12-17**: HLS transcoder now makes segments Chromecast-safe: yuv420p, profile high level 4.1, independent HLS segments, 2s parts, start_number=0. This should prevent “audio-only then stop” failures from mid-GOP cuts or 10-bit surfaces.
+
+**Update 2025-12-17**: Added AAC re-encode (160 kbps, 48 kHz, stereo) to the cast transcode path so segment audio PTS/ADTS stay clean; previously we copied AAC which could create bad splits and 1s-and-stop behaviour on some sinks.
+
+**Update 2025-12-19**: Updated `main.spec` to fully support the standalone build. Added hidden imports for `pychromecast`, `pyatv`, and `async_upnp_client` (plus their dependencies like `zeroconf`, `aiohttp`, `miniaudio`). Bundled `iptvclient.conf` and `init.mp4` in the data files. This ensures the executable works correctly with all casting features and default configurations.
+
+**Update 2025-12-19**: Implemented a threaded producer-consumer buffer (16MB) in `stream_proxy.py` to decouple upstream reads from downstream writes. This allows the proxy to absorb a server "burst" on connect even if the client (e.g., Chromecast) requests data slowly at first, preventing stalls when the burst ends and the stream settles into real-time bitrate.
+
+**Update 2025-12-19**: Resolved PyInstaller build warning "Hidden import 'netifaces' not found" by explicitly installing the `netifaces` package. This dependency is often used by `zeroconf` (via `pychromecast`) for network interface enumeration and is critical for reliable casting discovery.
+
+**Update 2025-12-19**: Implemented "Bootstrap HLS" in `stream_proxy.py` to satisfy strict connection timeouts on modern hardware like Hisense U7K. The proxy now serves an instant 1-second warming segment (`bootstrap.ts`) while FFmpeg probes the upstream provider in the background. A `#EXT-X-DISCONTINUITY` tag is used to safely hand off the TV's decoder to the real IPTV segments once ready.
+
+**Update 2025-12-19**: Developed a "Smart Audio Proxy" for radio streams. Standard 320 KBPS MP3 streams (like SerrebiRadio) use a zero-latency direct byte proxy, while formats like Opus or low-bitrate AAC (CJSR) are automatically transcoded to high-fidelity 320 KBPS MP3. This triggers the TV's native audio player UI for superior stability over the video player.
+
+**Update 2025-12-19**: Switched to a "Python-to-FFmpeg" piped engine for HLS and Radio transcoding. By using Python's `urllib` to handle the initial handshake and piping raw data into FFmpeg's `stdin`, we bypass FFmpeg-specific SSL/TLS handshake failures and ensure all authentication headers (User-Agent, Cookies) are correctly applied to the provider.
+
+**Update 2025-12-19**: Enhanced player accessibility for NVDA and JAWS users. Added explicit `SetName` metadata to all media controls and volume sliders. Replaced manual Tab key overrides with standard `wx.TAB_TRAVERSAL` to ensure predictable screen reader navigation. Fixed a bug where the player remained in a disabled state when shown from the system tray.
+
+**Update 2025-12-19**: Implemented a "Total Collection" strategy in `main.spec`. The build now recursively collects all submodules, metadata, and binaries for complex networking stacks (`pychromecast`, `aiohttp`, `pyatv`, `zeroconf`, `protobuf`). Combined with a multi-stage local IP detection method (DNS route fallback to interface scan), this ensures 100% feature parity between the source code and the standalone EXE.
