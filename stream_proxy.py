@@ -16,7 +16,22 @@ import time
 import hashlib
 import queue
 
+import sys
+
 LOG = logging.getLogger(__name__)
+
+def get_ffmpeg_path():
+    """Resolve ffmpeg path, prioritizing bundled executable in frozen mode."""
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        bundled = os.path.join(sys._MEIPASS, 'ffmpeg.exe')
+        if os.path.exists(bundled):
+            return bundled
+    
+    # Fallback to PATH or local file
+    if os.path.exists("ffmpeg.exe"):
+        return os.path.abspath("ffmpeg.exe")
+        
+    return "ffmpeg"
 
 class HLSConverter:
     def __init__(self, source_url, headers=None, transcode_profile: str = "auto"):
@@ -37,7 +52,7 @@ class HLSConverter:
     def start(self):
         # Video HLS engine (piped)
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            get_ffmpeg_path(), "-hide_banner", "-loglevel", "error",
             "-analyzeduration", "5000000", "-probesize", "5000000",
             "-fflags", "nobuffer+genpts+igndts",
             "-flags", "low_delay",
@@ -119,6 +134,7 @@ class StreamProxyHandler(http.server.BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             target_url = query.get('url', [None])[0]
             if not target_url: return self.send_error(400)
+            mode = (query.get('mode', [None])[0] or '').strip().lower()
             
             headers_json = query.get('headers', [None])[0]
             req_headers = {}
@@ -131,7 +147,9 @@ class StreamProxyHandler(http.server.BaseHTTPRequestHandler):
                 req_headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'
 
             # --- RADIO Path ---
-            if "radio" in target_url.lower() or "streamon.fm" in target_url.lower() or parsed.path == '/audio':
+            target_lower = target_url.lower()
+            force_audio = mode == "audio"
+            if force_audio or "radio" in target_lower or "streamon.fm" in target_lower or parsed.path == '/audio':
                 self.send_response(200)
                 self.send_header('Content-Type', 'audio/mpeg')
                 self.send_header('Icy-MetaData', '1')
@@ -140,21 +158,49 @@ class StreamProxyHandler(http.server.BaseHTTPRequestHandler):
 
                 # Transcode to 320k MP3 if not already high-quality MP3
                 # This handles Opus (RadioHD), AAC (CJSR), and others.
-                is_mp3 = target_url.lower().endswith(".mp3") or "SerrebiRadio" in target_url
+                is_mp3 = target_lower.endswith(".mp3") or "SerrebiRadio" in target_url
                 if not is_mp3 or "RadioHD" in target_url or "CJSR" in target_url:
                     cmd = [
-                        "ffmpeg", "-hide_banner", "-loglevel", "error",
-                        "-user_agent", req_headers.get("User-Agent", "Mozilla/5.0"),
-                        "-i", target_url, "-vn",
+                        get_ffmpeg_path(), "-hide_banner", "-loglevel", "error",
+                        "-i", "pipe:0", "-vn",
                         "-c:a", "libmp3lame", "-b:a", "320k", "-ar", "44100",
                         "-f", "mp3", "pipe:1"
                     ]
                     creation_flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=creation_flags)
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=creation_flags
+                    )
+                    def _pump_audio():
+                        try:
+                            req = urllib.request.Request(target_url, headers=req_headers)
+                            with urllib.request.urlopen(req, timeout=15) as resp:
+                                while proc and proc.poll() is None:
+                                    chunk = resp.read(32768)
+                                    if not chunk:
+                                        break
+                                    try:
+                                        proc.stdin.write(chunk)
+                                        proc.stdin.flush()
+                                    except Exception:
+                                        break
+                        except Exception as e:
+                            LOG.error("Radio pump error: %s", e)
+                        finally:
+                            if proc and proc.stdin:
+                                try:
+                                    proc.stdin.close()
+                                except Exception:
+                                    pass
+                    threading.Thread(target=_pump_audio, daemon=True).start()
                     try:
                         while True:
                             chunk = proc.stdout.read(16384)
-                            if not chunk: break
+                            if not chunk:
+                                break
                             self.wfile.write(chunk)
                     except: pass
                     finally:
@@ -243,7 +289,7 @@ class StreamProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             cmd = [
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                get_ffmpeg_path(), "-hide_banner", "-loglevel", "error",
                 "-f", "lavfi", "-i", "color=c=black:s=640x360:r=10:d=1",
                 "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
                 "-t", "1", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-b:v", "1M",

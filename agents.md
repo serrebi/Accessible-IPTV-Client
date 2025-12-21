@@ -1,6 +1,6 @@
 ﻿﻿You are a professional windows python developer with a decade of IPTV app experience. Always fully investigate things before applying a fix. If you learn anything new, write it in this file.
 You are root and you can install and use whatever you need to on windows with winget, powershell, chocolatey, whatever you need, or with pip3. You can use any package manager, like winget, pip3, or anything you need.
-
+Make sure the spec file has all requirements and submodules included in the build.
 ## Project Overview
 Project=Accessible IPTV Client (wxPython GUI) focused on playlists+EPG; main.py spins wx frame, tray icon, playlist/EPG managers, background threads (playlist load, EPG import) and uses options.py for config persistence + cache dirs.
 
@@ -74,3 +74,7 @@ wxPython>=4.2.1 (GUI), python-vlc (built-in player), psutil optional for memory 
 **Update 2025-12-19**: Enhanced player accessibility for NVDA and JAWS users. Added explicit `SetName` metadata to all media controls and volume sliders. Replaced manual Tab key overrides with standard `wx.TAB_TRAVERSAL` to ensure predictable screen reader navigation. Fixed a bug where the player remained in a disabled state when shown from the system tray.
 
 **Update 2025-12-19**: Implemented a "Total Collection" strategy in `main.spec`. The build now recursively collects all submodules, metadata, and binaries for complex networking stacks (`pychromecast`, `aiohttp`, `pyatv`, `zeroconf`, `protobuf`). Combined with a multi-stage local IP detection method (DNS route fallback to interface scan), this ensures 100% feature parity between the source code and the standalone EXE.
+
+**Update 2025-12-20**: Stream proxy now honors `mode=audio` and pipes radio transcoding through Python -> FFmpeg so auth headers/cookies are preserved; internal player buffer defaults align with README (2s base / 18s max) and treat 0 as unset to avoid zero-buffer playback.
+
+**Update 2025-12-20**: PyInstaller spec now explicitly bundles PyATV/UPnP dependencies (pydantic, srptools, tinytag, tabulate, defusedxml, didl_lite, voluptuous, chacha20poly1305_reuseable, requests deps) plus `iptvclient.conf` so frozen builds include all dynamic imports and default config.

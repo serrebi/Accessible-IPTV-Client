@@ -5,7 +5,10 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 sys.setrecursionlimit(5000)
 
-datas = [('init.mp4', '.')]
+datas = [
+    ('init.mp4', '.'),
+    ('ffmpeg.exe', '.'),
+]
 binaries = []
 hiddenimports = [
     'logging.handlers',
@@ -36,6 +39,20 @@ packages_to_bundle = [
     'aiohttp',
     'requests',
     'cryptography',
+    'chacha20poly1305_reuseable',
+    'pydantic',
+    'pydantic_core',
+    'annotated_types',
+    'typing_extensions',
+    'srptools',
+    'tabulate',
+    'tinytag',
+    'defusedxml',
+    'didl_lite',
+    'voluptuous',
+    'certifi',
+    'idna',
+    'urllib3',
     'psutil',
     'netifaces',
     'ifaddr',

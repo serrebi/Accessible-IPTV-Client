@@ -37,6 +37,7 @@ from providers import (
 from casting import CastingManager, CastDevice, CastProtocol
 from http_headers import channel_http_headers
 from external_player import ExternalPlayerLauncher
+from stream_proxy import get_ffmpeg_path
 
 try:
     from internal_player import (
@@ -113,7 +114,9 @@ def set_linux_env():
 def check_ffmpeg() -> bool:
     try:
         creation_flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, timeout=10, creationflags=creation_flags)
+        # Use the resolved ffmpeg path (bundled or system)
+        ffmpeg_bin = get_ffmpeg_path()
+        result = subprocess.run([ffmpeg_bin, '-version'], capture_output=True, text=True, timeout=10, creationflags=creation_flags)
         return result.returncode == 0
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False

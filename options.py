@@ -21,6 +21,8 @@ import tempfile
 CONFIG_FILE = "iptvclient.conf"
 _CONFIG_PATH = None  # Path of config last loaded/saved
 _IS_WINDOWS = platform.system() == "Windows"
+DEFAULT_INTERNAL_PLAYER_BUFFER_SECONDS = 2.0
+DEFAULT_INTERNAL_PLAYER_MAX_BUFFER_SECONDS = 18.0
 
 _WINDOWS_TZ_RESETTER = None
 _WINDOWS_TZ_LOCK = threading.Lock()
@@ -196,23 +198,23 @@ def get_config_write_target():
 
 def _apply_internal_player_bounds(cfg: Dict) -> None:
     """Coerce internal player buffering settings into valid ranges."""
-    max_val = cfg.get("internal_player_max_buffer_seconds", 60.0)
+    max_val = cfg.get("internal_player_max_buffer_seconds", DEFAULT_INTERNAL_PLAYER_MAX_BUFFER_SECONDS)
     try:
         max_val = float(max_val)
     except Exception:
-        max_val = 60.0
-    if max_val < 0:
-        max_val = 0.0
+        max_val = DEFAULT_INTERNAL_PLAYER_MAX_BUFFER_SECONDS
+    if max_val <= 0:
+        max_val = DEFAULT_INTERNAL_PLAYER_MAX_BUFFER_SECONDS
     max_val = min(max_val, 300.0)  # Allow up to 5 mins buffer for stability
     cfg["internal_player_max_buffer_seconds"] = max_val
 
-    base_val = cfg.get("internal_player_buffer_seconds", 4.0)
+    base_val = cfg.get("internal_player_buffer_seconds", DEFAULT_INTERNAL_PLAYER_BUFFER_SECONDS)
     try:
         base_val = float(base_val)
     except Exception:
-        base_val = 4.0
-    if base_val < 0:
-        base_val = 0.0
+        base_val = DEFAULT_INTERNAL_PLAYER_BUFFER_SECONDS
+    if base_val <= 0:
+        base_val = DEFAULT_INTERNAL_PLAYER_BUFFER_SECONDS
     if base_val > max_val:
         base_val = max_val
     cfg["internal_player_buffer_seconds"] = base_val
@@ -266,8 +268,8 @@ def load_config() -> Dict:
         "epgs": [],
         "media_player": "VLC",
         "custom_player_path": "",
-        "internal_player_buffer_seconds": 0.0,
-        "internal_player_max_buffer_seconds": 0.0,
+        "internal_player_buffer_seconds": DEFAULT_INTERNAL_PLAYER_BUFFER_SECONDS,
+        "internal_player_max_buffer_seconds": DEFAULT_INTERNAL_PLAYER_MAX_BUFFER_SECONDS,
         "internal_player_variant_max_mbps": 0.0,
         "minimize_to_tray": False,
         "epg_enabled": True,
@@ -284,7 +286,7 @@ def load_config() -> Dict:
                     for k, v in default.items():
                         data.setdefault(k, v)
                     if data.get("internal_player_buffer_seconds") == 12.0:
-                        data["internal_player_buffer_seconds"] = 2.0
+                        data["internal_player_buffer_seconds"] = DEFAULT_INTERNAL_PLAYER_BUFFER_SECONDS
                     resolve_internal_player_settings(data)
                     _CONFIG_PATH = p
                     return data
