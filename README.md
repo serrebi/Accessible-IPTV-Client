@@ -43,14 +43,19 @@ A vibe coded, accessible, keyboard-first IPTV player that works well with screen
 
 ## Build A Standalone App (Windows or Linux)
 
-If you want a single executable you can copy around:
+If you want a standalone build you can distribute:
 
+### Windows
+1. Run the `build_exe.bat` script in the project folder. This will install dependencies and build the app using the configuration in `main.spec`.
+2. Your build folder will be in `dist\iptvclient`.
+
+### Linux (or Manual Windows Build)
 1. From the project folder, install the bundler and build:
 
    - `pip install pyinstaller`
-   - `pyinstaller --noconsole --onefile main.py`
+   - `pyinstaller --clean main.spec`
 
-2. Your executable will be in the `./dist` folder when the build finishes.
+2. Your build folder (containing the executable and all dependencies) will be in the `dist\iptvclient` folder when the build finishes. You should distribute the entire folder.
 
 ## First-Time Setup In The App
 
