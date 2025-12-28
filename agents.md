@@ -82,3 +82,5 @@ wxPython>=4.2.1 (GUI), python-vlc (built-in player), psutil optional for memory 
 **Update 2025-12-22**: Switched the PyInstaller build strategy from `--onefile` to `--onedir`. Users reported that the single-executable version failed to run on some systems. Distributing the app as a directory (folder) improves reliability, reduces startup time (no extraction needed), and makes debugging dependency issues easier. Updated `main.spec` and `README.md` to reflect this change.
 
 **Update 2025-12-22**: Aligned all build artifacts (`main.spec`, `README.md`, `build.bat`, `build_exe.bat`) to consistently use the `--onedir` strategy with the output folder `dist\iptvclient`. Verified that all necessary binaries (`ffmpeg.exe`, `init.mp4`) and configuration files are correctly collected into the distribution folder alongside the DLLs.
+
+**Update 2025-12-23**: Added a Windows auto-updater that pulls a GitHub release manifest, validates SHA-256 + Authenticode signatures, stages updates with rollback, and restarts via a helper script.

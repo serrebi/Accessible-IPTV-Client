@@ -1,4 +1,5 @@
 import os
+import sys
 import shutil
 import json
 import socket
@@ -24,8 +25,10 @@ import wx.adv
 from options import (
     load_config, save_config, get_cache_path_for_url, get_cache_dir,
     get_db_path, canonicalize_name, extract_group, utc_to_local,
-    CustomPlayerDialog, resolve_internal_player_settings
+    CustomPlayerDialog, resolve_internal_player_settings, get_app_dir
 )
+import app_meta
+import updater
 from playlist import (
     EPGDatabase, EPGManagerDialog, PlaylistManagerDialog
 )
@@ -314,6 +317,7 @@ class IPTVClient(wx.Frame):
         self.default_player = self.config.get("media_player", "Built-in Player")
         self.custom_player_path = self.config.get("custom_player_path", "")
         self.show_player_on_enter = self._bool_pref(self.config.get("show_player_on_enter", True), default=True)
+        self.auto_check_updates = self._bool_pref(self.config.get("auto_check_updates", True), default=True)
         self.epg_importing = False
         self.epg_cache = {}
         self.epg_cache_lock = threading.Lock()
@@ -325,6 +329,8 @@ class IPTVClient(wx.Frame):
         self.provider_clients: Dict[str, object] = {}
         self.provider_epg_sources: List[str] = []
         self._internal_player_frame: Optional[InternalPlayerFrame] = None
+        self._update_check_inflight = False
+        self._update_install_pending = False
 
         # Casting Manager
         self.caster = CastingManager()
@@ -355,6 +361,9 @@ class IPTVClient(wx.Frame):
 
         # Defer all loading. This call starts ONLY the playlist loading thread.
         wx.CallAfter(self.start_playlist_load)
+
+        if self.auto_check_updates:
+            wx.CallLater(3000, lambda: self._start_update_check(interactive=False))
         
         self.Bind(wx.EVT_ICONIZE, self.on_minimize)
         self.Bind(wx.EVT_CLOSE, self.on_close)
@@ -428,6 +437,12 @@ class IPTVClient(wx.Frame):
         if hasattr(self, "show_player_on_enter_item"):
             try:
                 self.show_player_on_enter_item.Check(self.show_player_on_enter)
+            except Exception:
+                pass
+        self.auto_check_updates = self._bool_pref(self.config.get("auto_check_updates", True), default=True)
+        if hasattr(self, "auto_check_updates_item"):
+            try:
+                self.auto_check_updates_item.Check(self.auto_check_updates)
             except Exception:
                 pass
         event.Skip()
@@ -778,6 +793,14 @@ class IPTVClient(wx.Frame):
                 show_enter_item.Check(self.show_player_on_enter)
                 self.Bind(wx.EVT_MENU, self.on_toggle_show_player_on_enter, id=show_enter_id)
                 menu.AppendSeparator()
+
+                auto_update_id = 1103
+                auto_update_item = menu.AppendCheckItem(auto_update_id, "Auto-check for Updates")
+                auto_update_item.Check(self.auto_check_updates)
+                self.Bind(wx.EVT_MENU, self.on_toggle_auto_check_updates, id=auto_update_id)
+                menu.Append(1006, "Check for Updates")
+                self.Bind(wx.EVT_MENU, self.on_check_updates, id=1006)
+                menu.AppendSeparator()
                 
                 # Casting Menu Item (Linux)
                 menu.Append(1005, "Cast To...")
@@ -824,6 +847,8 @@ class IPTVClient(wx.Frame):
             om.AppendSubMenu(player_menu, "Media Player to Use")
             self.min_to_tray_item = om.AppendCheckItem(wx.ID_ANY, "Minimize to System Tray")
             self.show_player_on_enter_item = om.AppendCheckItem(wx.ID_ANY, "Show Player on Enter")
+            self.auto_check_updates_item = om.AppendCheckItem(wx.ID_ANY, "Auto-check for Updates")
+            self.check_updates_item = om.Append(wx.ID_ANY, "Check for Updates...")
             om.AppendSeparator()
             mb.Append(om, "Options")
             self.SetMenuBar(mb)
@@ -841,10 +866,13 @@ class IPTVClient(wx.Frame):
             self.Bind(wx.EVT_MENU, self._select_custom_player, self.player_Custom)
             self.Bind(wx.EVT_MENU, self.on_toggle_min_to_tray, self.min_to_tray_item)
             self.Bind(wx.EVT_MENU, self.on_toggle_show_player_on_enter, self.show_player_on_enter_item)
+            self.Bind(wx.EVT_MENU, self.on_toggle_auto_check_updates, self.auto_check_updates_item)
+            self.Bind(wx.EVT_MENU, self.on_check_updates, self.check_updates_item)
             self.Bind(wx.EVT_MENU_OPEN, self.on_menu_open)
             self._sync_player_menu_from_config()
             self.min_to_tray_item.Check(self.minimize_to_tray)
             self.show_player_on_enter_item.Check(self.show_player_on_enter)
+            self.auto_check_updates_item.Check(self.auto_check_updates)
 
         self.group_list.Bind(wx.EVT_LISTBOX, lambda _: self.on_group_select())
         self.filter_box.Bind(wx.EVT_TEXT_ENTER, lambda _: self.apply_filter())
@@ -974,6 +1002,172 @@ class IPTVClient(wx.Frame):
             if frame and frame.IsShown():
                 frame.Hide()
 
+    def on_toggle_auto_check_updates(self, event):
+        self.auto_check_updates = event.IsChecked()
+        self.config["auto_check_updates"] = self.auto_check_updates
+        save_config(self.config)
+
+    def on_check_updates(self, _):
+        self._start_update_check(interactive=True)
+
+    def _start_update_check(self, interactive: bool):
+        if self._update_check_inflight:
+            if interactive:
+                wx.MessageBox("Update check is already running.", "Updates", wx.OK | wx.ICON_INFORMATION)
+            return
+        self._update_check_inflight = True
+        threading.Thread(target=self._check_updates_worker, args=(interactive,), daemon=True).start()
+
+    def _check_updates_worker(self, interactive: bool):
+        try:
+            if platform.system() != "Windows":
+                raise updater.UpdateError("Updates are only supported on Windows builds.")
+            if not getattr(sys, "frozen", False):
+                raise updater.UpdateError("Updates are only available in the packaged build.")
+
+            release = updater.fetch_latest_release(app_meta.GITHUB_OWNER, app_meta.GITHUB_REPO)
+            tag = release.get("tag_name") or ""
+            latest_version = updater.normalize_version_tag(tag)
+            if not latest_version:
+                raise updater.UpdateError("Latest release tag is missing or invalid.")
+
+            current_version = app_meta.APP_VERSION
+            if not updater.is_newer_version(current_version, latest_version):
+                if interactive:
+                    wx.CallAfter(
+                        wx.MessageBox,
+                        f"{app_meta.APP_DISPLAY_NAME} is up to date (v{current_version}).",
+                        "Updates",
+                        wx.OK | wx.ICON_INFORMATION,
+                    )
+                return
+
+            notes = release.get("body") or ""
+            wx.CallAfter(self._prompt_update, latest_version, current_version, notes, release)
+        except updater.UpdateError as exc:
+            if interactive:
+                wx.CallAfter(
+                    wx.MessageBox,
+                    f"Update check failed: {exc}",
+                    "Updates",
+                    wx.OK | wx.ICON_ERROR,
+                )
+        finally:
+            self._update_check_inflight = False
+
+    def _prompt_update(self, latest_version: str, current_version: str, notes: str, release: Dict):
+        summary = updater.summarize_release_notes(notes)
+        message = (
+            f"Update available: v{latest_version} (current v{current_version}).\n\n"
+            f"{summary}\n\n"
+            "Download and install now? The app will restart after the update."
+        )
+        dlg = wx.MessageDialog(self, message, "Update Available", wx.YES_NO | wx.ICON_INFORMATION)
+        try:
+            if dlg.ShowModal() == wx.ID_YES:
+                self._start_update_download(release)
+        finally:
+            dlg.Destroy()
+
+    def _start_update_download(self, release: Dict):
+        threading.Thread(target=self._download_update_worker, args=(release,), daemon=True).start()
+
+    def _download_update_worker(self, release: Dict):
+        temp_root = None
+        try:
+            manifest = updater.fetch_update_manifest(
+                release,
+                app_meta.UPDATE_MANIFEST_NAME,
+            )
+            if not updater.is_newer_version(app_meta.APP_VERSION, manifest.version):
+                raise updater.UpdateError("Update manifest version is not newer than the current app.")
+
+            temp_root = tempfile.mkdtemp(prefix="iptvclient_update_")
+            zip_path = os.path.join(temp_root, manifest.asset_filename)
+            digest = updater.download_file_with_sha256(manifest.download_url, zip_path)
+            if digest.lower() != manifest.sha256.lower():
+                raise updater.UpdateError("Downloaded update failed SHA-256 verification.")
+
+            extract_root = os.path.join(temp_root, "extracted")
+            updater.safe_extract_zip(zip_path, extract_root)
+
+            exe_name = os.path.basename(sys.executable)
+            new_exe = updater.find_executable(extract_root, exe_name)
+            if not new_exe:
+                raise updater.UpdateError(f"Updated executable '{exe_name}' not found in the package.")
+
+            updater.verify_authenticode(new_exe)
+
+            staging_dir = os.path.dirname(new_exe)
+            install_dir = os.path.dirname(sys.executable)
+            backup_dir = f"{install_dir}.bak.{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+
+            helper_source = os.path.join(get_app_dir(), "update_helper.bat")
+            helper_ps1_source = os.path.join(get_app_dir(), "update_helper.ps1")
+            if not os.path.exists(helper_source) or not os.path.exists(helper_ps1_source):
+                raise updater.UpdateError("Update helper is missing from this build.")
+
+            helper_dir = os.path.join(temp_root, "helper")
+            os.makedirs(helper_dir, exist_ok=True)
+            helper_bat = os.path.join(helper_dir, "update_helper.bat")
+            helper_ps1 = os.path.join(helper_dir, "update_helper.ps1")
+            shutil.copy2(helper_source, helper_bat)
+            shutil.copy2(helper_ps1_source, helper_ps1)
+
+            wx.CallAfter(
+                self._launch_update_helper,
+                helper_bat,
+                install_dir,
+                staging_dir,
+                backup_dir,
+                exe_name,
+            )
+        except updater.UpdateError as exc:
+            wx.CallAfter(
+                wx.MessageBox,
+                f"Update failed: {exc}",
+                "Update Error",
+                wx.OK | wx.ICON_ERROR,
+            )
+            if temp_root:
+                try:
+                    shutil.rmtree(temp_root, ignore_errors=True)
+                except Exception:
+                    pass
+
+    def _launch_update_helper(
+        self,
+        helper_bat: str,
+        install_dir: str,
+        staging_dir: str,
+        backup_dir: str,
+        exe_name: str,
+    ):
+        wx.MessageBox(
+            "Update verified. The app will now close to install the update, then restart automatically.",
+            "Installing Update",
+            wx.OK | wx.ICON_INFORMATION,
+        )
+        creation_flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+        cmd = [
+            "cmd",
+            "/c",
+            helper_bat,
+            "--pid",
+            str(os.getpid()),
+            "--install-dir",
+            install_dir,
+            "--staging-dir",
+            staging_dir,
+            "--backup-dir",
+            backup_dir,
+            "--exe-name",
+            exe_name,
+        ]
+        subprocess.Popen(cmd, creationflags=creation_flags)
+        self._update_install_pending = True
+        self.Close()
+
     @staticmethod
     def _bool_pref(value, default: bool = False) -> bool:
         """Coerce config values that might be stored as bools/strings/ints."""
@@ -1101,7 +1295,7 @@ class IPTVClient(wx.Frame):
             event.Skip()
 
     def on_close(self, event):
-        if self.minimize_to_tray:
+        if self.minimize_to_tray and not self._update_install_pending:
             wx.CallAfter(self.show_tray_icon)
             event.Veto()
         else:

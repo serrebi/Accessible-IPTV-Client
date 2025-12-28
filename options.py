@@ -272,6 +272,7 @@ def load_config() -> Dict:
         "internal_player_max_buffer_seconds": DEFAULT_INTERNAL_PLAYER_MAX_BUFFER_SECONDS,
         "internal_player_variant_max_mbps": 0.0,
         "minimize_to_tray": False,
+        "auto_check_updates": True,
         "epg_enabled": True,
         "show_player_on_enter": True,
     }

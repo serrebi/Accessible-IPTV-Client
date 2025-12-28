@@ -1,17 +1,31 @@
 @echo off
-echo Cleaning up old build artifacts...
-if exist build rd /s /q build
-if exist dist rd /s /q dist
+setlocal
 
-echo Running PyInstaller...
-pyinstaller --noconfirm main.spec
+set "MODE=%~1"
+if "%MODE%"=="" set "MODE=build"
 
-if %ERRORLEVEL% EQU 0 (
+if /I "%MODE%"=="build" goto :run
+if /I "%MODE%"=="release" goto :run
+if /I "%MODE%"=="dry-run" goto :run
+
+echo Usage: build_exe.bat [build^|release^|dry-run]
+exit /b 1
+
+:run
+set "PYTHON=%PYTHON%"
+if "%PYTHON%"=="" set "PYTHON=python"
+set "SCRIPT=%~dp0tools\release.py"
+
+if not exist "%SCRIPT%" (
+    echo Release script not found: %SCRIPT%
+    exit /b 1
+)
+
+"%PYTHON%" "%SCRIPT%" %MODE%
+if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+if /I "%MODE%"=="build" (
     echo.
     echo Build successful!
-    echo Executable can be found in: dist\iptvclient\iptvclient.exe
-) else (
-    echo.
-    echo Build failed!
-    exit /b %ERRORLEVEL%
+    echo Executable can be found in: dist\iptvclient\IPTVClient.exe
 )

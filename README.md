@@ -46,7 +46,7 @@ A vibe coded, accessible, keyboard-first IPTV player that works well with screen
 If you want a standalone build you can distribute:
 
 ### Windows
-1. Run the `build_exe.bat` script in the project folder. This will install dependencies and build the app using the configuration in `main.spec`.
+1. Run `build.bat build` (or `build_exe.bat build`) in the project folder. This builds using `main.spec`, signs the exe, and creates a zip in `dist\release`.
 2. Your build folder will be in `dist\iptvclient`.
 
 ### Linux (or Manual Windows Build)
@@ -56,6 +56,38 @@ If you want a standalone build you can distribute:
    - `pyinstaller --clean main.spec`
 
 2. Your build folder (containing the executable and all dependencies) will be in the `dist\iptvclient` folder when the build finishes. You should distribute the entire folder.
+
+## Release Pipeline (Windows)
+
+Prerequisites:
+- Python 3.x with PyInstaller available (`pip install pyinstaller`)
+- `gh` CLI authenticated (`gh auth login`)
+- Code signing certificate installed
+- `signtool.exe` available (default path is used, or set `SIGNTOOL_PATH`)
+
+Commands:
+- `build.bat build` - build + sign + zip locally (no git tag/release)
+- `build.bat release` - compute next version, build, sign, zip, tag, push, and create a GitHub release
+- `build.bat dry-run` - show what would happen without changing git or creating a release
+
+Versioning rules:
+- Latest tag is parsed as semver (vMAJOR.MINOR[.PATCH], missing patch defaults to 0).
+- BREAKING CHANGE or `!:` in commits bumps MAJOR.
+- `feat` or `feature` in commits bumps MINOR.
+- Otherwise, PATCH is bumped.
+- If no prior semver tag exists, base version starts at `v1.4.2`.
+
+## Auto-Update (Windows)
+
+- The app checks GitHub Releases for updates (default auto-check on startup).
+- Manual check: Options menu -> Check for Updates.
+- Release assets include:
+  - `AccessibleIPTVClient-vX.Y.Z.zip` (full build)
+  - `AccessibleIPTVClient-update.json` (manifest with SHA-256 and download URL)
+- Security checks:
+  - SHA-256 verification of the downloaded zip
+  - Authenticode verification of the new exe before install
+- Updates install via a staging folder, create a backup, and restart the app.
 
 ## First-Time Setup In The App
 
@@ -102,11 +134,20 @@ The app stores settings in `iptvclient.conf` (JSON format). Key options:
 - `internal_player_max_buffer_seconds` - Maximum buffer ceiling
 - `internal_player_variant_max_mbps` - HLS quality cap in Mbps
 - `minimize_to_tray` - Whether to minimize to system tray
+- `auto_check_updates` - Whether to auto-check GitHub releases on startup (Windows)
 - `epg_enabled` - Whether EPG features are active
 
 ## Platform Notes
 
 - Windows and Linux are supported.
 - macOS is not supported at this time.
+
+## Manual Test Plan (Updater)
+
+1. Install or unzip a previous build (for example, from the v1.92 release) into a test folder.
+2. Run `build.bat release` to create a new GitHub release with the latest zip + manifest.
+3. Launch the older build and use Options -> Check for Updates (or wait for auto-check).
+4. Accept the update and confirm the app restarts at the new version.
+5. Verify the backup folder remains next to the install folder for rollback.
 
 That's it - add a playlist, optionally add an EPG, and enjoy.
