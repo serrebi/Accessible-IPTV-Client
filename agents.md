@@ -84,3 +84,5 @@ wxPython>=4.2.1 (GUI), python-vlc (built-in player), psutil optional for memory 
 **Update 2025-12-22**: Aligned all build artifacts (`main.spec`, `README.md`, `build.bat`, `build_exe.bat`) to consistently use the `--onedir` strategy with the output folder `dist\iptvclient`. Verified that all necessary binaries (`ffmpeg.exe`, `init.mp4`) and configuration files are correctly collected into the distribution folder alongside the DLLs.
 
 **Update 2025-12-23**: Added a Windows auto-updater that pulls a GitHub release manifest, validates SHA-256 + Authenticode signatures, stages updates with rollback, and restarts via a helper script.
+
+**Update 2025-12-28**: Updater now accepts a pinned Authenticode thumbprint from the release manifest (`signing_thumbprint`) so self-signed certs can pass verification when Windows reports UnknownError.

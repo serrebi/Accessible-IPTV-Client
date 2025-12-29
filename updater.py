@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 _VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)(?:\.(\d+))?$")
 
@@ -25,6 +25,7 @@ class UpdateManifest:
     sha256: str
     published_date: str
     release_notes_summary: Optional[str] = None
+    signing_thumbprints: Tuple[str, ...] = ()
 
 
 def parse_version(value: str) -> Optional[Tuple[int, int, int]]:
@@ -66,6 +67,34 @@ def _build_request(url: str) -> urllib.request.Request:
     return urllib.request.Request(url, headers=headers)
 
 
+def _normalize_thumbprint(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return value.replace(" ", "").strip().upper()
+
+
+def _normalize_thumbprints(values: Iterable[str]) -> Tuple[str, ...]:
+    normalized = {_normalize_thumbprint(value) for value in values if value}
+    normalized.discard("")
+    return tuple(sorted(normalized))
+
+
+def _env_thumbprints() -> Tuple[str, ...]:
+    raw = os.environ.get("ACCESSIBLEIPTVCLIENT_TRUSTED_SIGNING_THUMBPRINTS", "")
+    if not raw:
+        return ()
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _extract_manifest_thumbprints(payload: dict) -> Tuple[str, ...]:
+    raw = payload.get("signing_thumbprints") or payload.get("signing_thumbprint")
+    if isinstance(raw, str):
+        return (raw,)
+    if isinstance(raw, list):
+        return tuple(str(item).strip() for item in raw if item)
+    return ()
+
+
 def fetch_latest_release(owner: str, repo: str) -> dict:
     url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
     req = _build_request(url)
@@ -97,6 +126,7 @@ def fetch_update_manifest(release: dict, manifest_name: str) -> UpdateManifest:
         raise UpdateError("Update manifest download URL is missing.")
 
     data = download_json(url)
+    thumbprints = _normalize_thumbprints(list(_env_thumbprints()) + list(_extract_manifest_thumbprints(data)))
     try:
         return UpdateManifest(
             version=str(data["version"]),
@@ -105,6 +135,7 @@ def fetch_update_manifest(release: dict, manifest_name: str) -> UpdateManifest:
             sha256=str(data["sha256"]),
             published_date=str(data.get("published_date", "")),
             release_notes_summary=data.get("release_notes_summary"),
+            signing_thumbprints=thumbprints,
         )
     except KeyError as exc:
         raise UpdateError("Update manifest is missing required fields.") from exc
@@ -160,17 +191,41 @@ def find_executable(root: str, exe_name: str) -> Optional[str]:
     return None
 
 
-def verify_authenticode(exe_path: str) -> None:
+def verify_authenticode(exe_path: str, allowed_thumbprints: Iterable[str]) -> None:
+    allowed = set(_normalize_thumbprints(allowed_thumbprints))
     cmd = [
         "powershell",
         "-NoProfile",
         "-Command",
-        f"(Get-AuthenticodeSignature -FilePath '{exe_path}').Status",
+        (
+            f"$sig = Get-AuthenticodeSignature -FilePath '{exe_path}'; "
+            "$thumb = if ($sig.SignerCertificate) { $sig.SignerCertificate.Thumbprint } else { '' }; "
+            "$out = @{Status=$sig.Status.ToString(); StatusMessage=$sig.StatusMessage; Thumbprint=$thumb}; "
+            "$out | ConvertTo-Json -Compress"
+        ),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
-    status = result.stdout.strip()
-    if result.returncode != 0 or status.lower() != "valid":
-        raise UpdateError("Authenticode verification failed.")
+    if result.returncode != 0:
+        raise UpdateError(f"Authenticode verification failed: {result.stderr.strip() or result.stdout.strip()}")
+    try:
+        data = json.loads(result.stdout.strip() or "{}")
+    except json.JSONDecodeError as exc:
+        raise UpdateError("Authenticode verification returned invalid data.") from exc
+
+    status = str(data.get("Status") or "").strip()
+    status_msg = str(data.get("StatusMessage") or "").strip()
+    thumbprint = _normalize_thumbprint(data.get("Thumbprint"))
+
+    if status.lower() == "valid":
+        return
+    if thumbprint and thumbprint in allowed:
+        return
+    detail = f"Authenticode status was {status or 'Unknown'}."
+    if status_msg:
+        detail = f"{detail} {status_msg}"
+    if thumbprint:
+        detail = f"{detail} (thumbprint {thumbprint})."
+    raise UpdateError(detail)
 
 
 def summarize_release_notes(notes: str, max_lines: int = 6, max_chars: int = 600) -> str:
@@ -189,9 +244,10 @@ def build_manifest(
     download_url: str,
     sha256: str,
     release_notes_summary: Optional[str] = None,
+    signing_thumbprint: Optional[str] = None,
 ) -> dict:
     published = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-    return {
+    manifest = {
         "version": version,
         "asset_filename": asset_filename,
         "download_url": download_url,
@@ -199,3 +255,6 @@ def build_manifest(
         "published_date": published,
         "release_notes_summary": release_notes_summary,
     }
+    if signing_thumbprint:
+        manifest["signing_thumbprint"] = signing_thumbprint
+    return manifest

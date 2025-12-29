@@ -186,6 +186,27 @@ def sign_executable(exe_path):
     )
 
 
+def get_signing_thumbprint(exe_path):
+    override = os.environ.get("SIGN_CERT_THUMBPRINT", "").strip()
+    if override:
+        return override
+    result = run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            (
+                f"$sig = Get-AuthenticodeSignature -FilePath '{exe_path}'; "
+                "if ($sig.SignerCertificate) { $sig.SignerCertificate.Thumbprint }"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+    )
+    thumbprint = (result.stdout or "").strip()
+    return thumbprint
+
+
 def zip_folder(source_dir, zip_path):
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
         for root, _, files in os.walk(source_dir):
@@ -207,7 +228,7 @@ def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
 
-def build_assets(version, release_notes):
+def build_assets(version, release_notes, signing_thumbprint=None):
     dist_dir = os.path.join(REPO_ROOT, "dist", "iptvclient")
     if not os.path.isdir(dist_dir):
         raise RuntimeError("Build output not found at dist\\iptvclient.")
@@ -235,6 +256,7 @@ def build_assets(version, release_notes):
         download_url=download_url,
         sha256=asset_sha,
         release_notes_summary=summary,
+        signing_thumbprint=signing_thumbprint,
     )
     manifest_path = os.path.join(assets_dir, app_meta.UPDATE_MANIFEST_NAME)
     with open(manifest_path, "w", encoding="utf-8") as handle:
@@ -325,7 +347,8 @@ def main():
         run_pyinstaller()
         exe_path = os.path.join(REPO_ROOT, "dist", "iptvclient", app_meta.EXE_NAME)
         sign_executable(exe_path)
-        assets = build_assets(next_version, release_notes)
+        signing_thumbprint = get_signing_thumbprint(exe_path)
+        assets = build_assets(next_version, release_notes, signing_thumbprint)
         git_commit_and_tag(next_version)
         git_push(next_version)
         gh_release_create(next_version, assets)
@@ -337,7 +360,8 @@ def main():
         run_pyinstaller()
         exe_path = os.path.join(REPO_ROOT, "dist", "iptvclient", app_meta.EXE_NAME)
         sign_executable(exe_path)
-        build_assets(app_meta.APP_VERSION, release_notes)
+        signing_thumbprint = get_signing_thumbprint(exe_path)
+        build_assets(app_meta.APP_VERSION, release_notes, signing_thumbprint)
         return
 
     if args.mode == "dry-run":

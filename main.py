@@ -1096,7 +1096,7 @@ class IPTVClient(wx.Frame):
             if not new_exe:
                 raise updater.UpdateError(f"Updated executable '{exe_name}' not found in the package.")
 
-            updater.verify_authenticode(new_exe)
+            updater.verify_authenticode(new_exe, manifest.signing_thumbprints)
 
             staging_dir = os.path.dirname(new_exe)
             install_dir = os.path.dirname(sys.executable)
