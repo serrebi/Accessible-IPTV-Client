@@ -22,10 +22,22 @@ LOG = logging.getLogger(__name__)
 
 def get_ffmpeg_path():
     """Resolve ffmpeg path, prioritizing bundled executable in frozen mode."""
+    # PyInstaller onefile
     if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
         bundled = os.path.join(sys._MEIPASS, 'ffmpeg.exe')
         if os.path.exists(bundled):
             return bundled
+            
+    # PyInstaller onedir (PyInstaller 6+ puts it in _internal)
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+        internal = os.path.join(base_dir, '_internal', 'ffmpeg.exe')
+        if os.path.exists(internal):
+            return internal
+        # Old layout or user-placed
+        adjacent = os.path.join(base_dir, 'ffmpeg.exe')
+        if os.path.exists(adjacent):
+            return adjacent
     
     # Fallback to PATH or local file
     if os.path.exists("ffmpeg.exe"):
