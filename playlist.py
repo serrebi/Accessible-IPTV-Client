@@ -1773,6 +1773,7 @@ class EPGDatabase:
                 'connection reset',
                 'timed out',
                 'no element found',
+                'unclosed token',
             )
             try:
                 if isinstance(err, IncompleteRead):
