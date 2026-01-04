@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import zipfile
@@ -144,6 +145,9 @@ def update_version_file(new_version):
     path = os.path.join(REPO_ROOT, "app_meta.py")
     with open(path, "r", encoding="utf-8") as handle:
         data = handle.read()
+    current = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', data)
+    if current and current.group(1) == str(new_version):
+        return
     updated = re.sub(
         r'APP_VERSION\s*=\s*"[^\"]+"',
         f'APP_VERSION = "{new_version}"',
@@ -155,11 +159,36 @@ def update_version_file(new_version):
         handle.write(updated)
 
 
+def _remove_tree(path: str) -> None:
+    if not os.path.isdir(path):
+        return
+
+    if os.name == "nt":
+        cmd = [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Remove-Item -LiteralPath $args[0] -Recurse -Force -ErrorAction Stop",
+            path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0 and not os.path.exists(path):
+            return
+
+    def _on_error(func, failed_path, _exc_info):
+        try:
+            os.chmod(failed_path, stat.S_IWRITE)
+        except Exception:
+            pass
+        func(failed_path)
+
+    shutil.rmtree(path, onerror=_on_error)
+
+
 def clean_build_artifacts():
     for folder in ("build", "dist"):
         path = os.path.join(REPO_ROOT, folder)
-        if os.path.isdir(path):
-            shutil.rmtree(path)
+        _remove_tree(path)
 
 
 def run_pyinstaller():
