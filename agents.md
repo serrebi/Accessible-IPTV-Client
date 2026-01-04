@@ -86,3 +86,5 @@ wxPython>=4.2.1 (GUI), python-vlc (built-in player), psutil optional for memory 
 **Update 2025-12-23**: Added a Windows auto-updater that pulls a GitHub release manifest, validates SHA-256 + Authenticode signatures, stages updates with rollback, and restarts via a helper script.
 
 **Update 2025-12-28**: Updater now accepts a pinned Authenticode thumbprint from the release manifest (`signing_thumbprint`) so self-signed certs can pass verification when Windows reports UnknownError.
+
+**Update 2026-01-04**: Auto-update installs were failing because `main.py` launched `update_helper.bat` with GNU-style flags (`--pid`, `--install-dir`, etc.), but `update_helper.ps1` expects PowerShell parameter names (`-ParentPid`, `-InstallDir`, `-StagingDir`, `-BackupDir`, `-ExeName`). Updated the launcher args so the helper receives the correct parameters and updates apply successfully.
