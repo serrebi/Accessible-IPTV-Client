@@ -224,8 +224,8 @@ class StreamProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
 
                 # Determine if we need transcoding
-                is_mp3 = target_lower.endswith(".mp3") or "SerrebiRadio" in target_url
-                needs_transcode = not is_mp3 or "RadioHD" in target_url or "CJSR" in target_url
+                is_mp3 = target_lower.endswith(".mp3") or "serrebiradio" in target_lower
+                needs_transcode = not is_mp3 or "radiohd" in target_lower or "cjsr" in target_lower
 
                 # Shared buffer for decoupling download from client write
                 # 24KB fill = ~2s buffer at 96kbps, ensures smooth start without long wait
