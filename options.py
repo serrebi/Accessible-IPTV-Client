@@ -274,6 +274,7 @@ def load_config() -> Dict:
         "minimize_to_tray": False,
         "auto_check_updates": True,
         "epg_enabled": True,
+        "epg_auto_import_interval_hours": 6.0,
         "show_player_on_enter": True,
     }
     resolve_internal_player_settings(default)

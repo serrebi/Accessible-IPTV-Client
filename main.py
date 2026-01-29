@@ -331,6 +331,10 @@ class IPTVClient(wx.Frame):
         self._internal_player_frame: Optional[InternalPlayerFrame] = None
         self._update_check_inflight = False
         self._update_install_pending = False
+        self._playlist_load_token = 0
+        self._pending_epg_autostart = False
+        self._pending_epg_autostart_token = 0
+        self._epg_autostart_timer: Optional[wx.CallLater] = None
 
         # Casting Manager
         self.caster = CastingManager()
@@ -387,7 +391,15 @@ class IPTVClient(wx.Frame):
 
     def start_playlist_load(self):
         """Kicks off ONLY the playlist loading thread."""
-        threading.Thread(target=self._do_playlist_refresh, daemon=True).start()
+        self._playlist_load_token += 1
+        self._pending_epg_autostart = True
+        self._pending_epg_autostart_token = self._playlist_load_token
+        self._cancel_epg_autostart_timer()
+        threading.Thread(
+            target=self._do_playlist_refresh,
+            args=(self._playlist_load_token,),
+            daemon=True
+        ).start()
 
     def _ensure_db_tuned(self):
         """Enable WAL and indices so read lookups don’t stall behind imports."""
@@ -458,7 +470,7 @@ class IPTVClient(wx.Frame):
         # This full cycle can be triggered by the timer.
         self.start_playlist_load()
 
-    def _do_playlist_refresh(self):
+    def _do_playlist_refresh(self, refresh_token: int):
         """
         Loads playlists from cache for a fast UI update, then refreshes from the network.
         Crucially, it only starts the EPG import *after* playlists are loaded.
@@ -665,8 +677,12 @@ class IPTVClient(wx.Frame):
             
             return result
 
-        # Execute in parallel (fetching AND parsing)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        # Execute in parallel (fetching AND parsing) with a CPU-friendly cap.
+        source_count = len(playlist_sources)
+        cpu_count = os.cpu_count() or 2
+        worker_cap = max(2, cpu_count // 2)
+        max_workers = min(source_count if source_count else 1, worker_cap, 4)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(fetch_and_process_playlist, src) for src in playlist_sources]
             for future in concurrent.futures.as_completed(futures):
                 res = future.result()
@@ -697,13 +713,13 @@ class IPTVClient(wx.Frame):
         def finish_playlist_load_and_start_background_tasks():
             self.channels_by_group = channels_by_group
             self.all_channels = all_channels
+            self.reload_epg_sources()
+            self._pending_epg_autostart = True
+            self._pending_epg_autostart_token = refresh_token
             self._refresh_group_ui()
             self._cleanup_cache_and_channels(valid_caches)
-
             # Now that playlists are loaded, start the other processes.
-            self.reload_epg_sources()
             self.start_refresh_timer()
-            wx.CallLater(2000, self.start_epg_import_background)
 
         wx.CallAfter(finish_playlist_load_and_start_background_tasks)
 
@@ -1311,6 +1327,10 @@ class IPTVClient(wx.Frame):
                 self._stop_epg_poll_timer()
             except Exception:
                 pass
+            try:
+                self._cancel_epg_autostart_timer()
+            except Exception:
+                pass
             if hasattr(self, "_epg_executor"):
                 self._epg_executor.shutdown(wait=False)
             if self.caster:
@@ -1471,6 +1491,7 @@ class IPTVClient(wx.Frame):
 
             if not self.all_channels:
                 self.group_list.Append("No channels found.")
+                self._maybe_autostart_epg_import()
                 return
 
             self.group_list.Append(f"All Channels ({len(self.all_channels)})")
@@ -1502,11 +1523,80 @@ class IPTVClient(wx.Frame):
                 base.append(epg)
         self.epg_sources = base
 
-    def start_epg_import_background(self):
+    def _hash_epg_sources(self, sources: List[str]) -> str:
+        normalized = []
+        for src in sources:
+            if isinstance(src, str):
+                normalized.append(src.strip())
+            else:
+                try:
+                    normalized.append(json.dumps(src, sort_keys=True))
+                except Exception:
+                    normalized.append(str(src))
+        normalized.sort()
+        payload = "|".join(normalized).encode("utf-8", "ignore")
+        return hashlib.sha1(payload).hexdigest()
+
+    def _get_epg_auto_interval_seconds(self) -> float:
+        raw = self.config.get("epg_auto_import_interval_hours", 6.0)
+        try:
+            hours = float(raw)
+        except Exception:
+            hours = 6.0
+        if hours <= 0:
+            return 0.0
+        return hours * 3600.0
+
+    def _should_auto_import_epg(self, sources: List[str]) -> bool:
+        interval = self._get_epg_auto_interval_seconds()
+        if interval <= 0:
+            return True
+        try:
+            last_hash = self.config.get("epg_last_sources_hash", "")
+        except Exception:
+            last_hash = ""
+        current_hash = self._hash_epg_sources(sources)
+        if current_hash and current_hash != last_hash:
+            return True
+        db_path = get_db_path()
+        try:
+            age_sec = time.time() - os.path.getmtime(db_path)
+        except Exception:
+            return True
+        return age_sec >= interval
+
+    def _cancel_epg_autostart_timer(self):
+        if self._epg_autostart_timer:
+            try:
+                self._epg_autostart_timer.Stop()
+            except Exception:
+                pass
+            self._epg_autostart_timer = None
+
+    def _schedule_epg_autostart(self, token: int, delay_ms: int = 5000):
+        def _fire():
+            if token != self._playlist_load_token:
+                return
+            self._epg_autostart_timer = None
+            self.start_epg_import_background()
+        self._cancel_epg_autostart_timer()
+        self._epg_autostart_timer = wx.CallLater(delay_ms, _fire)
+
+    def _maybe_autostart_epg_import(self):
+        if not self._pending_epg_autostart:
+            return
+        if self._pending_epg_autostart_token != self._playlist_load_token:
+            return
+        self._pending_epg_autostart = False
+        self._schedule_epg_autostart(self._pending_epg_autostart_token)
+
+    def start_epg_import_background(self, *, force: bool = False):
         sources = list(self.epg_sources)
         if not sources or not self.config.get("epg_enabled", True):
             return
         if self.epg_importing:
+            return
+        if not force and not self._should_auto_import_epg(sources):
             return
         self.epg_importing = True
 
@@ -1514,11 +1604,13 @@ class IPTVClient(wx.Frame):
         wx.CallAfter(self._start_epg_poll_timer)
 
         def do_import():
+            success = False
             try:
                 db = EPGDatabase(get_db_path(), for_threading=True)
                 # Pass a coarse progress callback (per-source). The DB importer writes as it streams,
                 # so readers can pick up newly inserted rows during import.
                 db.import_epg_xml(sources)
+                success = True
                 try:
                     if hasattr(db, "close"):
                         db.close()
@@ -1529,10 +1621,10 @@ class IPTVClient(wx.Frame):
             except Exception:
                 pass
             finally:
-                wx.CallAfter(self.finish_import_background)
+                wx.CallAfter(self.finish_import_background, success)
         threading.Thread(target=do_import, daemon=True).start()
 
-    def finish_import_background(self):
+    def finish_import_background(self, success: bool = False):
         self.epg_importing = False
         # Stop import-specific polling and restart steady refresh timer
         self._stop_epg_poll_timer()
@@ -1540,6 +1632,13 @@ class IPTVClient(wx.Frame):
             self.epg_cache.clear()
         # Clear match cache as IDs/channels may have changed in the DB
         self._epg_match_cache.clear()
+        if success:
+            try:
+                self.config["epg_last_import_epoch"] = int(time.time())
+                self.config["epg_last_sources_hash"] = self._hash_epg_sources(self.epg_sources)
+                save_config(self.config)
+            except Exception:
+                pass
         self.on_highlight()
         self._start_epg_poll_timer()
 
@@ -1559,7 +1658,7 @@ class IPTVClient(wx.Frame):
             self.config["epgs"] = self.epg_sources
             save_config(self.config)
             self.reload_epg_sources()
-            wx.CallLater(1000, self.start_epg_import_background) # Start import after dialog closes
+            wx.CallLater(1000, lambda: self.start_epg_import_background(force=True)) # Start import after dialog closes
         dlg.Destroy()
 
     def import_epg(self, _):
@@ -1572,7 +1671,7 @@ class IPTVClient(wx.Frame):
             return
 
         wx.MessageBox("EPG import will start in the background.", "Import Started", wx.OK | wx.ICON_INFORMATION)
-        self.start_epg_import_background()
+        self.start_epg_import_background(force=True)
 
     def finish_import(self):
         # legacy-sounding API; ensure poll timer is stopped here too.
@@ -1929,6 +2028,7 @@ class IPTVClient(wx.Frame):
         if total == 0:
             self.epg_display.SetValue("")
             self.url_display.SetValue("")
+            self._maybe_autostart_epg_import()
             return
 
         # For small lists, append in one shot for speed
@@ -1949,6 +2049,7 @@ class IPTVClient(wx.Frame):
             self.channel_list.SetSelection(0)
             self.channel_list.SetFocus()
             self.on_highlight()
+            self._maybe_autostart_epg_import()
             return
 
         # For large lists, add in batches to keep UI responsive
@@ -1998,6 +2099,7 @@ class IPTVClient(wx.Frame):
             if idx >= total or token != self._populate_token:
                 if token == self._populate_token:
                     self.epg_display.SetValue("")
+                    self._maybe_autostart_epg_import()
                 return
             # update progress and schedule next chunk
             self.epg_display.SetValue(f"Loading channels… {idx}/{total}")
