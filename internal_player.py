@@ -842,6 +842,20 @@ class InternalPlayerFrame(wx.Frame):
                 LOG.warning("Failed to bind video surface: %s", err)
                 wx.CallLater(int(self._HANDLE_CHECK_INTERVAL * 1000), self._ensure_player_window)
 
+    @staticmethod
+    def _is_likely_audio(url: str) -> bool:
+        if not url:
+            return False
+        lower = url.lower()
+        # Common audio extensions
+        if lower.endswith((".mp3", ".aac", ".ogg", ".opus", ".flac", ".wav", ".m4a", ".wma")):
+            return True
+        # Common radio keywords
+        if any(token in lower for token in ("radio", "icecast", "shoutcast", "streamon.fm")):
+            if ".m3u8" not in lower and ".ts" not in lower:
+                return True
+        return False
+
     def _compute_buffer_profile(
         self,
         url: str,
@@ -852,13 +866,19 @@ class InternalPlayerFrame(wx.Frame):
         bitrate = bitrate_hint if bitrate_hint and bitrate_hint > 0 else self._estimate_stream_bitrate(url, headers=headers)
         base = self.base_buffer_seconds
         is_linear_ts = self._is_linear_ts(url)
+        is_audio = self._is_likely_audio(url)
+        
         cache_fraction = self._network_cache_fraction
         if is_linear_ts:
             cache_fraction = max(cache_fraction, self._ts_network_bias)
 
         # Simplified buffer logic: respect base buffer and scale up if needed, but never cap below base.
         # High bitrate streams on gigabit connections benefit from larger buffers, not smaller ones.
-        if bitrate is None:
+        if is_audio:
+            # Audio streams: prioritise fast start (2-3s) over massive buffers
+            # Users expect radio to start instantly.
+            raw_target = max(base, 2.0)
+        elif bitrate is None:
             raw_target = max(base, 12.0)
         elif bitrate <= 5.0:
             # Low bitrate: keep generous buffer
