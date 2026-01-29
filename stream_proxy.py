@@ -15,6 +15,7 @@ import os
 import time
 import hashlib
 import queue
+import collections
 
 import sys
 
@@ -129,6 +130,45 @@ class HLSConverter:
         return False
 
 
+class StreamBuffer:
+    def __init__(self, max_size=16 * 1024 * 1024):
+        self.max_size = max_size
+        self.buffer = collections.deque()
+        self.current_size = 0
+        self.lock = threading.Lock()
+        self.not_empty = threading.Condition(self.lock)
+        self.not_full = threading.Condition(self.lock)
+        self.closed = False
+        self.error = None
+
+    def write(self, chunk):
+        with self.lock:
+            while self.current_size + len(chunk) > self.max_size:
+                if self.closed: return
+                self.not_full.wait()
+            self.buffer.append(chunk)
+            self.current_size += len(chunk)
+            self.not_empty.notify()
+
+    def read(self):
+        with self.lock:
+            while not self.buffer:
+                if self.closed:
+                    if self.error: raise self.error
+                    return None
+                self.not_empty.wait()
+            chunk = self.buffer.popleft()
+            self.current_size -= len(chunk)
+            self.not_full.notify()
+            return chunk
+
+    def close(self, error=None):
+        with self.lock:
+            self.closed = True
+            self.error = error
+            self.not_empty.notify_all()
+            self.not_full.notify_all()
+
 class StreamProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
@@ -140,8 +180,7 @@ class StreamProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
 
-        # 1. --- Route: /audio or /stream (High-Speed Direct Proxy) ---
-        # Handles Radio (Direct/Transcode) and Video Gateway without 302 loops.
+        # 1. --- Route: /audio or /stream (High-Speed Buffered Proxy) ---
         if parsed.path in ('/audio', '/stream', '/proxy'):
             query = urllib.parse.parse_qs(parsed.query)
             target_url = query.get('url', [None])[0]
@@ -168,66 +207,85 @@ class StreamProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
 
-                # Transcode to 320k MP3 if not already high-quality MP3
-                # This handles Opus (RadioHD), AAC (CJSR), and others.
+                # Determine if we need transcoding
                 is_mp3 = target_lower.endswith(".mp3") or "SerrebiRadio" in target_url
-                if not is_mp3 or "RadioHD" in target_url or "CJSR" in target_url:
-                    cmd = [
-                        get_ffmpeg_path(), "-hide_banner", "-loglevel", "error",
-                        "-i", "pipe:0", "-vn",
-                        "-c:a", "libmp3lame", "-b:a", "320k", "-ar", "44100",
-                        "-f", "mp3", "pipe:1"
-                    ]
-                    creation_flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-                    proc = subprocess.Popen(
-                        cmd,
-                        stdin=subprocess.PIPE,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=creation_flags
-                    )
-                    def _pump_audio():
-                        try:
+                needs_transcode = not is_mp3 or "RadioHD" in target_url or "CJSR" in target_url
+
+                # Shared buffer for decoupling download from client write
+                stream_buffer = StreamBuffer(max_size=16 * 1024 * 1024)
+
+                def _upstream_worker():
+                    try:
+                        if needs_transcode:
+                            cmd = [
+                                get_ffmpeg_path(), "-hide_banner", "-loglevel", "error",
+                                "-i", "pipe:0", "-vn",
+                                "-c:a", "libmp3lame", "-b:a", "320k", "-ar", "44100",
+                                "-f", "mp3", "pipe:1"
+                            ]
+                            creation_flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+                            proc = subprocess.Popen(
+                                cmd,
+                                stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL,
+                                creationflags=creation_flags
+                            )
+                            
+                            # Feed ffmpeg in a sub-thread so we can read stdout in this thread
+                            def _feeder():
+                                try:
+                                    req = urllib.request.Request(target_url, headers=req_headers)
+                                    with urllib.request.urlopen(req, timeout=15) as resp:
+                                        while proc and proc.poll() is None:
+                                            chunk = resp.read(32768)
+                                            if not chunk: break
+                                            try:
+                                                proc.stdin.write(chunk)
+                                                proc.stdin.flush()
+                                            except: break
+                                except Exception: pass
+                                finally:
+                                    if proc and proc.stdin:
+                                        try: proc.stdin.close()
+                                        except: pass
+
+                            threading.Thread(target=_feeder, daemon=True).start()
+
+                            # Read ffmpeg stdout -> buffer
+                            while True:
+                                chunk = proc.stdout.read(32768)
+                                if not chunk: break
+                                stream_buffer.write(chunk)
+                            
+                            proc.wait()
+                        else:
+                            # Direct download -> buffer
                             req = urllib.request.Request(target_url, headers=req_headers)
                             with urllib.request.urlopen(req, timeout=15) as resp:
-                                while proc and proc.poll() is None:
+                                while True:
                                     chunk = resp.read(32768)
-                                    if not chunk:
-                                        break
-                                    try:
-                                        proc.stdin.write(chunk)
-                                        proc.stdin.flush()
-                                    except Exception:
-                                        break
-                        except Exception as e:
-                            LOG.error("Radio pump error: %s", e)
-                        finally:
-                            if proc and proc.stdin:
-                                try:
-                                    proc.stdin.close()
-                                except Exception:
-                                    pass
-                    threading.Thread(target=_pump_audio, daemon=True).start()
-                    try:
-                        while True:
-                            chunk = proc.stdout.read(16384)
-                            if not chunk:
-                                break
-                            self.wfile.write(chunk)
-                    except: pass
-                    finally:
-                        try: proc.terminate()
-                        except: pass
-                else:
-                    # Standard MP3 (320k): Direct Byte Proxy
-                    req = urllib.request.Request(target_url, headers=req_headers)
-                    try:
-                        with urllib.request.urlopen(req, timeout=10) as resp:
-                            while True:
-                                chunk = resp.read(32768)
-                                if not chunk: break
-                                self.wfile.write(chunk)
-                    except: pass
+                                    if not chunk: break
+                                    stream_buffer.write(chunk)
+                        
+                        stream_buffer.close()
+                    except Exception as e:
+                        LOG.error(f"Upstream worker error: {e}")
+                        stream_buffer.close(error=e)
+
+                # Start the producer thread
+                threading.Thread(target=_upstream_worker, daemon=True).start()
+
+                # Consumer: Serve to client
+                try:
+                    while True:
+                        chunk = stream_buffer.read()
+                        if chunk is None: break
+                        self.wfile.write(chunk)
+                except Exception:
+                    # Client disconnected
+                    stream_buffer.close() # Signal stop to producer if blocked
+                    pass
                 return
 
             # --- VIDEO Path (HLS Redirect) ---
