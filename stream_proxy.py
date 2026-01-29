@@ -228,8 +228,8 @@ class StreamProxyHandler(http.server.BaseHTTPRequestHandler):
                 needs_transcode = not is_mp3 or "radiohd" in target_lower or "cjsr" in target_lower
 
                 # Shared buffer for decoupling download from client write
-                # 24KB fill = ~2s buffer at 96kbps, ensures smooth start without long wait
-                stream_buffer = StreamBuffer(max_size=16 * 1024 * 1024, initial_fill=24 * 1024)
+                # 64KB fill = ~4-5s buffer at 96kbps, balances fast start with stability
+                stream_buffer = StreamBuffer(max_size=16 * 1024 * 1024, initial_fill=64 * 1024)
 
                 def _upstream_worker():
                     try:
