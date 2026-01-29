@@ -883,6 +883,7 @@ class EPGDatabase:
         if not self.readonly:
             try:
                 self._repair_channel_regions_prefer_id()
+                self._repair_norm_names()
             except Exception:
                 pass
 
@@ -965,6 +966,36 @@ class EPGDatabase:
                 _logger.debug("Repaired channel regions using id for %d rows", len(fixes))
         except Exception as e:
             _logger.debug("Region repair skipped/failed: %s", e)
+
+    def _repair_norm_names(self):
+        """Re-normalize all channel names in the DB to match current canonicalize_name logic."""
+        # Use a sentinel property to run this only once per process/session if desired,
+        # or just rely on the fact that it's fast enough. 
+        # For safety, we check a few rows to see if they match the current logic.
+        try:
+            c = self.conn.cursor()
+            # Sample check
+            sample = c.execute("SELECT id, display_name, norm_name FROM channels LIMIT 50").fetchall()
+            updates = []
+            for ch_id, disp, old_norm in sample:
+                new_norm = canonicalize_name(strip_noise_words(disp))
+                if new_norm != old_norm:
+                    updates.append((new_norm, ch_id))
+            
+            # If we found mismatches in the sample, do a full scan/update
+            if updates:
+                _logger.info("Detected stale norm_names in EPG DB. Re-normalizing all channels...")
+                all_rows = c.execute("SELECT id, display_name FROM channels").fetchall()
+                full_updates = []
+                for ch_id, disp in all_rows:
+                    nn = canonicalize_name(strip_noise_words(disp))
+                    full_updates.append((nn, ch_id))
+                
+                c.executemany("UPDATE channels SET norm_name = ? WHERE id = ?", full_updates)
+                self.conn.commit()
+                _logger.info("Re-normalized %d channels.", len(full_updates))
+        except Exception as e:
+            _logger.debug("Norm-name repair failed: %s", e)
 
     def insert_programme(self, channel_id: str, title: str, start_utc: str, end_utc: str):
         c = self.conn.cursor()
