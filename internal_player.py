@@ -879,13 +879,16 @@ class InternalPlayerFrame(wx.Frame):
             # Users expect radio to start instantly.
             raw_target = max(base, 2.0)
         elif bitrate is None:
-            raw_target = max(base, 12.0)
+            # Unknown bitrate: start conservative but not sluggish. 4s is reasonable.
+            raw_target = max(base, 4.0)
         elif bitrate <= 5.0:
-            # Low bitrate: keep generous buffer
-            raw_target = max(base, 15.0)
+            # Low bitrate video (SD/720p): 5s is plenty.
+            raw_target = max(base, 5.0)
         else:
-            # Higher bitrate: ensure we have at least 'base' or 12s, whichever is higher
-            raw_target = max(base, 12.0)
+            # High bitrate (HD/4K): Network jitter hurts more here.
+            # But downloading 12s of 4K takes forever on slow links.
+            # 6s is a good middle ground.
+            raw_target = max(base, 6.0)
             
         if is_linear_ts:
             raw_target = max(raw_target, self._ts_buffer_floor)
