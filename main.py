@@ -1187,7 +1187,7 @@ class IPTVClient(wx.Frame):
             "-ExeName",
             exe_name,
         ]
-        subprocess.Popen(cmd, creationflags=creation_flags)
+        subprocess.Popen(cmd, creationflags=creation_flags, cwd=os.path.dirname(helper_bat))
         self._update_install_pending = True
         self.Close()
 
