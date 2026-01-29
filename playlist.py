@@ -1038,41 +1038,41 @@ class EPGDatabase:
 
         region_clause = ""
         params_region: List[str] = []
-        if region:
-            region_clause = " AND (group_tag = ? OR group_tag = '') "
-            params_region = [region]
+        # Removed strict SQL filtering: region_clause = " AND (group_tag = ? OR group_tag = '') "
+        # We now rely on the scoring phase to penalize region mismatches rather than hiding candidates.
 
         # 1) exact norm matches
         if norm_tvg:
             rows = c.execute(
-                f"SELECT id, display_name, group_tag FROM channels WHERE norm_name = ? {region_clause} LIMIT 100",
-                [norm_tvg] + params_region
+                f"SELECT id, display_name, group_tag FROM channels WHERE norm_name = ? LIMIT 100",
+                [norm_tvg]
             ).fetchall()
             add_rows(rows)
         if norm_name and norm_name != norm_tvg:
             rows = c.execute(
-                f"SELECT id, display_name, group_tag FROM channels WHERE norm_name = ? {region_clause} LIMIT 100",
-                [norm_name] + params_region
+                f"SELECT id, display_name, group_tag FROM channels WHERE norm_name = ? LIMIT 100",
+                [norm_name]
             ).fetchall()
             add_rows(rows)
 
         # 2) brand-key LIKE
         if brand:
             rows = c.execute(
-                f"SELECT id, display_name, group_tag FROM channels WHERE norm_name LIKE ? {region_clause} LIMIT 200",
-                [f"%{brand}%"] + params_region
+                f"SELECT id, display_name, group_tag FROM channels WHERE norm_name LIKE ? LIMIT 200",
+                [f"%{brand}%"]
             ).fetchall()
             add_rows(rows)
 
         # 3) token LIKEs
         for tok in tokens:
             rows = c.execute(
-                f"SELECT id, display_name, group_tag FROM channels WHERE norm_name LIKE ? {region_clause} LIMIT 200",
-                [f"%{tok}%"] + params_region
+                f"SELECT id, display_name, group_tag FROM channels WHERE norm_name LIKE ? LIMIT 200",
+                [f"%{tok}%"]
             ).fetchall()
             add_rows(rows)
 
         # Fallback if we still have nothing and region provided: pull small regional sample
+        # (This is still useful to find generic regional channels if name matching fails completely)
         if not out and region:
             rows = c.execute(
                 "SELECT id, display_name, group_tag FROM channels WHERE group_tag = ? LIMIT 200",
