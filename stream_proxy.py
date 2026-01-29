@@ -228,7 +228,8 @@ class StreamProxyHandler(http.server.BaseHTTPRequestHandler):
                 needs_transcode = not is_mp3 or "RadioHD" in target_url or "CJSR" in target_url
 
                 # Shared buffer for decoupling download from client write
-                stream_buffer = StreamBuffer(max_size=16 * 1024 * 1024, initial_fill=128 * 1024)
+                # 24KB fill = ~2s buffer at 96kbps, ensures smooth start without long wait
+                stream_buffer = StreamBuffer(max_size=16 * 1024 * 1024, initial_fill=24 * 1024)
 
                 def _upstream_worker():
                     try:
@@ -254,7 +255,8 @@ class StreamProxyHandler(http.server.BaseHTTPRequestHandler):
                                     req = urllib.request.Request(target_url, headers=req_headers)
                                     with urllib.request.urlopen(req, timeout=15) as resp:
                                         while proc and proc.poll() is None:
-                                            chunk = resp.read(32768)
+                                            # Use smaller chunks (8KB) for smoother flow
+                                            chunk = resp.read(8192)
                                             if not chunk: break
                                             try:
                                                 proc.stdin.write(chunk)
@@ -270,7 +272,7 @@ class StreamProxyHandler(http.server.BaseHTTPRequestHandler):
 
                             # Read ffmpeg stdout -> buffer
                             while True:
-                                chunk = proc.stdout.read(32768)
+                                chunk = proc.stdout.read(8192)
                                 if not chunk: break
                                 stream_buffer.write(chunk)
                             
@@ -280,7 +282,7 @@ class StreamProxyHandler(http.server.BaseHTTPRequestHandler):
                             req = urllib.request.Request(target_url, headers=req_headers)
                             with urllib.request.urlopen(req, timeout=15) as resp:
                                 while True:
-                                    chunk = resp.read(32768)
+                                    chunk = resp.read(8192)
                                     if not chunk: break
                                     stream_buffer.write(chunk)
                         
