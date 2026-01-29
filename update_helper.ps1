@@ -59,6 +59,18 @@ try {
 try {
     Move-Item -LiteralPath $StagingDir -Destination $InstallDir -Force
     Write-Log "Installed update to $InstallDir"
+
+    # Restore configuration if it existed
+    $oldConfig = Join-Path $BackupDir "iptvclient.conf"
+    $newConfig = Join-Path $InstallDir "iptvclient.conf"
+    if (Test-Path -LiteralPath $oldConfig) {
+        try {
+            Copy-Item -LiteralPath $oldConfig -Destination $newConfig -Force
+            Write-Log "Restored configuration from backup."
+        } catch {
+            Write-Log "Failed to restore configuration: $($_.Exception.Message)"
+        }
+    }
 } catch {
     Write-Log "Failed to move staging into place: $($_.Exception.Message)"
     if (Test-Path -LiteralPath $BackupDir -and -not (Test-Path -LiteralPath $InstallDir)) {
