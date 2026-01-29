@@ -236,7 +236,8 @@ def _wait_for_import_lock(db_path: str, poll_sec: int = 10, log_every: int = 30)
 STRIP_TAGS = [
     'hd', 'sd', 'hevc', 'fhd', 'uhd', '4k', '8k', 'hdr', 'dash', 'hq', 'st',
     'us', 'usa', 'ca', 'canada', 'car', 'uk', 'u.k.', 'u.k', 'uk.', 'u.s.', 'u.s', 'us.',
-    'au', 'aus', 'nz'
+    'au', 'aus', 'nz', 'ukhd', 'uksd', 'fhd', 'uhd', 'h.265', 'h265', 'h.264', 'h264',
+    '50fps', '60fps'
 ]
 
 NOISE_WORDS = [

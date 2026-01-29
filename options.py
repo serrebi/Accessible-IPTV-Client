@@ -351,7 +351,8 @@ def get_db_path():
 STRIP_TAGS = [
     'hd', 'sd', 'hevc', 'fhd', 'uhd', '4k', '8k', 'hdr', 'dash', 'hq', 'st',
     'us', 'usa', 'ca', 'canada', 'car', 'uk', 'u.k.', 'u.k', 'uk.', 'u.s.', 'u.s', 'us.',
-    'au', 'aus', 'nz', 'eu'
+    'au', 'aus', 'nz', 'eu', 'ukhd', 'uksd', 'fhd', 'uhd', 'h.265', 'h265', 'h.264', 'h264',
+    '50fps', '60fps'
 ]
 
 def group_synonyms():
