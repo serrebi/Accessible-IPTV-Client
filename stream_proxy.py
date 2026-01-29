@@ -131,8 +131,9 @@ class HLSConverter:
 
 
 class StreamBuffer:
-    def __init__(self, max_size=16 * 1024 * 1024):
+    def __init__(self, max_size=16 * 1024 * 1024, initial_fill=128 * 1024):
         self.max_size = max_size
+        self.initial_fill = initial_fill
         self.buffer = collections.deque()
         self.current_size = 0
         self.lock = threading.Lock()
@@ -140,6 +141,7 @@ class StreamBuffer:
         self.not_full = threading.Condition(self.lock)
         self.closed = False
         self.error = None
+        self.has_filled = False
 
     def write(self, chunk):
         with self.lock:
@@ -148,15 +150,29 @@ class StreamBuffer:
                 self.not_full.wait()
             self.buffer.append(chunk)
             self.current_size += len(chunk)
-            self.not_empty.notify()
+            
+            if not self.has_filled:
+                if self.current_size >= self.initial_fill:
+                    self.has_filled = True
+                    self.not_empty.notify_all()
+            else:
+                self.not_empty.notify()
 
     def read(self):
         with self.lock:
-            while not self.buffer:
+            while not self.buffer or (not self.has_filled and not self.closed):
                 if self.closed:
+                    if self.buffer: break
                     if self.error: raise self.error
                     return None
+                
+                # Check fill again in case it changed while we waited
+                if not self.has_filled and self.current_size >= self.initial_fill:
+                    self.has_filled = True
+                    break
+                    
                 self.not_empty.wait()
+            
             chunk = self.buffer.popleft()
             self.current_size -= len(chunk)
             self.not_full.notify()
@@ -212,7 +228,7 @@ class StreamProxyHandler(http.server.BaseHTTPRequestHandler):
                 needs_transcode = not is_mp3 or "RadioHD" in target_url or "CJSR" in target_url
 
                 # Shared buffer for decoupling download from client write
-                stream_buffer = StreamBuffer(max_size=16 * 1024 * 1024)
+                stream_buffer = StreamBuffer(max_size=16 * 1024 * 1024, initial_fill=128 * 1024)
 
                 def _upstream_worker():
                     try:
