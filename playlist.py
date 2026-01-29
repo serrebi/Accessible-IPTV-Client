@@ -1395,20 +1395,15 @@ class EPGDatabase:
                 has_any = self._has_any_schedule_from_now(ch_id)
                 avail.append((m, has_any))
 
-            def region_bucket(m):
-                grp = (m.get('group_tag') or '').strip().lower()
-                if grp == playlist_region: return 0
-                if grp == '': return 1
-                return 2
-
-            # Prefer region, then Score + Data Bonus
-            # A bonus of 40 allow decent matches (e.g. "East" variant) with data to beat 
-            # exact matches without data, but prevents garbage (e.g. "Pluto") from winning.
+            # Prefer matches with data (t[1] is bool)
+            # Then by total score (which includes region bonuses).
+            # We no longer strictly bucket by region first, as that can hide valid channels 
+            # if a "better region" candidate exists but has no data.
             ordered = sorted(
                 avail,
                 key=lambda t: (
-                    region_bucket(t[0]),
-                    -(int(t[0].get('score', 0)) + (40 if t[1] else 0))
+                    not t[1],  # False (Has Data) < True (No Data) -> Data first
+                    -(int(t[0].get('score', 0)))
                 )
             )
             best = ordered[0][0]
