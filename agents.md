@@ -88,3 +88,7 @@ wxPython>=4.2.1 (GUI), python-vlc (built-in player), psutil optional for memory 
 **Update 2025-12-28**: Updater now accepts a pinned Authenticode thumbprint from the release manifest (`signing_thumbprint`) so self-signed certs can pass verification when Windows reports UnknownError.
 
 **Update 2026-01-04**: Auto-update installs were failing because `main.py` launched `update_helper.bat` with GNU-style flags (`--pid`, `--install-dir`, etc.), but `update_helper.ps1` expects PowerShell parameter names (`-ParentPid`, `-InstallDir`, `-StagingDir`, `-BackupDir`, `-ExeName`). Updated the launcher args so the helper receives the correct parameters and updates apply successfully.
+
+**Update 2026-01-29**: Build/runtime telemetry depends on `psutil` (optional import + PyInstaller hidden import). It was missing locally, so I installed it to keep memory telemetry and frozen builds consistent.
+
+**Update 2026-01-29**: Startup CPU spike mitigated by capping playlist fetch/parse worker threads (max 4, based on CPU count) and deferring auto EPG import until the channel list finishes populating. Auto-import now skips when the EPG DB is fresh (default 6h) unless forced; new config key `epg_auto_import_interval_hours`.
