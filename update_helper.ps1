@@ -12,6 +12,7 @@ param(
     [string]$RestartArgs = ""
 )
 
+Set-Location $env:TEMP
 $logPath = Join-Path $env:TEMP "AccessibleIPTVClient_update.log"
 
 function Write-Log {
