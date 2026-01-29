@@ -345,13 +345,14 @@ def group_synonyms():
 def canonicalize_name(name: str) -> str:
     name = (name or "").strip().lower()
     tags = STRIP_TAGS
-    pattern = r'^(?:' + '|'.join(tags) + r')\b[\s\-:]*|[\s\-:]*\b(?:' + '|'.join(tags) + r')$'
+    pattern = r'^(?:' + '|'.join(tags) + r')\b[\s\-:()\[\]]*|[\s\-:()\[\]]*\b(?:' + '|'.join(tags) + r')$'
     while True:
         newname = re.sub(pattern, '', name, flags=re.I).strip()
         if newname == name:
             break
         name = newname
     name = re.sub(r'\b(?:' + '|'.join(tags) + r')\b', '', name, flags=re.I)
+    name = re.sub(r'\(\s*\)|\[\s*\]', '', name)
     name = re.sub(r'\s+', ' ', name)
     return name.strip()
 

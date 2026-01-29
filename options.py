@@ -500,9 +500,9 @@ def _normalize_country_token(tok: str) -> str:
     return ''
 
 def canonicalize_name(name: str) -> str:
-    name = name.strip().lower()
+    name = (name or "").strip().lower()
     tags = STRIP_TAGS
-    pattern = r'^(?:' + '|'.join(tags) + r')\b[\s\-:]*|[\s\-:]*\b(?:' + '|'.join(tags) + r')$'
+    pattern = r'^(?:' + '|'.join(tags) + r')\b[\s\-:()[\]]*|[\s\-:()[\]]*\b(?:' + '|'.join(tags) + r')$'
     while True:
         newname = re.sub(pattern, '', name, flags=re.I).strip()
         if newname == name:
