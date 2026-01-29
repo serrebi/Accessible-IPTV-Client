@@ -92,3 +92,5 @@ wxPython>=4.2.1 (GUI), python-vlc (built-in player), psutil optional for memory 
 **Update 2026-01-29**: Build/runtime telemetry depends on `psutil` (optional import + PyInstaller hidden import). It was missing locally, so I installed it to keep memory telemetry and frozen builds consistent.
 
 **Update 2026-01-29**: Startup CPU spike mitigated by capping playlist fetch/parse worker threads (max 4, based on CPU count) and deferring auto EPG import until the channel list finishes populating. Auto-import now skips when the EPG DB is fresh (default 6h) unless forced; new config key `epg_auto_import_interval_hours`.
+
+**Update 2026-01-29**: PyInstaller flagged missing hidden import `netifaces`; installed it so casting discovery dependencies bundle cleanly.
