@@ -1120,22 +1120,27 @@ class IPTVClient(wx.Frame):
 
             helper_source = os.path.join(get_app_dir(), "update_helper.bat")
             helper_ps1_source = os.path.join(get_app_dir(), "update_helper.ps1")
+            helper_vbs_source = os.path.join(get_app_dir(), "update_helper_launcher.vbs")
             
             # PyInstaller 6+ onedir layout puts datas in _internal
             if not os.path.exists(helper_source):
                 helper_source = os.path.join(get_app_dir(), "_internal", "update_helper.bat")
             if not os.path.exists(helper_ps1_source):
                 helper_ps1_source = os.path.join(get_app_dir(), "_internal", "update_helper.ps1")
+            if not os.path.exists(helper_vbs_source):
+                helper_vbs_source = os.path.join(get_app_dir(), "_internal", "update_helper_launcher.vbs")
 
-            if not os.path.exists(helper_source) or not os.path.exists(helper_ps1_source):
+            if not os.path.exists(helper_source) or not os.path.exists(helper_ps1_source) or not os.path.exists(helper_vbs_source):
                 raise updater.UpdateError("Update helper is missing from this build.")
 
             helper_dir = os.path.join(temp_root, "helper")
             os.makedirs(helper_dir, exist_ok=True)
             helper_bat = os.path.join(helper_dir, "update_helper.bat")
             helper_ps1 = os.path.join(helper_dir, "update_helper.ps1")
+            helper_vbs = os.path.join(helper_dir, "update_helper_launcher.vbs")
             shutil.copy2(helper_source, helper_bat)
             shutil.copy2(helper_ps1_source, helper_ps1)
+            shutil.copy2(helper_vbs_source, helper_vbs)
 
             wx.CallAfter(
                 self._launch_update_helper,

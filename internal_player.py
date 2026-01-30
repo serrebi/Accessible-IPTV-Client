@@ -872,23 +872,23 @@ class InternalPlayerFrame(wx.Frame):
         if is_linear_ts:
             cache_fraction = max(cache_fraction, self._ts_network_bias)
 
-        # Simplified buffer logic: respect base buffer and scale up if needed, but never cap below base.
-        # High bitrate streams on gigabit connections benefit from larger buffers, not smaller ones.
+        # Improved buffering: use longer initial buffer to prevent quick disconnects
+        # HLS and M3U+ streams need more startup buffer to establish stable connection
         if is_audio:
-            # Audio streams: prioritise fast start (2-3s) over massive buffers
-            # Users expect radio to start instantly.
-            raw_target = max(base, 2.0)
+            # Audio streams: fast start (3-4s) but enough to avoid interruption
+            raw_target = max(base, 3.5)
         elif bitrate is None:
-            # Unknown bitrate: start conservative but not sluggish. 4s is reasonable.
-            raw_target = max(base, 4.0)
-        elif bitrate <= 5.0:
-            # Low bitrate video (SD/720p): 5s is plenty.
-            raw_target = max(base, 5.0)
+            # Unknown bitrate: use conservative 8s to allow connection to stabilize
+            raw_target = max(base, 8.0)
+        elif bitrate <= 3.0:
+            # Low bitrate video (SD): 8s gives stable connection
+            raw_target = max(base, 8.0)
+        elif bitrate <= 8.0:
+            # Medium bitrate (720p-1080p): 10s handles initial buffering
+            raw_target = max(base, 10.0)
         else:
-            # High bitrate (HD/4K): Network jitter hurts more here.
-            # But downloading 12s of 4K takes forever on slow links.
-            # 6s is a good middle ground.
-            raw_target = max(base, 6.0)
+            # High bitrate (HD/4K): 12s absorbs startup jitter
+            raw_target = max(base, 12.0)
             
         if is_linear_ts:
             raw_target = max(raw_target, self._ts_buffer_floor)

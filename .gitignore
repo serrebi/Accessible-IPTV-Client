@@ -14,7 +14,8 @@ dist/
 
 # Logs
 *.log
-
+#conf's
+iptvclient.conf
 # Tool caches
 .pytest_cache/
 .mypy_cache/

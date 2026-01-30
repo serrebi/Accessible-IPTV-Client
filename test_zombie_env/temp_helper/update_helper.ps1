@@ -119,16 +119,5 @@ if (Test-Path -LiteralPath $exePath) {
     exit 1
 }
 
-# Clean up backup directory after successful update
-if (Test-Path -LiteralPath $BackupDir) {
-    try {
-        Write-Log "Removing backup directory: $BackupDir"
-        Remove-Item -LiteralPath $BackupDir -Recurse -Force -ErrorAction Stop
-        Write-Log "Backup directory removed successfully."
-    } catch {
-        Write-Log "Failed to remove backup directory: $($_.Exception.Message)"
-    }
-}
-
 Write-Log "Updater completed."
 exit 0

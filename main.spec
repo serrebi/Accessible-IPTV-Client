@@ -52,6 +52,7 @@ a = Analysis(
         ('ffmpeg.exe', '.'),
         ('update_helper.bat', '.'),
         ('update_helper.ps1', '.'),
+        ('update_helper_launcher.vbs', '.'),
     ],
     hiddenimports=hidden_imports,
     hookspath=[],

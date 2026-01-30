@@ -94,3 +94,7 @@ wxPython>=4.2.1 (GUI), python-vlc (built-in player), psutil optional for memory 
 **Update 2026-01-29**: Startup CPU spike mitigated by capping playlist fetch/parse worker threads (max 4, based on CPU count) and deferring auto EPG import until the channel list finishes populating. Auto-import now skips when the EPG DB is fresh (default 6h) unless forced; new config key `epg_auto_import_interval_hours`.
 
 **Update 2026-01-29**: PyInstaller flagged missing hidden import `netifaces`; installed it so casting discovery dependencies bundle cleanly.
+
+**Update 2026-01-30**: Auto-updater now launches invisibly using VBScript to suppress the cmd window flash. PowerShell runs with `-WindowStyle Hidden` via `cscript`. Backup directories are automatically cleaned up after successful updates to avoid clutter in the parent folder.
+
+**Update 2026-01-30**: Internal player buffering retuned for stable HLS/M3U+/Xtream connections. Initial buffer targets increased to 8-12s (based on bitrate) to prevent quick connect/disconnect cycles. Audio streams use 3.5s for fast startup. This prevents the "connect, quick buffer, disconnect" pattern users were experiencing with provider streams.
