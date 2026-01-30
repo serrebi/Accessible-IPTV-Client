@@ -218,13 +218,15 @@ def verify_authenticode(exe_path: str, allowed_thumbprints: Iterable[str]) -> No
 
     if status.lower() == "valid":
         return
-    if thumbprint and thumbprint in allowed:
+    if thumbprint and allowed and thumbprint in allowed:
         return
     detail = f"Authenticode status was {status or 'Unknown'}."
     if status_msg:
         detail = f"{detail} {status_msg}"
     if thumbprint:
         detail = f"{detail} (thumbprint {thumbprint})."
+    if allowed:
+        detail = f"{detail} Expected thumbprints: {', '.join(sorted(allowed))}."
     raise UpdateError(detail)
 
 
