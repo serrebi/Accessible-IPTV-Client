@@ -30,7 +30,8 @@ from options import (
 import app_meta
 import updater
 from playlist import (
-    EPGDatabase, EPGManagerDialog, PlaylistManagerDialog
+    EPGDatabase, EPGManagerDialog, PlaylistManagerDialog,
+    strip_noise_words
 )
 from providers import (
     XtreamCodesClient, XtreamCodesConfig,
@@ -839,6 +840,7 @@ class IPTVClient(wx.Frame):
             m_mgr = fm.Append(wx.ID_ANY, "Playlist Manager\tCtrl+M")
             m_epg = fm.Append(wx.ID_ANY, "EPG Manager\tCtrl+E")
             m_imp = fm.Append(wx.ID_ANY, "Import EPG to DB\tCtrl+I")
+            m_now = fm.Append(wx.ID_ANY, "What's on Now\tCtrl+W")
             fm.AppendSeparator()
             # Casting Menu Item (Windows/Mac)
             m_cast = fm.Append(wx.ID_ANY, "Cast To...")
@@ -874,6 +876,7 @@ class IPTVClient(wx.Frame):
             self.Bind(wx.EVT_MENU, self.show_manager, m_mgr)
             self.Bind(wx.EVT_MENU, self.show_epg_manager, m_epg)
             self.Bind(wx.EVT_MENU, self.import_epg, m_imp)
+            self.Bind(wx.EVT_MENU, self.show_whats_on_now, m_now)
             self.Bind(wx.EVT_MENU, self.show_cast_dialog, m_cast)
             self.Bind(wx.EVT_MENU, lambda _: self.Close(), m_exit)
             self.Bind(wx.EVT_MENU, self._menu_show_player, pm_show)
@@ -1808,6 +1811,140 @@ class IPTVClient(wx.Frame):
 
         wx.MessageBox("EPG import will start in the background.", "Import Started", wx.OK | wx.ICON_INFORMATION)
         self.start_epg_import_background(force=True)
+
+    def show_whats_on_now(self, _):
+        """Show dialog with all currently airing programs."""
+        if not self.config.get("epg_enabled", True):
+            wx.MessageBox("EPG is not enabled.", "EPG Not Available", wx.OK | wx.ICON_WARNING)
+            return
+        
+        try:
+            db = EPGDatabase(get_db_path(), readonly=True)
+            programs = db.get_all_now_playing()
+            db.close()
+        except Exception as e:
+            wx.MessageBox(f"Failed to fetch EPG data: {e}", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        
+        if not programs:
+            wx.MessageBox("No programs are currently airing, or EPG data has not been imported yet.", "No Data", wx.OK | wx.ICON_INFORMATION)
+            return
+        
+        dlg = WhatsOnNowDialog(self, programs)
+        if dlg.ShowModal() == wx.ID_OK:
+            selection = dlg.get_selection()
+            if selection:
+                self._play_from_whats_on_now(selection)
+        dlg.Destroy()
+    
+    def _play_from_whats_on_now(self, program: Dict[str, str]):
+        """Find and play the channel matching the selected program."""
+        channel_name = program.get("channel_name", "")
+        channel_id = program.get("channel_id", "")
+        
+        if not channel_name and not channel_id:
+            wx.MessageBox("Could not identify the channel.", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        
+        # Try to find the channel in our playlist
+        matching_channel = None
+        best_score = 0
+        channel_name_lower = channel_name.lower() if channel_name else ""
+        channel_name_norm = canonicalize_name(strip_noise_words(channel_name)) if channel_name else ""
+        
+        # Extract base name without HD/SD suffixes for fuzzy matching
+        base_patterns = ["hd", "sd", "fhd", "uhd", "4k", "hevc", "h264", "h.264"]
+        channel_base = channel_name_lower
+        for pat in base_patterns:
+            channel_base = channel_base.replace(f" {pat}", "").replace(f"({pat})", "").replace(f"[{pat}]", "")
+        channel_base = channel_base.strip()
+        
+        for ch in self.all_channels:
+            ch_name = ch.get("name", "")
+            ch_tvg_name = ch.get("tvg-name", "")
+            ch_tvg_id = ch.get("tvg-id", "")
+            ch_name_lower = ch_name.lower()
+            
+            score = 0
+            
+            # Exact match on tvg-id (most reliable) - 100 points
+            if channel_id and ch_tvg_id:
+                if channel_id.lower() == ch_tvg_id.lower():
+                    score = 100
+                elif channel_id.lower() in ch_tvg_id.lower() or ch_tvg_id.lower() in channel_id.lower():
+                    score = max(score, 80)
+            
+            # Exact match on name - 90 points
+            if ch_name_lower == channel_name_lower:
+                score = max(score, 90)
+            
+            # Exact match on tvg-name - 90 points
+            if ch_tvg_name and ch_tvg_name.lower() == channel_name_lower:
+                score = max(score, 90)
+            
+            # Normalized match - 70 points
+            ch_name_norm = canonicalize_name(strip_noise_words(ch_name))
+            ch_tvg_norm = canonicalize_name(strip_noise_words(ch_tvg_name)) if ch_tvg_name else ""
+            if channel_name_norm and (ch_name_norm == channel_name_norm or ch_tvg_norm == channel_name_norm):
+                score = max(score, 70)
+            
+            # Base name match (without HD/SD etc) - 60 points
+            ch_base = ch_name_lower
+            for pat in base_patterns:
+                ch_base = ch_base.replace(f" {pat}", "").replace(f"({pat})", "").replace(f"[{pat}]", "")
+            ch_base = ch_base.strip()
+            if channel_base and ch_base and channel_base == ch_base:
+                score = max(score, 60)
+            
+            # Partial/contains match - 40 points
+            if channel_name_lower in ch_name_lower or ch_name_lower in channel_name_lower:
+                score = max(score, 40)
+            if ch_tvg_name and (channel_name_lower in ch_tvg_name.lower() or ch_tvg_name.lower() in channel_name_lower):
+                score = max(score, 40)
+            
+            # Word overlap score - up to 30 points
+            if channel_name_norm and ch_name_norm:
+                words_epg = set(channel_name_norm.split())
+                words_ch = set(ch_name_norm.split())
+                if words_epg and words_ch:
+                    overlap = len(words_epg & words_ch)
+                    total = max(len(words_epg), len(words_ch))
+                    if overlap > 0:
+                        word_score = int(30 * overlap / total)
+                        score = max(score, word_score)
+            
+            if score > best_score:
+                best_score = score
+                matching_channel = ch
+        
+        if not matching_channel or best_score < 30:
+            wx.MessageBox(f"Could not find channel '{channel_name}' in your playlist.", "Channel Not Found", wx.OK | wx.ICON_WARNING)
+            return
+        
+        # Find and select the channel in the currently displayed list
+        for idx, item in enumerate(self.displayed):
+            if item.get("type") == "channel":
+                ch = item.get("data", {})
+                if ch.get("url") == matching_channel.get("url"):
+                    self.channel_list.SetSelection(idx)
+                    # Use CallAfter to ensure UI updates before play
+                    wx.CallAfter(self.play_selected)
+                    return
+        
+        # Channel exists but not in current filter - switch to All Channels and try again
+        self.group_list.SetSelection(0)  # "All Channels" is first
+        self.on_group_select()
+        wx.CallLater(100, lambda: self._select_and_play_channel(matching_channel))
+    
+    def _select_and_play_channel(self, channel: Dict[str, str]):
+        """Helper to select and play a channel after group switch."""
+        for idx, item in enumerate(self.displayed):
+            if item.get("type") == "channel":
+                ch = item.get("data", {})
+                if ch.get("url") == channel.get("url"):
+                    self.channel_list.SetSelection(idx)
+                    wx.CallAfter(self.play_selected)
+                    return
 
     def finish_import(self):
         # legacy-sounding API; ensure poll timer is stopped here too.
@@ -3195,6 +3332,194 @@ class CatchupDialog(wx.Dialog):
         if idx == wx.NOT_FOUND or idx >= len(self.programmes):
             return None
         return self.programmes[idx]
+
+
+class WhatsOnNowDialog(wx.Dialog):
+    """Dialog showing all currently airing programs across all channels."""
+    
+    def __init__(self, parent, programs: List[Dict[str, str]]):
+        super().__init__(parent, title="What's on Now", size=(700, 500))
+        self.programs = programs
+        self.filtered_programs = programs[:]
+        self._type_ahead_buffer = ""
+        self._type_ahead_timer = None
+        
+        panel = wx.Panel(self)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # Search box (for filtering, Tab to access)
+        search_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        search_label = wx.StaticText(panel, label="Filter (Tab):")
+        self.search_box = wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER)
+        self.search_box.SetName("Filter programs")
+        search_sizer.Add(search_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        search_sizer.Add(self.search_box, 1, wx.EXPAND)
+        sizer.Add(search_sizer, 0, wx.EXPAND | wx.ALL, 10)
+        
+        # Info label
+        self.count_label = wx.StaticText(panel, label=f"{len(programs)} programs")
+        sizer.Add(self.count_label, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        
+        # Use virtual ListCtrl for fast loading with many items
+        self.listbox = _VirtualWhatsOnList(panel, self)
+        self.listbox.SetName("Currently airing programs")
+        self.listbox.InsertColumn(0, "Program - Channel", width=650)
+        self.listbox.SetItemCount(len(self.filtered_programs))
+        
+        # Buttons
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        play_btn = wx.Button(panel, id=wx.ID_OK, label="Play")
+        close_btn = wx.Button(panel, id=wx.ID_CANCEL, label="Close")
+        btn_sizer.Add(play_btn, 0, wx.RIGHT, 5)
+        btn_sizer.Add(close_btn, 0)
+        
+        sizer.Add(self.listbox, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+        
+        panel.SetSizer(sizer)
+        
+        self.Layout()
+        self.CenterOnParent()
+        
+        # Bind events - use KEY_DOWN to intercept space before ListCtrl handles it
+        self.listbox.Bind(wx.EVT_KEY_DOWN, self._on_key_down)
+        self.listbox.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self._on_activate)
+        play_btn.Bind(wx.EVT_BUTTON, self._on_play)
+        self.search_box.Bind(wx.EVT_TEXT, self._on_search)
+        self.search_box.Bind(wx.EVT_TEXT_ENTER, self._on_search_enter)
+        
+        # Focus the list initially
+        if self.filtered_programs:
+            self.listbox.Select(0)
+            self.listbox.Focus(0)
+        self.listbox.SetFocus()
+    
+    def _on_key_down(self, event):
+        """Handle key input for type-ahead search - intercept before ListCtrl."""
+        key = event.GetKeyCode()
+        
+        # Handle Tab to go to search box
+        if key == wx.WXK_TAB:
+            self.search_box.SetFocus()
+            return
+        
+        # Handle Enter to play
+        if key == wx.WXK_RETURN or key == wx.WXK_NUMPAD_ENTER:
+            if self.listbox.GetSelectedItemCount() > 0:
+                self.EndModal(wx.ID_OK)
+            return
+        
+        # Handle Escape to close
+        if key == wx.WXK_ESCAPE:
+            self.EndModal(wx.ID_CANCEL)
+            return
+        
+        # Handle Space - add to type-ahead buffer (don't activate)
+        if key == wx.WXK_SPACE or key == ord(' '):
+            if self._type_ahead_timer:
+                self._type_ahead_timer.Stop()
+            self._type_ahead_buffer += " "
+            self._find_match(self._type_ahead_buffer)
+            self._type_ahead_timer = wx.CallLater(1000, self._reset_type_ahead)
+            return
+        
+        # For printable characters (excluding space which is handled above), do type-ahead search
+        if 33 <= key <= 126:  # Start at 33 (!) to exclude space (32)
+            char = chr(key).lower()
+            
+            # Reset buffer if too much time passed
+            if self._type_ahead_timer:
+                self._type_ahead_timer.Stop()
+            
+            self._type_ahead_buffer += char
+            self._find_match(self._type_ahead_buffer)
+            
+            # Reset buffer after 1 second of no typing
+            self._type_ahead_timer = wx.CallLater(1000, self._reset_type_ahead)
+            return
+        
+        # Backspace clears type-ahead buffer
+        if key == wx.WXK_BACK:
+            if self._type_ahead_buffer:
+                self._type_ahead_buffer = self._type_ahead_buffer[:-1]
+                if self._type_ahead_buffer:
+                    self._find_match(self._type_ahead_buffer)
+            return
+        
+        event.Skip()
+    
+    def _reset_type_ahead(self):
+        """Reset the type-ahead buffer."""
+        self._type_ahead_buffer = ""
+    
+    def _find_match(self, prefix: str):
+        """Find and select the first item starting with prefix."""
+        prefix_lower = prefix.lower()
+        for idx, prog in enumerate(self.filtered_programs):
+            title = prog.get("title", "").lower()
+            if title.startswith(prefix_lower):
+                self.listbox.Select(idx)
+                self.listbox.Focus(idx)
+                self.listbox.EnsureVisible(idx)
+                return
+    
+    def _on_search(self, event):
+        """Filter the list based on search text."""
+        query = self.search_box.GetValue().lower().strip()
+        if not query:
+            self.filtered_programs = self.programs[:]
+        else:
+            self.filtered_programs = [
+                p for p in self.programs
+                if query in p.get("title", "").lower() or query in p.get("channel_name", "").lower()
+            ]
+        self.listbox.SetItemCount(len(self.filtered_programs))
+        self.listbox.Refresh()
+        self.count_label.SetLabel(f"{len(self.filtered_programs)} programs")
+        if self.filtered_programs:
+            self.listbox.Select(0)
+            self.listbox.Focus(0)
+    
+    def _on_search_enter(self, event):
+        """Move focus to list when Enter is pressed in search box."""
+        if self.filtered_programs:
+            self.listbox.SetFocus()
+            self.listbox.Select(0)
+            self.listbox.Focus(0)
+    
+    def _on_activate(self, event):
+        """Handle double-click/Enter to play."""
+        if self.listbox.GetSelectedItemCount() > 0:
+            self.EndModal(wx.ID_OK)
+    
+    def _on_play(self, event):
+        """Handle Play button click."""
+        if self.listbox.GetSelectedItemCount() > 0:
+            self.EndModal(wx.ID_OK)
+        event.Skip()
+    
+    def get_selection(self) -> Optional[Dict[str, str]]:
+        """Get the selected program dict."""
+        idx = self.listbox.GetFirstSelected()
+        if idx == -1 or idx >= len(self.filtered_programs):
+            return None
+        return self.filtered_programs[idx]
+
+
+class _VirtualWhatsOnList(wx.ListCtrl):
+    """Virtual list control for fast loading of What's on Now."""
+    
+    def __init__(self, parent, dialog):
+        super().__init__(parent, style=wx.LC_REPORT | wx.LC_SINGLE_SEL | wx.LC_VIRTUAL)
+        self.dialog = dialog
+    
+    def OnGetItemText(self, item, column):
+        if 0 <= item < len(self.dialog.filtered_programs):
+            prog = self.dialog.filtered_programs[item]
+            title = prog.get("title", "(No title)")
+            channel = prog.get("channel_name", "Unknown")
+            return f"{title} - {channel}"
+        return ""
 
 
 class ChannelEPGDialog(wx.Dialog):

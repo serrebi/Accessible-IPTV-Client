@@ -1495,6 +1495,41 @@ class EPGDatabase:
                 final.append(r)
         return final
 
+    def get_all_now_playing(self) -> List[Dict[str, str]]:
+        """Get all currently airing programs across all channels.
+        
+        Returns a list of dicts with: title, channel_name, channel_id, start, end
+        Sorted alphabetically by title.
+        """
+        c = self.conn.cursor()
+        now = self._utcnow()
+        now_str = now.strftime("%Y%m%d%H%M%S")
+        
+        # Get all programs where start <= now < end
+        rows = c.execute("""
+            SELECT p.title, p.start, p.end, c.display_name, c.id
+            FROM programmes p
+            JOIN channels c ON c.id = p.channel_id
+            WHERE p.start <= ? AND p.end > ?
+            ORDER BY p.title COLLATE NOCASE ASC
+        """, (now_str, now_str)).fetchall()
+        
+        result = []
+        seen = set()  # Avoid duplicates (same title on same channel)
+        for title, start, end, channel_name, channel_id in rows:
+            key = (title.lower(), channel_name.lower() if channel_name else "")
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append({
+                "title": title,
+                "channel_name": channel_name or "Unknown",
+                "channel_id": channel_id,
+                "start": start,
+                "end": end
+            })
+        return result
+
     def get_recent_programmes(self, channel: Dict[str, str], hours: int = 48, limit: int = 60) -> List[Dict[str, str]]:
         matches, _ = self.get_matching_channel_ids(channel)
         if not matches:
