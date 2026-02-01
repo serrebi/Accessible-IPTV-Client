@@ -1,6 +1,6 @@
 APP_NAME = "AccessibleIPTVClient"
 APP_DISPLAY_NAME = "Accessible IPTV Client"
-APP_VERSION = "1.95.0"
+APP_VERSION = "1.94.2"
 EXE_NAME = "IPTVClient.exe"
 GITHUB_OWNER = "serrebi"
 GITHUB_REPO = "Accessible-IPTV-Client"
