@@ -100,3 +100,11 @@ wxPython>=4.2.1 (GUI), python-vlc (built-in player), psutil optional for memory 
 **Update 2026-01-30**: Internal player buffering retuned for stable HLS/M3U+/Xtream connections. Initial buffer targets increased to 8-12s (based on bitrate) to prevent quick connect/disconnect cycles. Audio streams use 3.5s for fast startup. This prevents the "connect, quick buffer, disconnect" pattern users were experiencing with provider streams.
 
 **Update 2026-01-30**: Fixed updater Authenticode verification logic. When status is not "Valid", the code now checks if the `allowed` thumbprints set is non-empty before checking membership, preventing false negatives. Enhanced error messages to include expected thumbprints for easier debugging of signing issues. The fix ensures self-signed certificates with pinned thumbprints are properly accepted even when Windows reports UnknownError due to untrusted root certificates.
+
+**Update 2026-02-01**: VLC starts muted when using `--intf=dummy` (hidden/audio-only mode); fixed by calling `player.audio_set_mute(False)` in `_schedule_volume_apply()` so streams play audio when "Show Player on Enter" is unchecked.
+
+**Update 2026-02-01**: Reduced initial stream buffer from 8s to 3s for faster channel startup (~1s vs ~5s). Users with slow connections can increase `internal_player_buffer_seconds` in config.
+
+**Update 2026-02-01**: Added HTTP preflight check in `internal_player.py` to detect dead streams (404, 403, etc.) before VLC tries to connect, showing user-friendly error messages instead of silent failures.
+
+**Update 2026-02-01**: GitHub releases require an `AccessibleIPTVClient-update.json` manifest file alongside the zip. The manifest must contain: `version`, `asset_filename`, `download_url`, `sha256`, and `release_notes_summary`. Without it, the auto-updater fails with "Update manifest was not found".
