@@ -242,13 +242,9 @@ class TrayIcon(wx.adv.TaskBarIcon):
         return menu
 
     def on_taskbar_activate(self, event):
-        # Handle Enter key or double-click on tray icon for accessibility.
-        # This is the expected way for keyboard users to restore the app.
-        # Single-click was disabled to prevent accidental focus stealing,
-        # but double-click/Enter is intentional user action.
-        if event.GetEventType() == wx.adv.wxEVT_TASKBAR_LEFT_DCLICK:
-            self.on_restore()
-        # Single-click (LEFT_UP) is ignored to prevent accidental activation
+        # Handle left-click, double-click, or Enter key on tray icon.
+        # All these actions restore the app for accessibility (NVDA/JAWS).
+        self.on_restore()
 
     def on_menu_select(self, event):
         eid = event.GetId()
