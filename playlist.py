@@ -1036,21 +1036,19 @@ class EPGDatabase:
         brand = _brand_key(name)
         tokens = list(tokenize_channel_name(name))[:3]
 
-        region_clause = ""
-        params_region: List[str] = []
-        # Removed strict SQL filtering: region_clause = " AND (group_tag = ? OR group_tag = '') "
+        # NOTE: region_clause and params_region were removed during refactoring.
         # We now rely on the scoring phase to penalize region mismatches rather than hiding candidates.
 
         # 1) exact norm matches
         if norm_tvg:
             rows = c.execute(
-                f"SELECT id, display_name, group_tag FROM channels WHERE norm_name = ? LIMIT 100",
+                "SELECT id, display_name, group_tag FROM channels WHERE norm_name = ? LIMIT 100",
                 [norm_tvg]
             ).fetchall()
             add_rows(rows)
         if norm_name and norm_name != norm_tvg:
             rows = c.execute(
-                f"SELECT id, display_name, group_tag FROM channels WHERE norm_name = ? LIMIT 100",
+                "SELECT id, display_name, group_tag FROM channels WHERE norm_name = ? LIMIT 100",
                 [norm_name]
             ).fetchall()
             add_rows(rows)
@@ -1058,7 +1056,7 @@ class EPGDatabase:
         # 2) brand-key LIKE
         if brand:
             rows = c.execute(
-                f"SELECT id, display_name, group_tag FROM channels WHERE norm_name LIKE ? LIMIT 200",
+                "SELECT id, display_name, group_tag FROM channels WHERE norm_name LIKE ? LIMIT 200",
                 [f"%{brand}%"]
             ).fetchall()
             add_rows(rows)
@@ -1066,7 +1064,7 @@ class EPGDatabase:
         # 3) token LIKEs
         for tok in tokens:
             rows = c.execute(
-                f"SELECT id, display_name, group_tag FROM channels WHERE norm_name LIKE ? LIMIT 200",
+                "SELECT id, display_name, group_tag FROM channels WHERE norm_name LIKE ? LIMIT 200",
                 [f"%{tok}%"]
             ).fetchall()
             add_rows(rows)
@@ -2015,10 +2013,10 @@ class EPGDatabase:
         except Exception as e:
             _logger.debug("EPG maintenance skipped due to lock or error: %s", e)
         if trace_mem:
-            current, peak = tracemalloc.get_traced_memory()
+            _current, peak = tracemalloc.get_traced_memory()
             tracemalloc.stop()
         else:
-            current, peak = (0, 0)
+            _current, peak = (0, 0)
         try:
             c = self.conn.cursor()
             row_c = c.execute("SELECT COUNT(*) FROM channels").fetchone()

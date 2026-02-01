@@ -2,13 +2,12 @@ import os
 import sys
 import shutil
 import json
-import socket
 import tempfile
-import ctypes
 import urllib.request
 import urllib.parse
 import sqlite3
 import threading
+import logging
 from typing import Dict, List, Optional
 import wx
 import datetime
@@ -17,8 +16,9 @@ import platform
 import time
 import subprocess
 import hashlib
-import asyncio
 import concurrent.futures
+
+LOG = logging.getLogger(__name__)
 
 import wx.adv
 
@@ -37,7 +37,7 @@ from providers import (
     StalkerPortalClient, StalkerPortalConfig,
     ProviderError, generate_provider_id
 )
-from casting import CastingManager, CastDevice, CastProtocol
+from casting import CastingManager, CastDevice
 from http_headers import channel_http_headers
 from external_player import ExternalPlayerLauncher
 from stream_proxy import get_ffmpeg_path
@@ -403,6 +403,7 @@ class IPTVClient(wx.Frame):
 
     def _ensure_db_tuned(self):
         """Enable WAL and indices so read lookups don’t stall behind imports."""
+        conn = None
         try:
             path = get_db_path()
             uri = f"file:{path}?cache=shared"
@@ -421,10 +422,11 @@ class IPTVClient(wx.Frame):
         except Exception:
             pass
         finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def _sync_player_menu_from_config(self):
         defplayer = self.config.get("media_player", "Built-in Player")
@@ -989,7 +991,7 @@ class IPTVClient(wx.Frame):
                 
                 wx.CallAfter(lambda: self._show_epg_dialog(channel.get("name", ""), programmes))
             except Exception as e:
-                wx.CallAfter(lambda: wx.MessageBox(f"Error fetching EPG: {e}", "Error", wx.OK | wx.ICON_ERROR))
+                wx.CallAfter(lambda err=e: wx.MessageBox(f"Error fetching EPG: {err}", "Error", wx.OK | wx.ICON_ERROR))
 
         threading.Thread(target=fetch_and_show, daemon=True).start()
 
@@ -2618,7 +2620,9 @@ class IPTVClient(wx.Frame):
         channel: Optional[Dict[str, str]] = None,
         show_internal_player: Optional[bool] = None,
     ):
+        LOG.info("_launch_stream called: url=%s, title=%s, player=%s", url, title, self.default_player)
         if not url:
+            LOG.warning("_launch_stream: No URL provided")
             wx.MessageBox("Could not find stream URL for this selection.", "Not Found",
                           wx.OK | wx.ICON_WARNING)
             return
@@ -2712,7 +2716,7 @@ class IPTVClient(wx.Frame):
                 wx.CallAfter(self._handoff_internal_player_after_cast, url, title)
                 wx.CallAfter(lambda: wx.MessageBox(f"Casting to {device.display_name}...", "Casting", wx.OK | wx.ICON_INFORMATION))
             except Exception as e:
-                wx.CallAfter(lambda: wx.MessageBox(f"Failed to cast: {e}", "Casting Error", wx.OK | wx.ICON_ERROR))
+                wx.CallAfter(lambda err=e: wx.MessageBox(f"Failed to cast: {err}", "Casting Error", wx.OK | wx.ICON_ERROR))
 
         if self.caster.is_connected() and self.caster.active_device:
             threading.Thread(target=lambda: do_cast(self.caster.active_device), daemon=True).start()

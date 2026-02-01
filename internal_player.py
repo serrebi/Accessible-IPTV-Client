@@ -354,12 +354,32 @@ class InternalPlayerFrame(wx.Frame):
         self._early_buffer_fix_applied = False
         self._has_seen_playing = False
 
+        LOG.info("Playing URL: %s (title=%s, retry=%s)", base_url, title, _retry)
         self.SetTitle(f"{self._current_title} - Built-in Player")
         playback_url, variant_bitrate = self._resolve_stream_url(base_url, headers=merged_headers)
         self._last_resolved_url = playback_url
+        LOG.debug("Resolved playback URL: %s (variant_bitrate=%s)", playback_url, variant_bitrate)
+        
+        # Quick preflight check to catch obvious HTTP errors before VLC tries
+        if not _retry:
+            LOG.debug("Running preflight check...")
+            preflight_error = self._preflight_check(playback_url, headers=merged_headers)
+            if preflight_error:
+                LOG.warning("Preflight check failed: %s", preflight_error)
+                self._update_status_label("Connection failed")
+                wx.CallAfter(
+                    wx.MessageBox,
+                    preflight_error,
+                    "Stream Unavailable",
+                    wx.OK | wx.ICON_WARNING,
+                )
+                return
+            LOG.debug("Preflight check passed")
+        
         target_buffer, cache_profile, bitrate = self._compute_buffer_profile(
             playback_url, bitrate_hint=variant_bitrate, headers=merged_headers
         )
+        LOG.debug("Buffer profile: target=%.1fs, bitrate=%s Mbps", target_buffer, bitrate)
         self._last_buffer_seconds = target_buffer
         self._last_bitrate_mbps = bitrate
 
@@ -391,12 +411,14 @@ class InternalPlayerFrame(wx.Frame):
                 self.player.set_xwindow(0)  # Linux
             except Exception:
                 pass
+        LOG.debug("Calling player.play()...")
         self.player.play()
         self._is_paused = False
         self.play_pause_btn.SetLabel("Pause")
         self._schedule_volume_apply()
         self._status_timer.Start(500)
         self._update_status_label("Buffering...")
+        LOG.debug("Playback initiated, timer started")
         
         # Ensure focus returns to the controls for screen readers
         if video_visible:
@@ -872,23 +894,23 @@ class InternalPlayerFrame(wx.Frame):
         if is_linear_ts:
             cache_fraction = max(cache_fraction, self._ts_network_bias)
 
-        # Improved buffering: use longer initial buffer to prevent quick disconnects
-        # HLS and M3U+ streams need more startup buffer to establish stable connection
+        # Fast startup: use minimal initial buffer, rely on reconnect logic for stability
+        # User can increase base_buffer_seconds in config if they have slow internet
         if is_audio:
-            # Audio streams: fast start (3-4s) but enough to avoid interruption
-            raw_target = max(base, 3.5)
+            # Audio streams: very fast start
+            raw_target = max(base, 2.0)
         elif bitrate is None:
-            # Unknown bitrate: use conservative 8s to allow connection to stabilize
-            raw_target = max(base, 8.0)
+            # Unknown bitrate: use base + small margin for fast startup
+            raw_target = max(base, 3.0)
         elif bitrate <= 3.0:
-            # Low bitrate video (SD): 8s gives stable connection
-            raw_target = max(base, 8.0)
+            # Low bitrate (SD): quick start
+            raw_target = max(base, 3.0)
         elif bitrate <= 8.0:
-            # Medium bitrate (720p-1080p): 10s handles initial buffering
-            raw_target = max(base, 10.0)
+            # Medium bitrate (720p-1080p): slightly more buffer
+            raw_target = max(base, 4.0)
         else:
-            # High bitrate (HD/4K): 12s absorbs startup jitter
-            raw_target = max(base, 12.0)
+            # High bitrate (HD/4K): a bit more to absorb startup jitter
+            raw_target = max(base, 5.0)
             
         if is_linear_ts:
             raw_target = max(raw_target, self._ts_buffer_floor)
@@ -957,6 +979,69 @@ class InternalPlayerFrame(wx.Frame):
             return None
         return highest / 1_000_000
 
+    def _preflight_check(self, url: str, headers: Optional[Dict[str, object]] = None) -> Optional[str]:
+        """Quick HTTP check to detect obvious errors before VLC tries to open.
+        
+        Returns None if OK, or an error message string if the stream is unreachable.
+        Only checks the initial HTTP response - does not follow redirects or wait for stream data.
+        VLC handles redirects and auth tokens differently, so we just verify basic connectivity.
+        """
+        if not url or not url.startswith(("http://", "https://")):
+            return None  # Skip check for non-HTTP URLs
+        
+        req_headers = self._request_headers(headers, include_accept=True)
+        req = urllib.request.Request(url, headers=req_headers, method="GET")
+        
+        # Don't follow redirects - just check the initial response
+        # VLC handles redirects internally and may handle auth tokens differently
+        class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None  # Don't follow redirects
+        
+        opener = urllib.request.build_opener(NoRedirectHandler)
+        
+        try:
+            # Short timeout - just verify we can connect and get HTTP status
+            resp = opener.open(req, timeout=5)
+            status = resp.status
+            resp.close()
+            if status >= 400:
+                return f"HTTP error {status}"
+            return None  # Success - got 2xx/3xx response (3xx means redirect, let VLC handle it)
+        except urllib.error.HTTPError as e:
+            # 3xx redirects are fine - VLC will follow them
+            if 300 <= e.code < 400:
+                return None  # Redirect is OK
+            LOG.warning("Stream preflight failed: HTTP %d %s for %s", e.code, e.reason, url)
+            if e.code == 404:
+                return f"Stream not found (HTTP 404). The channel may be offline or the URL may have expired."
+            elif e.code == 403:
+                return f"Access denied (HTTP 403). Authentication may have expired."
+            elif e.code == 401:
+                return f"Authentication required (HTTP 401). Please check your credentials."
+            elif e.code == 502:
+                return f"Bad gateway (HTTP 502). The provider's server may be having issues."
+            elif e.code == 503:
+                return f"Service unavailable (HTTP 503). The provider may be overloaded."
+            elif e.code >= 500:
+                return f"Server error (HTTP {e.code}). Try again later."
+            else:
+                return f"HTTP error {e.code}: {e.reason}"
+        except urllib.error.URLError as e:
+            reason = str(e.reason) if e.reason else "Unknown error"
+            LOG.warning("Stream preflight failed: %s for %s", reason, url)
+            if "ssl" in reason.lower() or "certificate" in reason.lower():
+                return f"SSL/TLS error: {reason}"
+            elif "timeout" in reason.lower() or "timed out" in reason.lower():
+                return None  # Timeouts are OK - let VLC try with its own buffering
+            elif "refused" in reason.lower():
+                return f"Connection refused. The server may be down."
+            else:
+                return f"Connection error: {reason}"
+        except Exception as e:
+            LOG.debug("Preflight check exception (non-fatal): %s", e)
+            return None  # Let VLC try anyway for unknown errors
+
     @staticmethod
     def _extract_bitrate_from_query(query: str) -> Optional[float]:
         if not query:
@@ -998,9 +1083,15 @@ class InternalPlayerFrame(wx.Frame):
                 self._gave_up = True
                 self._manual_stop = True
                 self._current_url = None
+                # Build informative error message
+                reason_hint = ""
+                if self._last_restart_reason:
+                    reason_hint = f"\n\nLast error: {self._last_restart_reason}"
                 wx.CallAfter(
                     wx.MessageBox,
-                    "Stream disconnected after multiple retries. Please try another channel or try again later.",
+                    f"Stream disconnected after {self._max_reconnect_attempts} retries. "
+                    f"The stream may be offline or experiencing issues.{reason_hint}\n\n"
+                    "Please try another channel or try again later.",
                     "Stream Lost",
                     wx.OK | wx.ICON_WARNING,
                 )
@@ -1201,7 +1292,7 @@ class InternalPlayerFrame(wx.Frame):
         # Actually, if prefix is "", we might be erasing "Buffering...".
         # Let's add `self._last_status_prefix` to __init__ and use it.
         
-        current_lbl = self.status_label.GetLabel()
+        # NOTE: current_lbl was used for debugging; removed to silence lint warning.
         # Hacky heuristic: if prefix arg is empty, try to keep the existing prefix text (everything before " X.Xs buffer")
         # But simpler is to just use a stored state variable.
         
@@ -1350,6 +1441,8 @@ class InternalPlayerFrame(wx.Frame):
     def _schedule_volume_apply(self) -> None:
         def _apply() -> None:
             try:
+                # Ensure audio is not muted (can happen with --intf=dummy)
+                self.player.audio_set_mute(False)
                 current = self.player.audio_get_volume()
                 if current >= 0:
                     self._volume_value = current

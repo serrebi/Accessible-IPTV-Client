@@ -6,13 +6,11 @@ Each device is labeled with its type for easy identification.
 
 import asyncio
 import logging
-import socket
 import threading
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 LOG = logging.getLogger(__name__)
 
@@ -123,7 +121,6 @@ class BaseCaster(ABC):
 
 try:
     import pychromecast
-    from pychromecast.controllers.media import MediaController
     _HAS_CHROMECAST = True
 except ImportError:
     _HAS_CHROMECAST = False
