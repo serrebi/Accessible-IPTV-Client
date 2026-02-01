@@ -341,7 +341,7 @@ def print_dry_run(version, tag, bump, assets):
     print(f"- last_tag: {tag or 'none'}")
     print(f"- bump: {bump}")
     print(f"- next_version: {version}")
-    print(f"- build: pyinstaller --noconfirm main.spec")
+    print("- build: pyinstaller --noconfirm main.spec")
     print(f"- sign: {app_meta.EXE_NAME}")
     print(f"- zip: {assets['asset_path']}")
     print(f"- manifest: {assets['manifest_path']}")

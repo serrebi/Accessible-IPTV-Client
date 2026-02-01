@@ -1,7 +1,6 @@
 import os
 import sys
 import logging
-import sqlite3
 
 # Mocking environment
 sys.path.append(os.getcwd())

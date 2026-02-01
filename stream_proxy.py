@@ -14,7 +14,6 @@ import shutil
 import os
 import time
 import hashlib
-import queue
 import collections
 
 import sys

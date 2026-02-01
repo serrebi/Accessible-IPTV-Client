@@ -1,6 +1,5 @@
 
 import urllib.request
-import sys
 
 url = "http://live.iptvcanada.tv//playlist/jb8gdjke8y/9879569749/m3u8"
 

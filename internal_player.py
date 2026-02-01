@@ -132,6 +132,7 @@ class InternalPlayerFrame(wx.Frame):
         self._max_network_cache_seconds = 0.0
         self._ts_network_bias = 0.0
         self._xtream_buffer_refresh_seconds = 0.0
+        self._detected_content_ts = False  # True if stream detected as TS via Content-Type
         self._refresh_ts_floor()
         self._update_cache_bounds()
         self._last_buffer_seconds: float = self.base_buffer_seconds
@@ -353,6 +354,7 @@ class InternalPlayerFrame(wx.Frame):
         self._buffer_start_ts = None
         self._early_buffer_fix_applied = False
         self._has_seen_playing = False
+        self._detected_content_ts = False  # Reset content type detection
 
         LOG.info("Playing URL: %s (title=%s, retry=%s)", base_url, title, _retry)
         self.SetTitle(f"{self._current_title} - Built-in Player")
@@ -375,6 +377,8 @@ class InternalPlayerFrame(wx.Frame):
                 )
                 return
             LOG.debug("Preflight check passed")
+            # Detect content type to identify TS streams that don't have .ts extension
+            self._detect_stream_content_type(playback_url, headers=merged_headers)
         
         target_buffer, cache_profile, bitrate = self._compute_buffer_profile(
             playback_url, bitrate_hint=variant_bitrate, headers=merged_headers
@@ -678,8 +682,23 @@ class InternalPlayerFrame(wx.Frame):
         return base.strip()
 
     def _looks_like_xtream_live_ts(self) -> bool:
+        """Check if current stream looks like an Xtream-style live TS stream.
+        
+        Returns True if:
+        - URL matches Xtream pattern with .ts extension, OR
+        - Content-Type was detected as video/mp2t (MPEG-TS)
+        """
         target = self._strip_stream_modifiers(self._last_resolved_url or self._current_url or "")
-        return self._looks_like_xtream_live_ts_url(target)
+        if self._looks_like_xtream_live_ts_url(target):
+            return True
+        # Also check if we detected TS via content-type (for URLs without .ts extension)
+        if self._detected_content_ts and self._current_stream_kind == "live":
+            # Check it's not a known non-live pattern
+            lower = target.lower()
+            if any(token in lower for token in ("/timeshift/", "/movie/", "/series/", "/archive/", "catchup", "recording")):
+                return False
+            return True
+        return False
 
     @staticmethod
     def _looks_like_xtream_live_ts_url(url: str) -> bool:
@@ -878,6 +897,12 @@ class InternalPlayerFrame(wx.Frame):
                 return True
         return False
 
+    def _is_current_stream_ts(self, url: str) -> bool:
+        """Check if current stream is TS (either by URL extension or detected content-type)."""
+        if self._is_linear_ts(url):
+            return True
+        return self._detected_content_ts
+
     def _compute_buffer_profile(
         self,
         url: str,
@@ -887,7 +912,7 @@ class InternalPlayerFrame(wx.Frame):
     ) -> Tuple[float, dict, Optional[float]]:
         bitrate = bitrate_hint if bitrate_hint and bitrate_hint > 0 else self._estimate_stream_bitrate(url, headers=headers)
         base = self.base_buffer_seconds
-        is_linear_ts = self._is_linear_ts(url)
+        is_linear_ts = self._is_current_stream_ts(url)
         is_audio = self._is_likely_audio(url)
         
         cache_fraction = self._network_cache_fraction
@@ -1041,6 +1066,39 @@ class InternalPlayerFrame(wx.Frame):
         except Exception as e:
             LOG.debug("Preflight check exception (non-fatal): %s", e)
             return None  # Let VLC try anyway for unknown errors
+
+    def _detect_stream_content_type(self, url: str, headers: Optional[Dict[str, object]] = None) -> Optional[str]:
+        """Follow redirects and detect the content type of the final URL.
+        
+        Returns the content type string if detected, or None on error.
+        Also sets self._detected_content_ts if the content is video/mp2t.
+        Uses GET with early close to follow redirects (HEAD may not be supported).
+        """
+        if not url or not url.startswith(("http://", "https://")):
+            return None
+        
+        req_headers = self._request_headers(headers, include_accept=True)
+        req = urllib.request.Request(url, headers=req_headers, method="GET")
+        
+        try:
+            # Use GET and close immediately after reading headers
+            # (HEAD may not follow redirects properly on some servers)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                content_type = resp.getheader("Content-Type", "")
+                final_url = resp.geturl()
+                # Don't read the body, just close
+                LOG.debug("Stream content type: %s (final URL: %s)", content_type, final_url[:100] if final_url else "?")
+                
+                # Check for MPEG-TS content types
+                ct_lower = content_type.lower()
+                if any(ts_type in ct_lower for ts_type in ("video/mp2t", "video/mpeg", "application/octet-stream")):
+                    self._detected_content_ts = True
+                    LOG.debug("Detected TS stream via Content-Type: %s", content_type)
+                
+                return content_type
+        except Exception as e:
+            LOG.debug("Content type detection failed: %s", e)
+            return None
 
     @staticmethod
     def _extract_bitrate_from_query(query: str) -> Optional[float]:

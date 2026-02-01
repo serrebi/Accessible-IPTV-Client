@@ -244,7 +244,8 @@ class TrayIcon(wx.adv.TaskBarIcon):
     def on_taskbar_activate(self, event):
         # Handle left-click, double-click, or Enter key on tray icon.
         # All these actions restore the app for accessibility (NVDA/JAWS).
-        self.on_restore()
+        # Use CallLater to let the tray event fully complete before restoring.
+        wx.CallLater(50, self.on_restore)
 
     def on_menu_select(self, event):
         eid = event.GetId()
@@ -1246,36 +1247,124 @@ class IPTVClient(wx.Frame):
     def restore_from_tray(self):
         self._tray_allow_restore = False
         self._cancel_tray_ready_timer()
+        # First, destroy the tray icon completely
         if self.tray_icon:
             try:
                 self.tray_icon.RemoveIcon()
             except Exception:
                 pass
-            self.tray_icon.Destroy()
+            try:
+                self.tray_icon.Destroy()
+            except Exception:
+                pass
             self.tray_icon = None
+        # Show and restore the window
         self.Show()
         self.Iconize(False)
         self.Raise()
-        # Force window to foreground for screen reader accessibility
-        try:
-            self.SetFocus()
-        except Exception:
-            pass
+        # Delay focus operations to let the tray icon fully release
+        wx.CallLater(150, self._complete_restore_from_tray)
+    
+    def _complete_restore_from_tray(self):
+        """Complete restore after tray icon is destroyed."""
+        # Force window to foreground using Windows API for proper focus
+        self._force_foreground()
         # Set focus to channel list for screen reader accessibility
         wx.CallAfter(self._focus_channel_list)
+        # Additional delayed attempt
+        wx.CallLater(100, self._focus_channel_list)
+
+    def _force_foreground(self):
+        """Force window to foreground on Windows using native API."""
+        if platform.system() != "Windows":
+            try:
+                self.SetFocus()
+            except Exception:
+                pass
+            return
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            hwnd = self.GetHandle()
+            SW_RESTORE = 9
+            SW_SHOW = 5
+            VK_MENU = 0x12  # Alt key
+            KEYEVENTF_EXTENDEDKEY = 0x0001
+            KEYEVENTF_KEYUP = 0x0002
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            HWND_TOP = 0
+            
+            # Get our thread ID
+            current_tid = kernel32.GetCurrentThreadId()
+            
+            # Get the foreground window's thread
+            foreground_hwnd = user32.GetForegroundWindow()
+            foreground_tid = user32.GetWindowThreadProcessId(foreground_hwnd, None)
+            
+            # Attach our thread to the foreground thread
+            attached = False
+            if foreground_tid and foreground_tid != current_tid:
+                attached = user32.AttachThreadInput(foreground_tid, current_tid, True)
+            
+            # Show and restore the window
+            user32.ShowWindow(hwnd, SW_RESTORE)
+            user32.ShowWindow(hwnd, SW_SHOW)
+            
+            # Move window to top of Z-order
+            user32.SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+            
+            # Simulate Alt key press to unlock foreground
+            user32.keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY, 0)
+            user32.keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+            
+            # Set foreground and focus
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            user32.SetActiveWindow(hwnd)
+            user32.SetFocus(hwnd)
+            
+            # Detach threads if we attached
+            if attached:
+                user32.AttachThreadInput(foreground_tid, current_tid, False)
+        except Exception:
+            # Fallback to wx method if Windows API fails
+            try:
+                self.SetFocus()
+            except Exception:
+                pass
 
     def _focus_channel_list(self):
         """Set focus to channel list - used after restore from tray."""
         try:
             if self.IsShown() and not self.IsIconized():
                 # Ensure window is in foreground first
-                self.Raise()
+                self._force_foreground()
+                # Focus the channel list control
                 self.channel_list.SetFocus()
-                # Announce restoration to screen reader
+                # Set a selection to ensure something is selected
                 if self.channel_list.GetCount() > 0:
                     sel = self.channel_list.GetSelection()
                     if sel == wx.NOT_FOUND:
                         self.channel_list.SetSelection(0)
+                        sel = 0
+                    # Notify screen readers of the focus change on the list control
+                    if platform.system() == "Windows":
+                        try:
+                            import ctypes
+                            user32 = ctypes.windll.user32
+                            list_hwnd = self.channel_list.GetHandle()
+                            EVENT_OBJECT_FOCUS = 0x8005
+                            EVENT_OBJECT_SELECTION = 0x8006
+                            OBJID_CLIENT = -4
+                            CHILDID_SELF = 0
+                            # Fire focus event on the list
+                            user32.NotifyWinEvent(EVENT_OBJECT_FOCUS, list_hwnd, OBJID_CLIENT, CHILDID_SELF)
+                            # Fire selection event on the selected item (1-indexed for MSAA)
+                            user32.NotifyWinEvent(EVENT_OBJECT_SELECTION, list_hwnd, OBJID_CLIENT, sel + 1)
+                        except Exception:
+                            pass
         except Exception:
             pass
 

@@ -6,7 +6,7 @@ import socket
 import threading
 import time
 import tempfile
-from typing import List, Tuple
+from typing import Tuple
 
 class ExternalPlayerLauncher:
     def __init__(self):

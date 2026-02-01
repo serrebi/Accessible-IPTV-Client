@@ -1,10 +1,8 @@
 
 import time
 import logging
-import sys
 import pychromecast
 from stream_proxy import get_proxy
-from casting import ChromecastCaster, CastDevice, CastProtocol
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)

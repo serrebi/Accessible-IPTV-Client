@@ -1,7 +1,6 @@
 import os
 import sys
 import subprocess
-import time
 print("MAIN_APP running")
 helper_bat = r"C:\Users\admin\git\Accessible-IPTV-Client\test_zombie_env\temp_helper\update_helper.bat"
 install_dir = r"C:\Users\admin\git\Accessible-IPTV-Client\test_zombie_env\install"

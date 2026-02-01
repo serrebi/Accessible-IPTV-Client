@@ -4,7 +4,6 @@ import tempfile
 import os
 import time
 import shutil
-import sys
 
 # The URL that was failing
 SOURCE_URL = "https://gohyperspeed.com/700462241/nb3KdUgE63/600000220"

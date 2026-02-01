@@ -1,6 +1,5 @@
 
 import urllib.request
-import sys
 
 base = "http://live.iptvcanada.tv/get.php?username=jb8gdjke8y&password=9879569749&type=m3u_plus"
 variants = [

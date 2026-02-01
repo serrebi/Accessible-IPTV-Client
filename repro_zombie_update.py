@@ -157,7 +157,7 @@ def run_test():
     # Print Log
     log_path = os.path.join(tempfile.gettempdir(), "AccessibleIPTVClient_update.log")
     if os.path.exists(log_path):
-        print(f"Log content:")
+        print("Log content:")
         with open(log_path, "r") as f:
             print(f.read())
             
