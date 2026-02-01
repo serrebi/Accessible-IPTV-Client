@@ -116,3 +116,7 @@ wxPython>=4.2.1 (GUI), python-vlc (built-in player), psutil optional for memory 
 **Update 2026-02-01**: Fixed system tray restore not announcing in NVDA. Added Windows API calls (`SetForegroundWindow`, `AttachThreadInput`, `keybd_event` Alt key trick) to properly transfer focus, plus `NotifyWinEvent` with `EVENT_OBJECT_FOCUS` and `EVENT_OBJECT_SELECTION` to notify screen readers of the focus change. Users experiencing persistent issues should run NVDA's "Fix COM registrations" tool from Tools menu.
 
 **Update 2026-02-01**: Improved Xtream-style TS stream detection. URLs that redirect to TS streams (with `video/mp2t` Content-Type) but don't have `.ts` extension are now properly detected as MPEG-TS live streams. This enables the Xtream refresh logic (auto-reconnect without consuming retry budget) for streams like `gohyperspeed.com` that use `/auth/` token URLs.
+
+**Update 2026-02-01**: Fixed live TS stream position tracking. VLC's `get_time()` can return decreasing values during timestamp discontinuities in live streams. The playback monitor now detects backwards jumps (>1s) and resets position tracking instead of counting them as stalls.
+
+**Update 2026-02-01**: Reduced stream startup delay from 3-5s to 1-2s. Buffer targets lowered to 1.5-2.5s (based on bitrate), removed network-based bitrate probing (use URL hints only), and reduced HLS manifest fetch timeout from 4s to 2s. Rely on reconnect logic for stability instead of large initial buffers.
