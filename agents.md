@@ -108,3 +108,5 @@ wxPython>=4.2.1 (GUI), python-vlc (built-in player), psutil optional for memory 
 **Update 2026-02-01**: Added HTTP preflight check in `internal_player.py` to detect dead streams (404, 403, etc.) before VLC tries to connect, showing user-friendly error messages instead of silent failures.
 
 **Update 2026-02-01**: GitHub releases require an `AccessibleIPTVClient-update.json` manifest file alongside the zip. The manifest must contain: `version`, `asset_filename`, `download_url`, `sha256`, and `release_notes_summary`. Without it, the auto-updater fails with "Update manifest was not found".
+
+**Update 2026-02-01**: PowerShell's `Get-AuthenticodeSignature` cmdlet fails to load from Python subprocess when PSMODULEPATH contains PowerShell Core (pwsh 7) paths. Fixed by: (1) writing the script to a temp .ps1 file, (2) launching via `cmd /c powershell.exe` with the full Windows PowerShell 5.1 path, (3) stripping PSMODULEPATH and POWERSHELL environment variables. This ensures Authenticode verification works in all environments.
