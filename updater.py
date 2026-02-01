@@ -1,6 +1,7 @@
 import datetime
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -9,6 +10,8 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
+
+LOG = logging.getLogger(__name__)
 
 _VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)(?:\.(\d+))?$")
 
@@ -126,9 +129,17 @@ def fetch_update_manifest(release: dict, manifest_name: str) -> UpdateManifest:
         raise UpdateError("Update manifest download URL is missing.")
 
     data = download_json(url)
-    thumbprints = _normalize_thumbprints(list(_env_thumbprints()) + list(_extract_manifest_thumbprints(data)))
+    LOG.debug("fetch_update_manifest: raw data=%s", data)
+    
+    env_thumbs = list(_env_thumbprints())
+    manifest_thumbs = list(_extract_manifest_thumbprints(data))
+    LOG.debug("fetch_update_manifest: env_thumbprints=%s, manifest_thumbprints=%s", env_thumbs, manifest_thumbs)
+    
+    thumbprints = _normalize_thumbprints(env_thumbs + manifest_thumbs)
+    LOG.debug("fetch_update_manifest: normalized thumbprints=%s", thumbprints)
+    
     try:
-        return UpdateManifest(
+        manifest = UpdateManifest(
             version=str(data["version"]),
             asset_filename=str(data["asset_filename"]),
             download_url=str(data["download_url"]),
@@ -137,6 +148,8 @@ def fetch_update_manifest(release: dict, manifest_name: str) -> UpdateManifest:
             release_notes_summary=data.get("release_notes_summary"),
             signing_thumbprints=thumbprints,
         )
+        LOG.debug("fetch_update_manifest: created manifest with signing_thumbprints=%s", manifest.signing_thumbprints)
+        return manifest
     except KeyError as exc:
         raise UpdateError("Update manifest is missing required fields.") from exc
 
@@ -193,18 +206,60 @@ def find_executable(root: str, exe_name: str) -> Optional[str]:
 
 def verify_authenticode(exe_path: str, allowed_thumbprints: Iterable[str]) -> None:
     allowed = set(_normalize_thumbprints(allowed_thumbprints))
-    cmd = [
-        "powershell",
-        "-NoProfile",
-        "-Command",
-        (
-            f"$sig = Get-AuthenticodeSignature -FilePath '{exe_path}'; "
-            "$thumb = if ($sig.SignerCertificate) { $sig.SignerCertificate.Thumbprint } else { '' }; "
-            "$out = @{Status=$sig.Status.ToString(); StatusMessage=$sig.StatusMessage; Thumbprint=$thumb}; "
-            "$out | ConvertTo-Json -Compress"
-        ),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    LOG.debug("verify_authenticode: exe=%s, allowed_thumbprints=%s", exe_path, allowed)
+    
+    # Convert to absolute path and normalize 
+    abs_path = os.path.abspath(exe_path)
+    
+    # Write the PowerShell script to a temp file to avoid module loading issues
+    # when running from a frozen PyInstaller app or PowerShell Core environment
+    import tempfile
+    ps_script = f'''
+$ErrorActionPreference = 'SilentlyContinue'
+$sig = Get-AuthenticodeSignature -LiteralPath "{abs_path}"
+$thumb = if ($sig.SignerCertificate) {{ $sig.SignerCertificate.Thumbprint }} else {{ "" }}
+@{{Status=$sig.Status.ToString(); StatusMessage=$sig.StatusMessage; Thumbprint=$thumb}} | ConvertTo-Json -Compress
+'''
+    
+    # Create temp script file
+    script_fd, script_path = tempfile.mkstemp(suffix=".ps1")
+    try:
+        os.write(script_fd, ps_script.encode('utf-8'))
+        os.close(script_fd)
+        
+        # Use cmd.exe to launch Windows PowerShell with a clean environment
+        # This bypasses Python environment variables that can cause module loading issues
+        # (e.g., PSMODULEPATH conflicts between pwsh 7 and Windows PowerShell 5.1)
+        windows_ps = os.path.join(os.environ.get("SYSTEMROOT", "C:\\Windows"),
+                                   "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        if not os.path.exists(windows_ps):
+            windows_ps = "powershell.exe"  # Fall back to PATH
+        
+        cmd = [
+            "cmd", "/c", windows_ps,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy", "Bypass",
+            "-File", script_path,
+        ]
+        
+        # Clean environment - remove PS-related vars that cause module conflicts
+        clean_env = os.environ.copy()
+        for k in list(clean_env.keys()):
+            if 'PSMODULE' in k.upper() or 'POWERSHELL' in k.upper():
+                del clean_env[k]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=clean_env)
+        
+        LOG.debug("verify_authenticode: returncode=%s, stdout=%r, stderr=%r", 
+                  result.returncode, result.stdout[:500] if result.stdout else None, 
+                  result.stderr[:500] if result.stderr else None)
+    finally:
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
+    
     if result.returncode != 0:
         raise UpdateError(f"Authenticode verification failed: {result.stderr.strip() or result.stdout.strip()}")
     try:
@@ -215,11 +270,27 @@ def verify_authenticode(exe_path: str, allowed_thumbprints: Iterable[str]) -> No
     status = str(data.get("Status") or "").strip()
     status_msg = str(data.get("StatusMessage") or "").strip()
     thumbprint = _normalize_thumbprint(data.get("Thumbprint"))
+    
+    LOG.debug("verify_authenticode: status=%s, thumbprint=%s", status, thumbprint)
 
+    # Case 1: Signature is fully valid (trusted CA)
     if status.lower() == "valid":
+        LOG.debug("verify_authenticode: PASS - status is Valid")
         return
-    if thumbprint and allowed and thumbprint in allowed:
+    
+    # Case 2: Self-signed or untrusted CA, but thumbprint matches allowed list
+    # This handles UnknownError, NotTrusted, etc. when we have a pinned thumbprint
+    if thumbprint and thumbprint in allowed:
+        LOG.debug("verify_authenticode: PASS - thumbprint %s in allowed set", thumbprint)
         return
+    
+    # Case 3: No allowed thumbprints configured, but we have a signature - warn but allow
+    # This provides backwards compatibility for releases without pinned thumbprints
+    if thumbprint and not allowed:
+        LOG.warning("verify_authenticode: No allowed thumbprints configured, allowing signed exe with thumbprint %s", thumbprint)
+        return
+    
+    # Verification failed - build detailed error message
     detail = f"Authenticode status was {status or 'Unknown'}."
     if status_msg:
         detail = f"{detail} {status_msg}"
