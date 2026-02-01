@@ -120,3 +120,5 @@ wxPython>=4.2.1 (GUI), python-vlc (built-in player), psutil optional for memory 
 **Update 2026-02-01**: Fixed live TS stream position tracking. VLC's `get_time()` can return decreasing values during timestamp discontinuities in live streams. The playback monitor now detects backwards jumps (>1s) and resets position tracking instead of counting them as stalls.
 
 **Update 2026-02-01**: Reduced stream startup delay from 3-5s to 1-2s. Buffer targets lowered to 1.5-2.5s (based on bitrate), removed network-based bitrate probing (use URL hints only), and reduced HLS manifest fetch timeout from 4s to 2s. Rely on reconnect logic for stability instead of large initial buffers.
+
+**Update 2026-02-01**: Fixed focus-stealing when app is minimized to tray. `_populate_channel_list_chunked()` was calling `SetFocus()` unconditionally during playlist refresh and EPG updates, causing the app to steal focus even when hidden. Added guard `if self.IsShown() and not self.IsIconized()` before `SetFocus()` calls.

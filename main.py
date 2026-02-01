@@ -2320,7 +2320,9 @@ class IPTVClient(wx.Frame):
                 except Exception:
                     pass
             self.channel_list.SetSelection(0)
-            self.channel_list.SetFocus()
+            # Only set focus if window is visible (avoid stealing focus from tray)
+            if self.IsShown() and not self.IsIconized():
+                self.channel_list.SetFocus()
             self.on_highlight()
             self._maybe_autostart_epg_import()
             return
@@ -2345,7 +2347,9 @@ class IPTVClient(wx.Frame):
             except Exception:
                 pass
         self.channel_list.SetSelection(0)
-        self.channel_list.SetFocus()
+        # Only set focus if window is visible (avoid stealing focus from tray)
+        if self.IsShown() and not self.IsIconized():
+            self.channel_list.SetFocus()
         self.on_highlight()
         idx = preview_end
         self.epg_display.SetValue(f"Loading channels… {idx}/{total}")
