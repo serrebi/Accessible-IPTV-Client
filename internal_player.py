@@ -362,22 +362,8 @@ class InternalPlayerFrame(wx.Frame):
         self._last_resolved_url = playback_url
         LOG.debug("Resolved playback URL: %s (variant_bitrate=%s)", playback_url, variant_bitrate)
         
-        # Quick preflight check to catch obvious HTTP errors before VLC tries
+        # Detect content type based on URL patterns (fast, no network call)
         if not _retry:
-            LOG.debug("Running preflight check...")
-            preflight_error = self._preflight_check(playback_url, headers=merged_headers)
-            if preflight_error:
-                LOG.warning("Preflight check failed: %s", preflight_error)
-                self._update_status_label("Connection failed")
-                wx.CallAfter(
-                    wx.MessageBox,
-                    preflight_error,
-                    "Stream Unavailable",
-                    wx.OK | wx.ICON_WARNING,
-                )
-                return
-            LOG.debug("Preflight check passed")
-            # Detect content type to identify TS streams that don't have .ts extension
             self._detect_stream_content_type(playback_url, headers=merged_headers)
         
         target_buffer, cache_profile, bitrate = self._compute_buffer_profile(
@@ -394,6 +380,7 @@ class InternalPlayerFrame(wx.Frame):
             media.add_option(":no-video")
             media.add_option(":vout=dummy")
             media.add_option(":intf=dummy")
+        # Stop any existing playback quickly (don't wait for it to fully stop)
         try:
             self.player.stop()
         except Exception:
@@ -787,7 +774,7 @@ class InternalPlayerFrame(wx.Frame):
     def _fetch_hls_manifest(self, url: str, headers: Optional[Dict[str, object]] = None) -> Optional[str]:
         req = urllib.request.Request(url, headers=self._request_headers(headers))
         try:
-            with urllib.request.urlopen(req, timeout=4) as response:
+            with urllib.request.urlopen(req, timeout=2) as response:
                 data = response.read(512_000)
         except Exception as err:
             LOG.debug("Failed to fetch HLS manifest %s: %s", url, err)
@@ -923,19 +910,19 @@ class InternalPlayerFrame(wx.Frame):
         # User can increase base_buffer_seconds in config if they have slow internet
         if is_audio:
             # Audio streams: very fast start
-            raw_target = max(base, 2.0)
+            raw_target = max(base, 1.5)
         elif bitrate is None:
-            # Unknown bitrate: use base + small margin for fast startup
-            raw_target = max(base, 3.0)
+            # Unknown bitrate: use minimal buffer for fast startup
+            raw_target = max(base, 1.5)
         elif bitrate <= 3.0:
             # Low bitrate (SD): quick start
-            raw_target = max(base, 3.0)
+            raw_target = max(base, 1.5)
         elif bitrate <= 8.0:
             # Medium bitrate (720p-1080p): slightly more buffer
-            raw_target = max(base, 4.0)
+            raw_target = max(base, 2.0)
         else:
             # High bitrate (HD/4K): a bit more to absorb startup jitter
-            raw_target = max(base, 5.0)
+            raw_target = max(base, 2.5)
             
         if is_linear_ts:
             raw_target = max(raw_target, self._ts_buffer_floor)
@@ -968,41 +955,13 @@ class InternalPlayerFrame(wx.Frame):
         return network_target, profile, bitrate
 
     def _estimate_stream_bitrate(self, url: str, headers: Optional[Dict[str, object]] = None) -> Optional[float]:
+        """Estimate bitrate from URL hints only (no network calls for fast startup)."""
         parsed = urllib.parse.urlparse(url)
         query_hint = self._extract_bitrate_from_query(parsed.query)
         if query_hint:
             return query_hint
-
-        lower = url.lower()
-        if "m3u8" not in lower and "manifest" not in lower:
-            return None
-
-        req = urllib.request.Request(url, headers=self._request_headers(headers))
-        try:
-            with urllib.request.urlopen(req, timeout=3) as response:
-                data = response.read(65536)
-        except Exception as err:
-            LOG.debug("Bitrate probe failed for %s: %s", url, err)
-            return None
-
-        try:
-            text = data.decode("utf-8", errors="ignore")
-        except Exception:
-            return None
-
-        matches = re.findall(r"BANDWIDTH=(\d+)", text)
-        if not matches:
-            matches = re.findall(r"AVERAGE-BANDWIDTH=(\d+)", text)
-        if not matches:
-            return None
-
-        try:
-            highest = max(int(m) for m in matches)
-        except Exception:
-            return None
-        if highest <= 0:
-            return None
-        return highest / 1_000_000
+        # Skip network probing for fast startup - let buffer tuning use defaults
+        return None
 
     def _preflight_check(self, url: str, headers: Optional[Dict[str, object]] = None) -> Optional[str]:
         """Quick HTTP check to detect obvious errors before VLC tries to open.
@@ -1026,8 +985,8 @@ class InternalPlayerFrame(wx.Frame):
         opener = urllib.request.build_opener(NoRedirectHandler)
         
         try:
-            # Short timeout - just verify we can connect and get HTTP status
-            resp = opener.open(req, timeout=5)
+            # Very short timeout for fast startup - just verify basic connectivity
+            resp = opener.open(req, timeout=2)
             status = resp.status
             resp.close()
             if status >= 400:
@@ -1068,37 +1027,44 @@ class InternalPlayerFrame(wx.Frame):
             return None  # Let VLC try anyway for unknown errors
 
     def _detect_stream_content_type(self, url: str, headers: Optional[Dict[str, object]] = None) -> Optional[str]:
-        """Follow redirects and detect the content type of the final URL.
+        """Detect if the stream is MPEG-TS based on URL patterns.
         
-        Returns the content type string if detected, or None on error.
-        Also sets self._detected_content_ts if the content is video/mp2t.
-        Uses GET with early close to follow redirects (HEAD may not be supported).
+        Returns the content type string if detected, or None.
+        Also sets self._detected_content_ts if the content appears to be video/mp2t.
+        Uses URL pattern detection (fast, no network call) to avoid startup delay.
         """
         if not url or not url.startswith(("http://", "https://")):
             return None
         
-        req_headers = self._request_headers(headers, include_accept=True)
-        req = urllib.request.Request(url, headers=req_headers, method="GET")
+        # Check URL patterns for common IPTV providers that serve TS streams
+        lower_url = url.lower()
+        parsed = urllib.parse.urlparse(url)
+        path_parts = [p for p in (parsed.path or "").split("/") if p]
         
-        try:
-            # Use GET and close immediately after reading headers
-            # (HEAD may not follow redirects properly on some servers)
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                content_type = resp.getheader("Content-Type", "")
-                final_url = resp.geturl()
-                # Don't read the body, just close
-                LOG.debug("Stream content type: %s (final URL: %s)", content_type, final_url[:100] if final_url else "?")
-                
-                # Check for MPEG-TS content types
-                ct_lower = content_type.lower()
-                if any(ts_type in ct_lower for ts_type in ("video/mp2t", "video/mpeg", "application/octet-stream")):
-                    self._detected_content_ts = True
-                    LOG.debug("Detected TS stream via Content-Type: %s", content_type)
-                
-                return content_type
-        except Exception as e:
-            LOG.debug("Content type detection failed: %s", e)
-            return None
+        # Xtream pattern: URLs with numeric channel IDs
+        if len(path_parts) >= 2:
+            last_part = path_parts[-1].split(".")[0]
+            # Check if last part is numeric (channel ID) - common Xtream pattern
+            if last_part.isdigit():
+                self._detected_content_ts = True
+                LOG.debug("Detected likely TS stream via URL pattern: numeric channel ID")
+                return "video/mp2t"
+            # Also check for /live/ prefix with numeric ID
+            if "live" in path_parts and len(path_parts) >= 3:
+                for part in path_parts[-2:]:
+                    if part.split(".")[0].isdigit():
+                        self._detected_content_ts = True
+                        LOG.debug("Detected likely TS stream via URL pattern: /live/ with numeric ID")
+                        return "video/mp2t"
+        
+        # Check for common TS URL patterns
+        if any(pattern in lower_url for pattern in ("/auth/", "/stream/", "/play/")):
+            # These URL patterns often indicate streaming endpoints
+            self._detected_content_ts = True
+            LOG.debug("Detected likely TS stream via URL pattern: streaming endpoint")
+            return "video/mp2t"
+        
+        return None
 
     @staticmethod
     def _extract_bitrate_from_query(query: str) -> Optional[float]:
@@ -1224,6 +1190,13 @@ class InternalPlayerFrame(wx.Frame):
             self._last_position_ms = None
             return
         if self._last_position_ms is None:
+            self._last_position_ms = position
+            self._stall_ticks = 0
+            return
+        # Check for position going backwards (timestamp discontinuity in live TS streams)
+        # This is normal for live streams - don't count as a stall
+        if position < self._last_position_ms - 1000:
+            # Significant backwards jump (>1s) - likely timestamp reset, reset tracking
             self._last_position_ms = position
             self._stall_ticks = 0
             return
