@@ -242,10 +242,13 @@ class TrayIcon(wx.adv.TaskBarIcon):
         return menu
 
     def on_taskbar_activate(self, event):
-        # Disabled auto-restore on tray icon click for screen reader accessibility.
-        # Users should right-click and select "Restore" from the menu instead.
-        # This prevents the app from stealing focus unexpectedly with NVDA/JAWS.
-        pass
+        # Handle Enter key or double-click on tray icon for accessibility.
+        # This is the expected way for keyboard users to restore the app.
+        # Single-click was disabled to prevent accidental focus stealing,
+        # but double-click/Enter is intentional user action.
+        if event.GetEventType() == wx.adv.wxEVT_TASKBAR_LEFT_DCLICK:
+            self.on_restore()
+        # Single-click (LEFT_UP) is ignored to prevent accidental activation
 
     def on_menu_select(self, event):
         eid = event.GetId()
@@ -1257,6 +1260,11 @@ class IPTVClient(wx.Frame):
         self.Show()
         self.Iconize(False)
         self.Raise()
+        # Force window to foreground for screen reader accessibility
+        try:
+            self.SetFocus()
+        except Exception:
+            pass
         # Set focus to channel list for screen reader accessibility
         wx.CallAfter(self._focus_channel_list)
 
@@ -1264,7 +1272,14 @@ class IPTVClient(wx.Frame):
         """Set focus to channel list - used after restore from tray."""
         try:
             if self.IsShown() and not self.IsIconized():
+                # Ensure window is in foreground first
+                self.Raise()
                 self.channel_list.SetFocus()
+                # Announce restoration to screen reader
+                if self.channel_list.GetCount() > 0:
+                    sel = self.channel_list.GetSelection()
+                    if sel == wx.NOT_FOUND:
+                        self.channel_list.SetSelection(0)
         except Exception:
             pass
 
