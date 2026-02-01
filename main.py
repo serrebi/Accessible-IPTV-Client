@@ -242,13 +242,10 @@ class TrayIcon(wx.adv.TaskBarIcon):
         return menu
 
     def on_taskbar_activate(self, event):
-        parent = self.parent
-        if not getattr(parent, "_tray_allow_restore", True):
-            return
-        is_shown = parent.IsShownOnScreen() if hasattr(parent, "IsShownOnScreen") else parent.IsShown()
-        if is_shown:
-            return
-        self.on_restore()
+        # Disabled auto-restore on tray icon click for screen reader accessibility.
+        # Users should right-click and select "Restore" from the menu instead.
+        # This prevents the app from stealing focus unexpectedly with NVDA/JAWS.
+        pass
 
     def on_menu_select(self, event):
         eid = event.GetId()
@@ -866,9 +863,13 @@ class IPTVClient(wx.Frame):
             self.min_to_tray_item = om.AppendCheckItem(wx.ID_ANY, "Minimize to System Tray")
             self.show_player_on_enter_item = om.AppendCheckItem(wx.ID_ANY, "Show Player on Enter")
             self.auto_check_updates_item = om.AppendCheckItem(wx.ID_ANY, "Auto-check for Updates")
-            self.check_updates_item = om.Append(wx.ID_ANY, "Check for Updates...")
-            om.AppendSeparator()
             mb.Append(om, "Options")
+            # Help menu
+            hm = wx.Menu()
+            self.check_updates_item = hm.Append(wx.ID_ANY, "Check for Updates...")
+            hm.AppendSeparator()
+            m_about = hm.Append(wx.ID_ABOUT, "About...")
+            mb.Append(hm, "Help")
             self.SetMenuBar(mb)
             self.Bind(wx.EVT_MENU, self.show_manager, m_mgr)
             self.Bind(wx.EVT_MENU, self.show_epg_manager, m_epg)
@@ -886,6 +887,7 @@ class IPTVClient(wx.Frame):
             self.Bind(wx.EVT_MENU, self.on_toggle_show_player_on_enter, self.show_player_on_enter_item)
             self.Bind(wx.EVT_MENU, self.on_toggle_auto_check_updates, self.auto_check_updates_item)
             self.Bind(wx.EVT_MENU, self.on_check_updates, self.check_updates_item)
+            self.Bind(wx.EVT_MENU, self._show_about_dialog, m_about)
             self.Bind(wx.EVT_MENU_OPEN, self.on_menu_open)
             self._sync_player_menu_from_config()
             self.min_to_tray_item.Check(self.minimize_to_tray)
@@ -994,6 +996,23 @@ class IPTVClient(wx.Frame):
                 wx.CallAfter(lambda err=e: wx.MessageBox(f"Error fetching EPG: {err}", "Error", wx.OK | wx.ICON_ERROR))
 
         threading.Thread(target=fetch_and_show, daemon=True).start()
+
+    def _show_about_dialog(self, _event=None):
+        """Show About dialog with app info and links."""
+        from app_meta import APP_DISPLAY_NAME, APP_VERSION, GITHUB_OWNER, GITHUB_REPO
+        
+        info = wx.adv.AboutDialogInfo()
+        info.SetName(APP_DISPLAY_NAME)
+        info.SetVersion(APP_VERSION)
+        info.SetDescription("A screen reader accessible IPTV client for Windows and Linux.\n\n"
+                           "Supports M3U/M3U Plus playlists, Stalker Portal, XtreamCodes,\n"
+                           "built-in VLC player, casting, and XMLTV EPG.")
+        info.SetCopyright("© 2025-2026 Serrebi and contributors")
+        info.SetWebSite(f"https://github.com/{GITHUB_OWNER}", "GitHub Profile")
+        info.AddDeveloper("Serrebi")
+        info.SetLicense("MIT License\n\nSee LICENSE file for details.")
+        
+        wx.adv.AboutBox(info)
 
     def _show_epg_dialog(self, channel_name, programmes):
         if not programmes:
@@ -1236,8 +1255,18 @@ class IPTVClient(wx.Frame):
             self.tray_icon.Destroy()
             self.tray_icon = None
         self.Show()
-        self.Raise()
         self.Iconize(False)
+        self.Raise()
+        # Set focus to channel list for screen reader accessibility
+        wx.CallAfter(self._focus_channel_list)
+
+    def _focus_channel_list(self):
+        """Set focus to channel list - used after restore from tray."""
+        try:
+            if self.IsShown() and not self.IsIconized():
+                self.channel_list.SetFocus()
+        except Exception:
+            pass
 
     def _tray_show_player(self):
         try:
@@ -2691,10 +2720,9 @@ class IPTVClient(wx.Frame):
             wx.MessageBox(f"Failed to launch {player}:\n{err}", "Launch Error", wx.OK | wx.ICON_ERROR)
 
     def _restore_main_focus(self) -> None:
+        """Restore focus to channel list only if this window is active."""
         try:
-            if self.IsShown():
-                self.Raise()
-                self.SetFocus()
+            if self.IsShown() and self.IsActive():
                 self.channel_list.SetFocus()
         except Exception:
             pass
