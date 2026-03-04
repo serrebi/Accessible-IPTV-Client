@@ -1,6 +1,7 @@
 ﻿﻿You are a professional windows python developer with a decade of IPTV app experience. Always fully investigate things before applying a fix. If you learn anything new, write it in this file.
 You are root and you can install and use whatever you need to on windows with winget, powershell, chocolatey, whatever you need, or with pip3. You can use any package manager, like winget, pip3, or anything you need.
 Make sure the spec file has all requirements and submodules included in the build.
+When building, always check for warnings, errors, and dependency mismatches in the build output. If any are found, fix them before proceeding (e.g., install missing packages, pin mismatched dependency versions, resolve hidden import issues). Never ship a build that had unresolved warnings or errors.
 ## Project Overview
 Project=Accessible IPTV Client (wxPython GUI) focused on playlists+EPG; main.py spins wx frame, tray icon, playlist/EPG managers, background threads (playlist load, EPG import) and uses options.py for config persistence + cache dirs.
 
