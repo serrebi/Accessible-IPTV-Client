@@ -124,7 +124,7 @@ class InternalPlayerFrame(wx.Frame):
         self._max_reconnect_attempts = 4
         self._last_restart_ts = 0.0
         self._last_restart_reason = ""
-        self._buffer_step_seconds = 0.0
+        self._buffer_step_seconds = 1.0
         self._max_buffer_seconds = self._resolve_max_buffer(max_buffer_seconds, base_value)
         self.base_buffer_seconds = max(0.0, min(base_value, self._max_buffer_seconds))
         self._network_cache_fraction = 0.0
@@ -139,7 +139,7 @@ class InternalPlayerFrame(wx.Frame):
         self._variant_max_mbps: Optional[float] = self._sanitize_variant_cap(variant_max_mbps)
         self._last_variant_url: Optional[str] = None
         self._buffering_events: Deque[float] = deque(maxlen=20)
-        self._choppy_window_seconds = 0.0
+        self._choppy_window_seconds = 60.0
         self._choppy_threshold = 4
         self._choppy_cooldown = 20.0
         self._last_adjust_ts = 0.0
@@ -1315,22 +1315,7 @@ class InternalPlayerFrame(wx.Frame):
         vol = int(self._volume_value) if volume_override is None else volume_override
         vol_txt = f" | Vol {vol}%"
         
-        # If prefix is empty, try to preserve existing prefix from label? 
-        # No, caller usually knows state. If called from volume update, we might lose state info ("Buffering...").
-        # But `_perform_update` doesn't know the state.
-        # We should store `_current_state_prefix` in the class to update label correctly.
-        # But for now, let's just update if we can.
-        # Actually, if prefix is "", we might be erasing "Buffering...".
-        # Let's add `self._last_status_prefix` to __init__ and use it.
-        
-        # NOTE: current_lbl was used for debugging; removed to silence lint warning.
-        # Hacky heuristic: if prefix arg is empty, try to keep the existing prefix text (everything before " X.Xs buffer")
-        # But simpler is to just use a stored state variable.
-        
-        # Let's assume the user is okay with just "Vol XX%" updating if we don't have state.
-        # Or better: `buf_txt` is always generated fresh.
-        
-        real_prefix = prefix if prefix else getattr(self, "_last_status_prefix", "Idle")
+        real_prefix = prefix if prefix else self._last_status_prefix
         if prefix:
             self._last_status_prefix = prefix
             

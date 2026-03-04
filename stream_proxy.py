@@ -222,19 +222,20 @@ class StreamProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
 
-                # Determine if we need transcoding
-                is_mp3 = target_lower.endswith(".mp3") or "serrebiradio" in target_lower
-                needs_transcode = not is_mp3 or "radiohd" in target_lower or "cjsr" in target_lower
+                # Determine if we need transcoding — only skip for plain MP3 streams
+                is_mp3 = target_lower.endswith(".mp3")
+                needs_transcode = not is_mp3
 
                 # Shared buffer for decoupling download from client write
-                # 64KB fill = ~4-5s buffer at 96kbps, balances fast start with stability
-                stream_buffer = StreamBuffer(max_size=16 * 1024 * 1024, initial_fill=64 * 1024)
+                # 128KB fill ≈ 3s at 320kbps output, absorbs FFmpeg startup latency
+                stream_buffer = StreamBuffer(max_size=16 * 1024 * 1024, initial_fill=128 * 1024)
 
                 def _upstream_worker():
                     try:
                         if needs_transcode:
                             cmd = [
                                 get_ffmpeg_path(), "-hide_banner", "-loglevel", "error",
+                                "-probesize", "32k", "-analyzeduration", "500000",
                                 "-i", "pipe:0", "-vn",
                                 "-c:a", "libmp3lame", "-b:a", "320k", "-ar", "44100",
                                 "-f", "mp3", "pipe:1"

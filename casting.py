@@ -10,7 +10,7 @@ import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 LOG = logging.getLogger(__name__)
 
@@ -126,6 +126,8 @@ except ImportError:
     _HAS_CHROMECAST = False
     pychromecast = None
 
+from xml.sax.saxutils import escape as xml_escape
+
 from stream_proxy import get_proxy
 from http_headers import channel_http_headers
 
@@ -137,7 +139,7 @@ class ChromecastCaster(BaseCaster):
             raise CastError("pychromecast is not installed. Run: pip install pychromecast")
         self._cast = None
         self._browser = None
-        self._devices: Dict[str, any] = {}
+        self._devices: Dict[str, Any] = {}
         # Ensure proxy is ready
         get_proxy().start()
     
@@ -484,11 +486,12 @@ class DLNACaster(BaseCaster):
             dlna_features = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
             res_attrs = f'protocolInfo="http-get:*:{content_type_actual}:{dlna_features}"'
             
+            safe_title = xml_escape(title)
             didl = f'''<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
                 xmlns:dc="http://purl.org/dc/elements/1.1/"
                 xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
                 <item id="1" parentID="0" restricted="1">
-                    <dc:title>{title}</dc:title>
+                    <dc:title>{safe_title}</dc:title>
                     <upnp:class>{upnp_class}</upnp:class>
                     <res {res_attrs}>{proxied_url}</res>
                 </item>
@@ -538,7 +541,10 @@ class DLNACaster(BaseCaster):
             except Exception:
                 pass
             self._requester = None
-    
+
+    def is_connected(self) -> bool:
+        return self._device is not None
+
 # ============================================================================
 # AirPlay Implementation
 # ============================================================================
@@ -667,17 +673,14 @@ class AirPlayCaster(BaseCaster):
             await stream.play_url(url, position=0)
         except Exception as e:
             # pyatv 0.14+ raises NotSupportedError if the connected protocol doesn't support streaming (e.g. RAOP only)
-            if "NotSupportedError" in str(type(e).__name__):
+            if _HAS_AIRPLAY and isinstance(e, pyatv.exceptions.NotSupportedError):
                  raise PlaybackError("This AirPlay device does not support video streaming (play_url). It might be an audio-only device or connected via limited protocol.")
             raise PlaybackError(f"Failed to start playback: {e}")
     
     async def stop(self) -> None:
         if self._atv:
             try:
-                # AirPlay doesn't strictly have 'stop', but we can close the connection
-                # or try to stop media. 'remote_control.stop()' is for remote buttons.
-                # play_url usually stops when connection closes or replaced.
-                pass
+                await self._atv.remote_control.stop()
             except Exception:
                 pass
     
